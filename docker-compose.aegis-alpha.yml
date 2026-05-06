@@ -1,0 +1,113 @@
+services:
+  mysql:
+    image: mysql:8.0
+    restart: unless-stopped
+    environment:
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-aegis_alpha}
+      MYSQL_USER: ${MYSQL_USER:-marketmind}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?Set MYSQL_PASSWORD in .env}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?Set MYSQL_ROOT_PASSWORD in .env}
+    ports:
+      - "3306:3306"
+    volumes:
+      - aegis-alpha-mysql:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u$${MYSQL_USER} -p$${MYSQL_PASSWORD} --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["sh", "-c", "redis-server --requirepass \"$${MARKETMIND_REDIS_PASSWORD}\""]
+    environment:
+      MARKETMIND_REDIS_PASSWORD: ${MARKETMIND_REDIS_PASSWORD:?Set MARKETMIND_REDIS_PASSWORD in .env}
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$${MARKETMIND_REDIS_PASSWORD}\" ping | grep PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  langgraph:
+    build:
+      context: ./aegis-alpha-orchestrator
+    restart: unless-stopped
+    environment:
+      MARKETMIND_LANGGRAPH_PORT: ${MARKETMIND_LANGGRAPH_PORT:-8787}
+      MARKETMIND_LANGGRAPH_HOST: ${MARKETMIND_LANGGRAPH_HOST:-0.0.0.0}
+      MARKETMIND_LANGCHAIN_PROVIDER: ${MARKETMIND_LANGCHAIN_PROVIDER:-openai}
+      MARKETMIND_LANGCHAIN_MODEL: ${MARKETMIND_LANGCHAIN_MODEL:-gpt-4o-mini}
+      MARKETMIND_LANGCHAIN_BASE_URL: ${MARKETMIND_LANGCHAIN_BASE_URL:-}
+      MARKETMIND_LANGCHAIN_API_KEY: ${MARKETMIND_LANGCHAIN_API_KEY:-}
+      MARKETMIND_LANGCHAIN_TIMEOUT_MS: ${MARKETMIND_LANGCHAIN_TIMEOUT_MS:-25000}
+      MARKETMIND_LANGCHAIN_MOCK: ${MARKETMIND_LANGCHAIN_MOCK:-true}
+    ports:
+      - "8787:8787"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8787/health >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  backend:
+    build:
+      context: ./aegis-alpha-api
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      langgraph:
+        condition: service_healthy
+    environment:
+      MARKETMIND_PORT: ${MARKETMIND_PORT:-5178}
+      MARKETMIND_DB_URL: ${MARKETMIND_DB_URL:-jdbc:mysql://mysql:3306/aegis_alpha?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&useSSL=false&allowPublicKeyRetrieval=true}
+      MARKETMIND_DB_USER: ${MARKETMIND_DB_USER:-marketmind}
+      MARKETMIND_DB_PASSWORD: ${MARKETMIND_DB_PASSWORD:?Set MARKETMIND_DB_PASSWORD in .env}
+      MARKETMIND_SQL_INIT: ${MARKETMIND_SQL_INIT:-always}
+      MARKETMIND_REDIS_HOST: ${MARKETMIND_REDIS_HOST:-redis}
+      MARKETMIND_REDIS_PORT: ${MARKETMIND_REDIS_PORT:-6379}
+      MARKETMIND_REDIS_PASSWORD: ${MARKETMIND_REDIS_PASSWORD:?Set MARKETMIND_REDIS_PASSWORD in .env}
+      MARKETMIND_SEED_ENABLED: ${MARKETMIND_SEED_ENABLED:-true}
+      MARKETMIND_TOKEN_SECRET: ${MARKETMIND_TOKEN_SECRET:?Set MARKETMIND_TOKEN_SECRET in .env}
+      MARKETMIND_LANGCHAIN_ENABLED: ${MARKETMIND_LANGCHAIN_ENABLED:-true}
+      MARKETMIND_LANGCHAIN_ENGINE_URL: ${MARKETMIND_LANGCHAIN_ENGINE_URL:-http://langgraph:8787}
+      MARKETMIND_LANGCHAIN_PROVIDER: ${MARKETMIND_LANGCHAIN_PROVIDER:-openai}
+      MARKETMIND_LANGCHAIN_MODEL: ${MARKETMIND_LANGCHAIN_MODEL:-gpt-4o-mini}
+      MARKETMIND_LANGCHAIN_API_KEY: ${MARKETMIND_LANGCHAIN_API_KEY:-}
+      MARKETMIND_LANGCHAIN_BASE_URL: ${MARKETMIND_LANGCHAIN_BASE_URL:-}
+      MARKETMIND_LANGCHAIN_TIMEOUT_MS: ${MARKETMIND_LANGCHAIN_TIMEOUT_MS:-25000}
+    ports:
+      - "5178:5178"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:5178/_backend/auth/me >/dev/null || test $$? -eq 22"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+
+  frontend:
+    build:
+      context: ./aegis-alpha-web
+      args:
+        MARKETMIND_BACKEND_INTERNAL_URL: ${MARKETMIND_BACKEND_INTERNAL_URL:-http://backend:5178}
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      PORT: ${MARKETMIND_FRONTEND_PORT:-5174}
+    ports:
+      - "5174:5174"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:5174/ >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+volumes:
+  aegis-alpha-mysql:

@@ -1,0 +1,126 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    @apply bg-gray-50 text-gray-900 antialiased;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans SC", sans-serif;
+    letter-spacing: 0;
+  }
+}
+
+@layer components {
+  .btn-primary {
+    @apply px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors text-sm font-medium disabled:opacity-50 disabled:cursor-not-allowed;
+  }
+  .btn-secondary {
+    @apply px-4 py-2 bg-white text-gray-700 rounded-lg border border-gray-300 hover:bg-gray-50 transition-colors text-sm font-medium disabled:opacity-50 disabled:cursor-not-allowed;
+  }
+  .card {
+    @apply bg-white rounded-lg border border-gray-200 p-5;
+  }
+  .input-field {
+    @apply w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500;
+  }
+  .table-header {
+    @apply px-4 py-3 text-left text-xs font-semibold text-gray-500 uppercase tracking-wider bg-gray-50;
+  }
+  .table-cell {
+    @apply px-4 py-3 text-sm text-gray-700;
+  }
+  .empty-state {
+    @apply flex flex-col items-center justify-center py-16 text-gray-400;
+  }
+  .badge {
+    @apply inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium;
+  }
+  .badge-green {
+    @apply badge bg-green-100 text-green-700;
+  }
+  .badge-red {
+    @apply badge bg-red-100 text-red-700;
+  }
+  .badge-yellow {
+    @apply badge bg-yellow-100 text-yellow-700;
+  }
+  .badge-blue {
+    @apply badge bg-blue-100 text-blue-700;
+  }
+  .badge-gray {
+    @apply badge bg-gray-100 text-gray-600;
+  }
+}
+
+.react-flow__node-workflowNode {
+  border: 0;
+  background: transparent;
+  padding: 0;
+}
+
+.react-flow__handle {
+  width: 5px;
+  height: 5px;
+  border: 1px solid #fff;
+  background: #111827;
+}
+
+.react-flow__controls {
+  box-shadow: none;
+  border: 1px solid #e5e7eb;
+  border-radius: 0;
+  overflow: hidden;
+}
+
+.workflow-canvas {
+  background: #fff;
+}
+
+.workflow-node-card {
+  font-family: Arial, "Noto Sans SC", sans-serif;
+}
+
+.workflow-canvas .react-flow__edge-text {
+  font-size: 7px;
+}
+
+.workflow-canvas .react-flow__controls {
+  left: 16px;
+  bottom: 16px;
+}
+
+.workflow-canvas .react-flow__controls-button {
+  width: 32px;
+  height: 32px;
+  border-bottom: 1px solid #e5e7eb;
+  background: #fff;
+}
+
+.workflow-canvas .react-flow__minimap {
+  right: 16px;
+  bottom: 16px;
+  width: 190px;
+  height: 128px;
+  border: 16px solid #f4f4f5;
+  background: #fff;
+  box-shadow: none;
+}
+
+.workflow-catalog-scroll {
+  scrollbar-width: auto;
+  scrollbar-color: #8a8a8a #f4f4f5;
+}
+
+.workflow-catalog-scroll::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+.workflow-catalog-scroll::-webkit-scrollbar-track {
+  background: #f4f4f5;
+}
+
+.workflow-catalog-scroll::-webkit-scrollbar-thumb {
+  background: #8a8a8a;
+  border-radius: 8px;
+}

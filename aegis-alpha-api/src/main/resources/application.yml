@@ -1,0 +1,51 @@
+server:
+  port: ${MARKETMIND_PORT:5178}
+
+spring:
+  datasource:
+    url: ${MARKETMIND_DB_URL:jdbc:mysql://127.0.0.1:3306/marketmind_alpha?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&useSSL=false&allowPublicKeyRetrieval=true}
+    username: ${MARKETMIND_DB_USER:marketmind}
+    password: ${MARKETMIND_DB_PASSWORD:marketmind_dev}
+    driver-class-name: com.mysql.cj.jdbc.Driver
+  sql:
+    init:
+      mode: ${MARKETMIND_SQL_INIT:always}
+      schema-locations: classpath:db/mysql/schema.sql
+      continue-on-error: true
+  redis:
+    host: ${MARKETMIND_REDIS_HOST:127.0.0.1}
+    port: ${MARKETMIND_REDIS_PORT:6379}
+    password: ${MARKETMIND_REDIS_PASSWORD:1234}
+    timeout: 1200ms
+
+mybatis:
+  configuration:
+    map-underscore-to-camel-case: true
+
+marketmind:
+  seed-enabled: ${MARKETMIND_SEED_ENABLED:true}
+  token-secret: ${MARKETMIND_TOKEN_SECRET:local-marketmind-demo-secret}
+  langchain:
+    enabled: ${MARKETMIND_LANGCHAIN_ENABLED:false}
+    engine-url: ${MARKETMIND_LANGCHAIN_ENGINE_URL:http://127.0.0.1:8787}
+    provider: ${MARKETMIND_LANGCHAIN_PROVIDER:openai}
+    model: ${MARKETMIND_LANGCHAIN_MODEL:deepseek-v4-flash}
+    api-key: ${MARKETMIND_LANGCHAIN_API_KEY:${OPENAI_API_KEY:}}
+    base-url: ${MARKETMIND_LANGCHAIN_BASE_URL:${OPENAI_BASE_URL:}}
+  dify:
+    enabled: ${MARKETMIND_DIFY_ENABLED:false}
+    base-url: ${MARKETMIND_DIFY_BASE_URL:https://api.dify.ai/v1}
+    workflow-api-key: ${MARKETMIND_DIFY_WORKFLOW_API_KEY:}
+    chat-api-key: ${MARKETMIND_DIFY_CHAT_API_KEY:}
+    console-base-url: ${MARKETMIND_DIFY_CONSOLE_BASE_URL:}
+    console-token: ${MARKETMIND_DIFY_CONSOLE_TOKEN:}
+    node-callback-base-url: ${MARKETMIND_NODE_CALLBACK_BASE_URL:http://127.0.0.1:5178}
+    node-execution-token: ${MARKETMIND_NODE_EXECUTION_TOKEN:local-workflow-node-token}
+  market-data:
+    yahoo-chart-url: ${MARKETMIND_YAHOO_CHART_URL:https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1m&range=1d}
+    stooq-quote-url: ${MARKETMIND_STOOQ_QUOTE_URL:https://stooq.com/q/l/?s={symbol}.us&f=sd2t2ohlcv&h&e=csv}
+    sec-ticker-map-url: ${MARKETMIND_SEC_TICKER_MAP_URL:https://www.sec.gov/files/company_tickers.json}
+    sec-companyfacts-url: ${MARKETMIND_SEC_COMPANYFACTS_URL:https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json}
+    yahoo-news-rss-url: ${MARKETMIND_YAHOO_NEWS_RSS_URL:https://feeds.finance.yahoo.com/rss/2.0/headline?s={symbol}&region=US&lang=en-US}
+    gdelt-news-url: ${MARKETMIND_GDELT_NEWS_URL:https://api.gdeltproject.org/api/v2/doc/doc?query={symbol}&mode=artlist&format=json&maxrecords=10}
+    http-timeout-ms: ${MARKETMIND_MARKET_DATA_HTTP_TIMEOUT_MS:4000}

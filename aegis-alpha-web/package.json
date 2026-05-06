@@ -1,0 +1,28 @@
+{
+  "name": "aegis-alpha-web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "next dev --hostname 127.0.0.1 --port 5174",
+    "build": "node scripts/next-build.cjs",
+    "start": "next start --hostname 127.0.0.1 --port 5174",
+    "test:portfolio-list": "node scripts/portfolio-list-view.test.mjs",
+    "test:market-data-query": "node scripts/market-data-query.test.mjs",
+    "test:enterprise-console": "node scripts/enterprise-console-foundation.test.mjs",
+    "test:ui-ux-audit": "node scripts/ui-ux-audit-regression.test.mjs"
+  },
+  "dependencies": {
+    "@xyflow/react": "^12.10.2",
+    "lucide-react": "^0.468.0",
+    "next": "^15.0.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "read-excel-file": "^9.0.9"
+  },
+  "devDependencies": {
+    "autoprefixer": "^10.4.14",
+    "postcss": "^8.4.24",
+    "tailwindcss": "^3.3.0"
+  }
+}

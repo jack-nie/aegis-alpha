@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Aegis Alpha</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div id="loginView" class="login-view">
+      <section class="login-card">
+        <h1>登录</h1>
+        <p>使用 Aegis Alpha 账号进入平台。</p>
+        <form id="loginForm">
+          <input id="username" autocomplete="username" placeholder="用户名" required />
+          <input id="password" autocomplete="current-password" type="password" placeholder="密码" required />
+          <button type="submit">登录</button>
+          <p id="loginError" class="error" hidden>账号或密码错误。</p>
+        </form>
+      </section>
+    </div>
+
+    <div id="appView" class="app-view" hidden>
+      <header class="topbar">
+        <div class="topbar-left">
+          <button id="menuBtn" class="icon-button" aria-label="打开导航">☰</button>
+          <h1 id="pageCrumb">主页</h1>
+        </div>
+        <div class="topbar-right">
+          <span class="muted" data-current-user>当前用户: guanghui.nie</span>
+          <label class="language-label">语言</label>
+          <select id="languageSelect">
+            <option>中文</option>
+            <option>English</option>
+          </select>
+          <button id="logoutBtn" class="link-button">退出登录</button>
+        </div>
+      </header>
+
+      <aside id="navDrawer" class="nav-drawer" aria-label="导航">
+        <div class="drawer-title">Aegis Alpha</div>
+        <button data-route="home">主页</button>
+        <button data-route="data">数据中心 / 仪表盘</button>
+        <button data-route="portfolio">投资组合 / 总览</button>
+        <button data-route="workflow">AI+ / 工作流</button>
+        <button data-route="backtest">回测 / 回测管理</button>
+        <button data-route="profile">个人中心 / 个人信息</button>
+      </aside>
+      <div id="overlay" class="overlay" hidden></div>
+
+      <main id="content" class="content"></main>
+
+      <button id="chatButton" class="chat-button" aria-label="打开 AI Copilot">◔</button>
+      <section id="chatPanel" class="chat-panel" hidden>
+        <div class="chat-head">
+          <div>
+            <strong>AI Copilot</strong>
+            <p>右侧浮层对话框（原型）</p>
+          </div>
+          <button id="closeChat" class="icon-button">×</button>
+        </div>
+        <div class="chat-body">
+          <p id="chatReply">你好，我是 AI Copilot。你可以先通过这个浮层入口开始对话。</p>
+        </div>
+        <button class="secondary full">新对话</button>
+        <h3>历史对话</h3>
+        <p class="muted">暂无历史对话。</p>
+      </section>
+    </div>
+
+    <script src="./app.js"></script>
+  </body>
+</html>

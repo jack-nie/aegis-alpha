@@ -1,0 +1,12 @@
+.ai-memory
+.github
+docs/
+logs/
+target/
+.next/
+node_modules/
+out/
+dist/
+*.log
+.env*.local
+target/
