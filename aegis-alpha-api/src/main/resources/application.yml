@@ -1,7 +1,19 @@
 server:
   port: ${MARKETMIND_PORT:5178}
+  servlet:
+    encoding:
+      charset: UTF-8
+      enabled: true
+      force: true
+      force-request: true
+      force-response: true
 
 spring:
+  http:
+    encoding:
+      charset: UTF-8
+      enabled: true
+      force: true
   datasource:
     url: ${MARKETMIND_DB_URL:jdbc:mysql://127.0.0.1:3306/marketmind_alpha?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&useSSL=false&allowPublicKeyRetrieval=true}
     username: ${MARKETMIND_DB_USER:marketmind}

@@ -466,7 +466,7 @@ function promptForHandler(handler) {
     "finance.sentiment_monitor": "Assess investor, media, and analyst sentiment for the subject.",
     "finance.tech_breakthrough": "Identify technical or product breakthroughs relevant to the subject.",
     "finance.industry_news": "Summarize important recent industry news relevant to the subject.",
-    "general.agent": "Answer the user's conversational investment research question clearly in Chinese.",
+    "general.agent": "You are an investment research assistant. Use the marketDataContext (quote, financials, news) in the workflow state to provide a concrete analysis. Always reference actual data values (price, PE, PB, news titles) in your response. Do NOT say data is insufficient if marketDataContext is present. Answer in Chinese.",
     "general.web_search": "Find concise web-search style evidence relevant to the subject.",
     "finance.financial_interpretation": "Interpret financial performance, margins, growth, cash flow, and balance-sheet signals.",
     "finance.stock_recommendation_aggregate": "Aggregate prior workflow findings into a stock recommendation with confidence and caveats.",

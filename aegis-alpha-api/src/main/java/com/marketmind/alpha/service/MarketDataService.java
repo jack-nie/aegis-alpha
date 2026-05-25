@@ -130,6 +130,14 @@ public class MarketDataService {
             @Override
             public Map<String, Object> get() {
                 List<String> attempted = new ArrayList<String>();
+                if (isAShare(ticker)) {
+                    attempted.add("tencent-finance");
+                    try {
+                        return quoteFromTencent(ticker);
+                    } catch (Exception ignored) {
+                        // Continue to free providers.
+                    }
+                }
                 if (!finnhubApiKey.isEmpty()) {
                     attempted.add("finnhub");
                     try {
@@ -175,6 +183,14 @@ public class MarketDataService {
             @Override
             public Map<String, Object> get() {
                 List<String> attempted = new ArrayList<String>();
+                if (isAShare(ticker)) {
+                    attempted.add("tencent-finance");
+                    try {
+                        return financialsFromTencent(ticker);
+                    } catch (Exception ignored) {
+                        // Continue to free providers.
+                    }
+                }
                 attempted.add("sec-companyfacts");
                 try {
                     return financialsFromSec(ticker);
@@ -207,6 +223,14 @@ public class MarketDataService {
             @Override
             public Map<String, Object> get() {
                 List<String> attempted = new ArrayList<String>();
+                if (isAShare(ticker)) {
+                    attempted.add("eastmoney");
+                    try {
+                        return newsFromEastMoney(ticker);
+                    } catch (Exception ignored) {
+                        // Continue to free providers.
+                    }
+                }
                 if (!finnhubApiKey.isEmpty()) {
                     attempted.add("finnhub-news");
                     try {
@@ -717,7 +741,7 @@ public class MarketDataService {
     private String get(String url) {
         HttpHeaders headers = new HttpHeaders();
         headers.set("User-Agent", USER_AGENT);
-        ResponseEntity<String> response = restTemplate.exchange(url, HttpMethod.GET, new HttpEntity<String>(headers), String.class);
+        ResponseEntity<String> response = restTemplate.exchange(java.net.URI.create(url), HttpMethod.GET, new HttpEntity<String>(headers), String.class);
         if (!response.getStatusCode().is2xxSuccessful() || response.getBody() == null) {
             throw new IllegalStateException("HTTP request failed for " + url);
         }
@@ -727,7 +751,7 @@ public class MarketDataService {
     private byte[] getBytes(String url) {
         HttpHeaders headers = new HttpHeaders();
         headers.set("User-Agent", USER_AGENT);
-        ResponseEntity<byte[]> response = restTemplate.exchange(url, HttpMethod.GET, new HttpEntity<String>(headers), byte[].class);
+        ResponseEntity<byte[]> response = restTemplate.exchange(java.net.URI.create(url), HttpMethod.GET, new HttpEntity<String>(headers), byte[].class);
         if (!response.getStatusCode().is2xxSuccessful() || response.getBody() == null) {
             throw new IllegalStateException("HTTP request failed for " + url);
         }
@@ -739,11 +763,211 @@ public class MarketDataService {
     }
 
     private String normalizeSymbol(String symbol) {
-        String ticker = symbol == null ? "" : symbol.trim().toUpperCase();
-        if (ticker.isEmpty()) {
+        String raw = symbol == null ? "" : symbol.trim();
+        if (raw.isEmpty()) {
             throw new IllegalArgumentException("symbol is required");
         }
+        String resolved = resolveAShareSymbol(raw);
+        String ticker = resolved.toUpperCase();
         return ticker.replaceAll("[^A-Z0-9._-]", "");
+    }
+
+    private static final java.util.Map<String, String> CHINESE_STOCK_NAMES = new java.util.LinkedHashMap<String, String>();
+    static {
+        CHINESE_STOCK_NAMES.put("沪电股份", "002463.SZ");
+        CHINESE_STOCK_NAMES.put("贵州茅台", "600519.SH");
+        CHINESE_STOCK_NAMES.put("中国平安", "601318.SH");
+        CHINESE_STOCK_NAMES.put("招商银行", "600036.SH");
+        CHINESE_STOCK_NAMES.put("宁德时代", "300750.SZ");
+        CHINESE_STOCK_NAMES.put("比亚迪", "002594.SZ");
+        CHINESE_STOCK_NAMES.put("隆基绿能", "601012.SH");
+        CHINESE_STOCK_NAMES.put("五粮液", "000858.SZ");
+        CHINESE_STOCK_NAMES.put("美的集团", "000333.SZ");
+        CHINESE_STOCK_NAMES.put("中信证券", "600030.SH");
+        CHINESE_STOCK_NAMES.put("立讯精密", "002475.SZ");
+        CHINESE_STOCK_NAMES.put("海康威视", "002415.SZ");
+        CHINESE_STOCK_NAMES.put("恒瑞医药", "600276.SH");
+        CHINESE_STOCK_NAMES.put("迈瑞医疗", "300760.SZ");
+        CHINESE_STOCK_NAMES.put("药明康德", "603259.SH");
+        CHINESE_STOCK_NAMES.put("东方财富", "300059.SZ");
+        CHINESE_STOCK_NAMES.put("三一重工", "600031.SH");
+        CHINESE_STOCK_NAMES.put("紫金矿业", "601899.SH");
+        CHINESE_STOCK_NAMES.put("中国中免", "601888.SH");
+        CHINESE_STOCK_NAMES.put("片仔癌", "600436.SH");
+    }
+
+    public String resolveAShareSymbolPublic(String input) {
+        return resolveAShareSymbol(input);
+    }
+
+    private String resolveAShareSymbol(String input) {
+        if (input == null) return "";
+        String trimmed = input.trim();
+        if (CHINESE_STOCK_NAMES.containsKey(trimmed)) {
+            return CHINESE_STOCK_NAMES.get(trimmed);
+        }
+        for (java.util.Map.Entry<String, String> entry : CHINESE_STOCK_NAMES.entrySet()) {
+            if (trimmed.contains(entry.getKey())) {
+                return entry.getValue();
+            }
+        }
+        return trimmed;
+    }
+
+    private boolean isAShare(String ticker) {
+        if (ticker == null) return false;
+        String t = ticker.toUpperCase();
+        if (t.endsWith(".SZ") || t.endsWith(".SH")) return true;
+        if (t.matches("\\d{6}")) return true;
+        return false;
+    }
+
+    private String toTencentCode(String ticker) {
+        String t = ticker.toUpperCase();
+        if (t.endsWith(".SZ")) return "sz" + t.substring(0, 6);
+        if (t.endsWith(".SH")) return "sh" + t.substring(0, 6);
+        if (t.matches("\\d{6}")) {
+            String code = t.substring(0, 6);
+            if (code.startsWith("6")) return "sh" + code;
+            return "sz" + code;
+        }
+        return t.toLowerCase();
+    }
+
+    private String getGBK(String url) {
+        byte[] raw = getBytes(url);
+        try {
+            return new String(raw, "GBK");
+        } catch (Exception ex) {
+            return new String(raw);
+        }
+    }
+
+    private Map<String, Object> quoteFromTencent(String ticker) throws Exception {
+        String code = toTencentCode(ticker);
+        String url = "http://qt.gtimg.cn/q=" + code;
+        String raw = getGBK(url);
+        if (raw == null || raw.trim().isEmpty() || raw.contains("pv_none")) {
+            throw new IllegalStateException("Tencent Finance returned no data for " + ticker);
+        }
+        String data = raw;
+        int start = data.indexOf('"');
+        int end = data.lastIndexOf('"');
+        if (start >= 0 && end > start) {
+            data = data.substring(start + 1, end);
+        }
+        String[] parts = data.split("~");
+        if (parts.length < 45) {
+            throw new IllegalStateException("Tencent Finance response too short for " + ticker);
+        }
+        double price = parseDouble(parts[3]);
+        double previous = parseDouble(parts[4]);
+        double open = parseDouble(parts[5]);
+        Long volumeObj = parseLong(parts[6]);
+        long volume = volumeObj != null ? volumeObj : 0L;
+        double change = round(price - previous, 4);
+        double changePct = previous == 0 ? 0 : round(change / previous * 100, 4);
+
+        Map<String, Object> quote = base("quote", ticker, "tencent-finance");
+        quote.put("name", parts[1]);
+        quote.put("price", price);
+        quote.put("open", open);
+        quote.put("previousClose", previous);
+        quote.put("high", parseDouble(parts[33]));
+        quote.put("low", parseDouble(parts[34]));
+        quote.put("volume", volume);
+        quote.put("change", change);
+        quote.put("changePct", changePct);
+        quote.put("marketCap", parts[44]);
+        quote.put("asOf", parts[30]);
+        quote.put("isRealtime", Boolean.TRUE);
+        quote.put("delayHint", "Tencent Finance real-time quote data.");
+        quote.put("sources", Collections.singletonList(source("Tencent Finance", url, "quote")));
+        return quote;
+    }
+    private Map<String, Object> newsFromEastMoney(String ticker) throws Exception {
+        String code = ticker.replaceAll("[^0-9]", "");
+        String url = "https://feed.mix.sina.com.cn/api/roll/get?pageid=153&lid=2516&k=" + code + "&num=8&page=1";
+        byte[] rawBytes = getBytes(url);
+        String raw = new String(rawBytes, "UTF-8");
+        List<Map<String, Object>> articles = new ArrayList<Map<String, Object>>();
+        if (raw != null && !raw.isEmpty()) {
+            JsonNode root = objectMapper.readTree(raw);
+            JsonNode dataNode = root.path("result").path("data");
+            if (dataNode.isArray()) {
+                for (JsonNode item : dataNode) {
+                    String title = text(item.path("title"), "");
+                    if (title.isEmpty()) continue;
+                    Map<String, Object> article = new LinkedHashMap<String, Object>();
+                    article.put("title", title);
+                    article.put("url", text(item.path("url"), ""));
+                    String ctime = text(item.path("ctime"), "");
+                    if (!ctime.isEmpty()) {
+                        try {
+                            article.put("publishedAt", java.time.Instant.ofEpochSecond(Long.parseLong(ctime)).toString());
+                        } catch (Exception ex) {
+                            article.put("publishedAt", ctime);
+                        }
+                    } else {
+                        article.put("publishedAt", "");
+                    }
+                    article.put("source", text(item.path("media_name"), "Sina Finance"));
+                    article.put("provider", "sina-finance");
+                    articles.add(article);
+                }
+            }
+        }
+        Map<String, Object> payload = base("news", ticker, "sina-finance");
+        payload.put("articles", articles);
+        payload.put("asOf", articles.isEmpty() ? nowIso() : string(articles.get(0).get("publishedAt")));
+        payload.put("isRealtime", Boolean.TRUE);
+        payload.put("delayHint", "Sina Finance news feed.");
+        payload.put("sources", Collections.singletonList(source("Sina Finance News", url, "news")));
+        return payload;
+    }
+
+    private Map<String, Object> financialsFromTencent(String ticker) throws Exception {
+        String code = toTencentCode(ticker);
+        String url = "http://qt.gtimg.cn/q=" + code;
+        String raw = getGBK(url);
+        if (raw == null || raw.trim().isEmpty() || raw.contains("pv_none")) {
+            throw new IllegalStateException("Tencent Finance returned no financials for " + ticker);
+        }
+        String data = raw;
+        int start = data.indexOf('"');
+        int end = data.lastIndexOf('"');
+        if (start >= 0 && end > start) {
+            data = data.substring(start + 1, end);
+        }
+        String[] parts = data.split("~");
+        if (parts.length < 45) {
+            throw new IllegalStateException("Tencent Finance response too short for " + ticker);
+        }
+        Map<String, Object> payload = base("financials", ticker, "tencent-finance");
+        payload.put("companyName", parts[1]);
+        List<Map<String, Object>> metrics = new ArrayList<Map<String, Object>>();
+        addTencentMetric(metrics, "PE ratio", parts[39], "ratio");
+        addTencentMetric(metrics, "PB ratio", parts.length > 46 ? parts[46] : "N/A", "ratio");
+        addTencentMetric(metrics, "Total market cap", parts[44], "CNY");
+        addTencentMetric(metrics, "Circulating market cap", parts[45], "CNY");
+        payload.put("metrics", metrics);
+        payload.put("asOf", parts[30]);
+        payload.put("isRealtime", Boolean.TRUE);
+        payload.put("delayHint", "Tencent Finance valuation metrics.");
+        payload.put("sources", Collections.singletonList(source("Tencent Finance", url, "financials")));
+        return payload;
+    }
+
+    private void addTencentMetric(List<Map<String, Object>> metrics, String label, String value, String unit) {
+        Map<String, Object> metric = new LinkedHashMap<String, Object>();
+        metric.put("metric", label);
+        metric.put("label", label);
+        metric.put("value", value);
+        metric.put("unit", unit);
+        metric.put("filed", "");
+        metric.put("end", "");
+        metric.put("form", "tencent-realtime");
+        metrics.add(metric);
     }
 
     private String trim(String value) {
