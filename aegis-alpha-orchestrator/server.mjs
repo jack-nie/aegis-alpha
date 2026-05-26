@@ -9,17 +9,10 @@ app.use(express.json({ limit: "2mb" }));
 
 // --- request context middleware: propagate request-id, trace-id, client-ip ---
 app.use((req, _res, next) => {
-  const requestId =
-    req.headers["x-request-id"] ||
-    crypto.randomUUID();
-  const traceId =
-    req.headers["x-trace-id"] ||
-    req.headers["traceparent"] ||
-    null;
+  const requestId = req.headers["x-request-id"] || crypto.randomUUID();
+  const traceId = req.headers["x-trace-id"] || req.headers["traceparent"] || null;
   const xff = req.headers["x-forwarded-for"];
-  const clientIp = xff
-    ? xff.split(",")[0].trim()
-    : req.headers["x-real-ip"] || req.ip;
+  const clientIp = xff ? xff.split(",")[0].trim() : req.headers["x-real-ip"] || req.ip;
   const userAgent = req.headers["user-agent"] || null;
   req.context = { requestId, traceId, clientIp, userAgent };
   next();
@@ -457,8 +450,8 @@ function shouldHydrateMarketData(handler) {
 
 function fallbackSummary(handler, subject, state, errorMessage) {
   if (handler === "general.agent") {
-    const message = typeof state?.message === "string" && state.message.trim() ? state.message.trim() : "褰撳墠闂";
-    return `鏆傛椂鏃犳硶杩炴帴鐪熷疄妯″瀷锛屽凡鏀跺埌浣犵殑闂锛氣€?{message}鈥濄€傝妫€鏌ユā鍨?API Key銆丅ase URL 鎴栫綉缁滆繛鎺ュ悗閲嶈瘯銆俙;
+    const message = typeof state?.message === "string" && state.message.trim() ? state.message.trim() : "当前问题";
+    return `暂时无法连接真实模型，已收到你的问题：“${message}”。请检查模型 API Key、Base URL 或网络连接后重试。`;
   }
   if (handler === "finance.stock_recommendation_aggregate") {
     return `Fallback recommendation for ${subject}: upstream workflow evidence was collected, but the LLM aggregation step degraded due to ${errorMessage}. Treat confidence as limited and review node outputs before acting.`;
@@ -512,13 +505,14 @@ function mockSummary(handler, subject, state) {
   if (handler === "condition") return `Condition evaluated for ${subject}.`;
   if (handler === "logic") return `Logic node processed ${subject}.`;
   if (handler === "general.agent") {
-    const message = typeof state?.message === "string" && state.message.trim() ? state.message.trim() : "褰撳墠闂";
-    return `褰撳墠瀵硅瘽寮曟搸澶勪簬妯℃嫙妯″紡锛屽凡鏀跺埌浣犵殑闂锛氣€?{message}鈥濄€傝閰嶇疆鐪熷疄妯″瀷 API Key 鍚庤幏鍙栧畬鏁?AI 鍥炲銆俙;
+    const message = typeof state?.message === "string" && state.message.trim() ? state.message.trim() : "当前问题";
+    return `当前对话引擎处于模拟模式，已收到你的问题：“${message}”。请配置真实模型 API Key 后获取完整 AI 回复。`;
   }
   if (handler === "finance.stock_recommendation_aggregate") {
     const keys = Object.keys(state).filter((key) => key !== "subject");
     return `Mock aggregate recommendation for ${subject} based on ${keys.length} upstream outputs.`;
   }
+  return `Mock ${handler} result for ${subject}.`;
   if (handler === "finance.fundamental_analysis") {
     return `Mock fundamental analysis for ${subject}: Revenue growth stable, margins healthy, balance sheet strong.`;
   }
@@ -534,7 +528,6 @@ function mockSummary(handler, subject, state) {
   if (handler === "finance.risk_assessment") {
     return `Mock risk assessment for ${subject}: Overall risk level moderate, key risks include market volatility and sector rotation.`;
   }
-  return `Mock ${handler} result for ${subject}.`;
 }
 
 function mockSignals(handler, subject) {
@@ -663,6 +656,3 @@ function withTimeout(promise, timeoutMs, message) {
 app.listen(port, "127.0.0.1", () => {
   console.log(`Aegis Alpha orchestrator listening on http://127.0.0.1:${port}`);
 });
-
-
-
