@@ -2,8 +2,28 @@ import express from "express";
 import { ChatOpenAI } from "@langchain/openai";
 import { HumanMessage, SystemMessage } from "@langchain/core/messages";
 
+import crypto from "crypto";
+
 const app = express();
 app.use(express.json({ limit: "2mb" }));
+
+// --- request context middleware: propagate request-id, trace-id, client-ip ---
+app.use((req, _res, next) => {
+  const requestId =
+    req.headers["x-request-id"] ||
+    crypto.randomUUID();
+  const traceId =
+    req.headers["x-trace-id"] ||
+    req.headers["traceparent"] ||
+    null;
+  const xff = req.headers["x-forwarded-for"];
+  const clientIp = xff
+    ? xff.split(",")[0].trim()
+    : req.headers["x-real-ip"] || req.ip;
+  const userAgent = req.headers["user-agent"] || null;
+  req.context = { requestId, traceId, clientIp, userAgent };
+  next();
+});
 
 const port = Number(process.env.MARKETMIND_LANGGRAPH_PORT || 8787);
 const DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-flash";
@@ -19,6 +39,11 @@ const HANDLERS = new Set([
   "general.web_search",
   "finance.financial_interpretation",
   "finance.stock_recommendation_aggregate",
+  "finance.fundamental_analysis",
+  "finance.technical_analysis",
+  "finance.valuation_analysis",
+  "finance.money_flow_analysis",
+  "finance.risk_assessment",
 ]);
 const FALLBACK_HANDLERS = new Set(["start", "end", "condition", "logic"]);
 
@@ -63,6 +88,8 @@ app.post("/execute-workflow", async (req, res) => {
   } catch (error) {
     res.status(500).json({
       ok: false,
+      requestId: req.context?.requestId,
+      traceId: req.context?.traceId,
       error: error?.message || String(error),
       finalState: req.body?.state || {},
       trace: [],
@@ -430,8 +457,8 @@ function shouldHydrateMarketData(handler) {
 
 function fallbackSummary(handler, subject, state, errorMessage) {
   if (handler === "general.agent") {
-    const message = typeof state?.message === "string" && state.message.trim() ? state.message.trim() : "当前问题";
-    return `暂时无法连接真实模型，已收到你的问题：“${message}”。请检查模型 API Key、Base URL 或网络连接后重试。`;
+    const message = typeof state?.message === "string" && state.message.trim() ? state.message.trim() : "褰撳墠闂";
+    return `鏆傛椂鏃犳硶杩炴帴鐪熷疄妯″瀷锛屽凡鏀跺埌浣犵殑闂锛氣€?{message}鈥濄€傝妫€鏌ユā鍨?API Key銆丅ase URL 鎴栫綉缁滆繛鎺ュ悗閲嶈瘯銆俙;
   }
   if (handler === "finance.stock_recommendation_aggregate") {
     return `Fallback recommendation for ${subject}: upstream workflow evidence was collected, but the LLM aggregation step degraded due to ${errorMessage}. Treat confidence as limited and review node outputs before acting.`;
@@ -470,6 +497,11 @@ function promptForHandler(handler) {
     "general.web_search": "Find concise web-search style evidence relevant to the subject.",
     "finance.financial_interpretation": "Interpret financial performance, margins, growth, cash flow, and balance-sheet signals.",
     "finance.stock_recommendation_aggregate": "Aggregate prior workflow findings into a stock recommendation with confidence and caveats.",
+    "finance.fundamental_analysis": "Perform deep fundamental analysis: review income statement, balance sheet, and cash flow. Evaluate profitability (gross/net margins, ROE, ROA), solvency (debt-to-equity, current ratio), growth (revenue/EPS CAGR), and earnings quality. Reference actual financial data from marketDataContext.",
+    "finance.technical_analysis": "Perform technical analysis: analyze price action, moving averages (MA5/10/20/60), MACD, RSI, KDJ, Bollinger Bands, volume trends, and support/resistance levels. Identify trend direction, momentum, and key technical signals.",
+    "finance.valuation_analysis": "Perform valuation analysis: assess PE/PB/PS ratios vs historical averages and sector peers. Evaluate dividend yield, PEG ratio, EV/EBITDA. Determine whether the stock is overvalued, fairly valued, or undervalued relative to intrinsic value.",
+    "finance.money_flow_analysis": "Analyze money flow patterns: institutional vs retail flow, net inflow/outflow trends, block trade activity, margin trading data, and foreign capital (northbound flow for A-shares) positioning changes.",
+    "finance.risk_assessment": "Perform comprehensive risk assessment: identify systemic risks (macro, policy, rate), sector-specific risks, company-specific risks (governance, leverage, litigation), and black swan probability. Assign risk level and key risk factors.",
   };
   return prompts[handler] || "Pass through workflow state and produce concise structured output.";
 }
@@ -480,12 +512,27 @@ function mockSummary(handler, subject, state) {
   if (handler === "condition") return `Condition evaluated for ${subject}.`;
   if (handler === "logic") return `Logic node processed ${subject}.`;
   if (handler === "general.agent") {
-    const message = typeof state?.message === "string" && state.message.trim() ? state.message.trim() : "当前问题";
-    return `当前对话引擎处于模拟模式，已收到你的问题：“${message}”。请配置真实模型 API Key 后获取完整 AI 回复。`;
+    const message = typeof state?.message === "string" && state.message.trim() ? state.message.trim() : "褰撳墠闂";
+    return `褰撳墠瀵硅瘽寮曟搸澶勪簬妯℃嫙妯″紡锛屽凡鏀跺埌浣犵殑闂锛氣€?{message}鈥濄€傝閰嶇疆鐪熷疄妯″瀷 API Key 鍚庤幏鍙栧畬鏁?AI 鍥炲銆俙;
   }
   if (handler === "finance.stock_recommendation_aggregate") {
     const keys = Object.keys(state).filter((key) => key !== "subject");
     return `Mock aggregate recommendation for ${subject} based on ${keys.length} upstream outputs.`;
+  }
+  if (handler === "finance.fundamental_analysis") {
+    return `Mock fundamental analysis for ${subject}: Revenue growth stable, margins healthy, balance sheet strong.`;
+  }
+  if (handler === "finance.technical_analysis") {
+    return `Mock technical analysis for ${subject}: Trend neutral-to-bullish, MACD positive crossover, RSI in mid-range.`;
+  }
+  if (handler === "finance.valuation_analysis") {
+    return `Mock valuation analysis for ${subject}: PE at sector median, PB below historical average, fair value estimate in range.`;
+  }
+  if (handler === "finance.money_flow_analysis") {
+    return `Mock money flow analysis for ${subject}: Net institutional inflow positive, northbound capital adding positions.`;
+  }
+  if (handler === "finance.risk_assessment") {
+    return `Mock risk assessment for ${subject}: Overall risk level moderate, key risks include market volatility and sector rotation.`;
   }
   return `Mock ${handler} result for ${subject}.`;
 }
@@ -584,7 +631,7 @@ function isMockMode() {
 }
 
 function resolveApiKey(payload) {
-  if (Object.prototype.hasOwnProperty.call(payload, "apiKey")) {
+  if (Object.prototype.hasOwnProperty.call(payload, "apiKey") && payload.apiKey) {
     return payload.apiKey;
   }
   return process.env.OPENAI_API_KEY || process.env.MARKETMIND_LANGCHAIN_API_KEY;
@@ -616,3 +663,6 @@ function withTimeout(promise, timeoutMs, message) {
 app.listen(port, "127.0.0.1", () => {
   console.log(`Aegis Alpha orchestrator listening on http://127.0.0.1:${port}`);
 });
+
+
+

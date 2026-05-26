@@ -1,5 +1,6 @@
 "use client";
 
+import { AgentTestPage, WorkflowTestPage } from "./TestPages";
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Background,
@@ -24,7 +25,9 @@ const KNOWN_APP_PATHS = new Set([
   "/portfolio/trades",
   "/portfolio/portfolios",
   "/agent",
+  "/agent/test",
   "/workflow",
+  "/workflow/test",
   "/workflow/runs",
   "/data-center/dashboard",
   "/data-center/macro",
@@ -67,7 +70,9 @@ const pageTitles = {
   "/portfolio/trades": "投资组合 / 交易流水",
   "/portfolio/portfolios": "组合列表",
   "/agent": "AI+ / Agent",
+  "/agent/test": "AI+ / Agent test",
   "/workflow": "AI+ / 工作流",
+  "/workflow/test": "AI+ / workflow test",
   "/workflow/runs": "AI+ / 运行中心",
   "/report": "Report",
   "/backtest": "回测管理",
@@ -104,7 +109,9 @@ const navItems = [
     icon: "bolt",
     children: [
       { label: "Agent", path: "/agent" },
+      { label: "Agent test", path: "/agent/test" },
       { label: "工作流", path: "/workflow" },
+            { label: "Workflow test", path: "/workflow/test" },
       { label: "运行中心", path: "/workflow/runs" },
       { label: "报告", path: "/report" },
     ],
@@ -2064,7 +2071,87 @@ function Dashboard({ api }) {
   const news = marketDataResult?.news;
   const metrics = Array.isArray(financials?.metrics) ? financials.metrics.slice(0, 5) : [];
   const articles = Array.isArray(news?.articles) ? news.articles.slice(0, 5) : [];
+  const [analysisResult, setAnalysisResult] = useState(null);
+  const [analysisLoading, setAnalysisLoading] = useState(false);
+  const [analysisError, setAnalysisError] = useState("");
+  const [showDataRequest, setShowDataRequest] = useState(false);
+  const [missingFields, setMissingFields] = useState([]);
+  const [extraInfo, setExtraInfo] = useState({ sector: "", industry: "", timeframe: "", notes: "" });
+
+  const REQUIRED_ANALYSIS_FIELDS = [
+    { key: "price", label: "\u6700\u65b0\u4ef7\u683c" },
+    { key: "changePct", label: "\u6da8\u8dcc\u5e45" },
+    { key: "marketCap", label: "\u603b\u5e02\u503c" },
+    { key: "pe", label: "\u5e02\u76c8\u7387 PE" },
+    { key: "pb", label: "\u5e02\u51c0\u7387 PB" },
+    { key: "dividendYield", label: "\u80a1\u606f\u7387" },
+    { key: "week52High", label: "52\u5468\u6700\u9ad8" },
+    { key: "week52Low", label: "52\u5468\u6700\u4f4e" },
+  ];
+
+  function resolveAnalysisFieldValue(key) {
+    const q = quote || {};
+    const f = financials || {};
+    const pick = (v) => (v === undefined || v === null || v === "" ? "" : String(v));
+    switch (key) {
+      case "price": return pick(q.price);
+      case "changePct": return pick(q.changePct);
+      case "marketCap": return pick(q.marketCap ?? f.marketCap);
+      case "pe": return pick(q.pe ?? f.pe);
+      case "pb": return pick(q.pb ?? f.pb);
+      case "dividendYield": return pick(q.dividendYield ?? f.dividendYield);
+      case "week52High": return pick(q.week52High ?? f.week52High);
+      case "week52Low": return pick(q.week52Low ?? f.week52Low);
+      default: return "";
+    }
+  }
+
+  const openDataRequest = useCallback(() => {
+    const missing = REQUIRED_ANALYSIS_FIELDS.filter((field) => !resolveAnalysisFieldValue(field.key));
+    setMissingFields(missing);
+    setShowDataRequest(true);
+  }, [quote, financials]);
+
+  const generateDeepAnalysis = useCallback(async () => {
+    const missing = REQUIRED_ANALYSIS_FIELDS.filter((field) => !resolveAnalysisFieldValue(field.key));
+    if (missing.length) {
+      setMissingFields(missing);
+      setShowDataRequest(true);
+      return;
+    }
+    const payload = [
+      `\u80a1\u7968\u4ee3\u7801: ${marketSymbol}`,
+      quote?.name ? `\u540d\u79f0: ${quote.name}` : "",
+      resolveAnalysisFieldValue("price") ? `\u6700\u65b0\u4ef7\u683c: ${resolveAnalysisFieldValue("price")}` : "",
+      resolveAnalysisFieldValue("changePct") ? `\u6da8\u8dcc\u5e45: ${resolveAnalysisFieldValue("changePct")}%` : "",
+      resolveAnalysisFieldValue("marketCap") ? `\u603b\u5e02\u503c: ${resolveAnalysisFieldValue("marketCap")}` : "",
+      resolveAnalysisFieldValue("pe") ? `PE(TTM): ${resolveAnalysisFieldValue("pe")}` : "",
+      resolveAnalysisFieldValue("pb") ? `PB: ${resolveAnalysisFieldValue("pb")}` : "",
+      resolveAnalysisFieldValue("dividendYield") ? `\u80a1\u606f\u7387: ${resolveAnalysisFieldValue("dividendYield")}` : "",
+      resolveAnalysisFieldValue("week52High") ? `52\u5468\u6700\u9ad8: ${resolveAnalysisFieldValue("week52High")}` : "",
+      resolveAnalysisFieldValue("week52Low") ? `52\u5468\u6700\u4f4e: ${resolveAnalysisFieldValue("week52Low")}` : "",
+      extraInfo.sector ? `\u884c\u4e1a: ${extraInfo.sector}` : "",
+      extraInfo.industry ? `\u7ec6\u5206\u884c\u4e1a: ${extraInfo.industry}` : "",
+      extraInfo.timeframe ? `\u5173\u6ce8\u5468\u671f: ${extraInfo.timeframe}` : "",
+      extraInfo.notes ? `\u8865\u5145\u8bf4\u660e: ${extraInfo.notes}` : "",
+    ].filter(Boolean).join("
+");
+
+    setAnalysisLoading(true);
+    setAnalysisError("");
+    try {
+      const result = await api("/chat/messages", { method: "POST", body: JSON.stringify({ message: payload, workflowKey: "deep_dive", state: { ticker: marketSymbol, symbol: marketSymbol, sector: extraInfo.sector, industry: extraInfo.industry } }) });
+      const content = result?.content || result?.message || "\u672a\u8fd4\u56de\u5206\u6790\u5185\u5bb9";
+      setAnalysisResult(content);
+    } catch (ex) {
+      setAnalysisError(ex.message || "\u751f\u6210\u6df1\u5ea6\u5206\u6790\u5931\u8d25");
+    } finally {
+      setAnalysisLoading(false);
+    }
+  }, [api, marketSymbol, quote, financials, extraInfo]);
+
   return (
+
     <div>
       <h2 className="text-lg font-semibold text-gray-800 mb-6">数据中心仪表盘</h2>
       <div className="mb-6 grid grid-cols-1 gap-4 lg:grid-cols-2">
@@ -3105,8 +3192,10 @@ export default function App() {
   if (!token) return <LoginPage onLogin={login} />;
 
   let page = <Home navigate={navigate} openCopilotWithPrompt={openCopilotWithPrompt} />;
-  if (path === "/agent") page = <AgentPage api={api} />;
+  if (path === "/agent/test") page = <AgentTestPage api={api} />;
+  else if (path === "/agent") page = <AgentPage api={api} />;
   else if (path === "/workflow/runs") page = <WorkflowRunCenterPage api={api} />;
+  else if (path === "/workflow/test") page = <WorkflowTestPage api={api} />;
   else if (path === "/workflow") page = <WorkflowPage api={api} />;
   else if (path.startsWith("/portfolio")) page = <Portfolio api={api} navigate={navigate} path={path} />;
   else if (path === "/data-center/dashboard") page = <Dashboard api={api} />;

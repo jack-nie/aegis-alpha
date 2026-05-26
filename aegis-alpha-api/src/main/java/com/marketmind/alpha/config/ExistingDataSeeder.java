@@ -58,12 +58,13 @@ public class ExistingDataSeeder implements CommandLineRunner {
 
     private void seedWorkflows() {
         if (workflowMapper.countDefinitions() == 0) {
-            workflow("daily", "Daily Graph", 1, 7, 6);
-            workflow("deep_dive", "Deep Dive Graph", 1, 17, 16);
-            workflow("exit_workflow", "Exit Workflow", 1, 8, 8);
-            workflow("portfolio_workflow", "Portfolio Workflow", 1, 6, 5);
-            workflow("position_workflow", "Position Workflow", 1, 23, 23);
-            workflow("sector-analyst-workflow", "Sector Analyst Workflow", 1, 16, 15);
+            workflow("daily", "Daily Graph", 1, 7, 7);
+            workflow("deep_dive", "Deep Dive Graph", 1, 17, 18);
+            workflow("exit_workflow", "Exit Workflow", 1, 9, 9);
+            workflow("portfolio_workflow", "Portfolio Workflow", 1, 7, 7);
+            workflow("position_workflow", "Position Workflow", 1, 15, 16);
+            workflow("sector-analyst-workflow", "Sector Analyst Workflow", 1, 15, 16);
+            workflow("stock_analysis", "Stock Analysis", 1, 9, 10);
 
             WorkflowRun run = new WorkflowRun();
             run.setRunId(UUID.randomUUID().toString());

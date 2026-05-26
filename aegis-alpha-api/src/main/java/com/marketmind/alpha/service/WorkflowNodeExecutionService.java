@@ -110,13 +110,17 @@ public class WorkflowNodeExecutionService {
     private boolean isQuoteHandler(String functionName) {
         return "fdb.daily_ohlc".equals(functionName)
                 || "fdb.money_flow".equals(functionName)
-                || "finance.market_analysis".equals(functionName);
+                || "finance.market_analysis".equals(functionName)
+                || "finance.technical_analysis".equals(functionName)
+                || "finance.money_flow_analysis".equals(functionName);
     }
 
     private boolean isFinancialHandler(String functionName) {
         return "fdb.fundamental_data".equals(functionName)
                 || "fdb.financial_ratios".equals(functionName)
-                || "finance.financial_interpretation".equals(functionName);
+                || "finance.financial_interpretation".equals(functionName)
+                || "finance.fundamental_analysis".equals(functionName)
+                || "finance.valuation_analysis".equals(functionName);
     }
 
     private boolean isNewsHandler(String functionName) {
@@ -125,6 +129,7 @@ public class WorkflowNodeExecutionService {
                 || "finance.industry_news".equals(functionName)
                 || "finance.sentiment_monitor".equals(functionName)
                 || "finance.tech_breakthrough".equals(functionName)
+                || "finance.risk_assessment".equals(functionName)
                 || "general.web_search".equals(functionName)
                 || "general.fetch_news".equals(functionName)
                 || "general.get_sector_news".equals(functionName)

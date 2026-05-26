@@ -83,6 +83,22 @@ class ApiContractTest {
             workflow.setNodes(7);
             workflow.setEdges(6);
             workflowMapper.insertDefinition(workflow);
+            WorkflowDefinition stockAnalysis = new WorkflowDefinition();
+            stockAnalysis.setWorkflowKey("stock_analysis");
+            stockAnalysis.setName("Stock Analysis");
+            stockAnalysis.setVersion(1);
+            stockAnalysis.setNodes(9);
+            stockAnalysis.setEdges(10);
+            workflowMapper.insertDefinition(stockAnalysis);
+        }
+        if (workflowMapper.findDefinition("stock_analysis") == null) {
+            WorkflowDefinition sa = new WorkflowDefinition();
+            sa.setWorkflowKey("stock_analysis");
+            sa.setName("Stock Analysis");
+            sa.setVersion(1);
+            sa.setNodes(9);
+            sa.setEdges(10);
+            workflowMapper.insertDefinition(sa);
         }
         if (dashboardMapper.countQuadrant() == 0) {
             dashboardMapper.insertQuadrant("2025-03-01", 3, 4, 1, 4);
@@ -705,6 +721,41 @@ class ApiContractTest {
                 .andExpect(jsonPath("$[?(@.workflowRunId == '" + runId + "')].symbol", hasItem("AAPL")))
                 .andExpect(jsonPath("$[?(@.workflowRunId == '" + runId + "')].nodeCount", hasItem(5)))
                 .andExpect(jsonPath("$[?(@.workflowRunId == '" + runId + "')].resultJson", hasSize(1)));
+    }
+
+    @Test
+    void stockAnalysisWorkflowExecutesAllNodesWithDefaultLayout() throws Exception {
+        String login = mockMvc.perform(post("/_backend/auth/login")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"username\":\"guanghui.nie\",\"password\":\"guanghui.nie\"}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.access_token", notNullValue()))
+                .andReturn().getResponse().getContentAsString();
+        String token = login.replaceAll(".*\"access_token\":\"([^\"]+)\".*", "$1");
+        String auth = "Bearer " + token;
+
+        // Verify stock_analysis layout returns the default parallel DAG
+        mockMvc.perform(get("/_backend/workflows/stock_analysis/layout").header("Authorization", auth))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.workflowKey").value("stock_analysis"))
+                .andExpect(jsonPath("$.nodes", hasSize(9)))
+                .andExpect(jsonPath("$.edges", hasSize(10)));
+
+        // Run the workflow
+        String runJson = mockMvc.perform(post("/_backend/workflows/stock_analysis/run").header("Authorization", auth)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"subject\":\"AAPL individual stock analysis\",\"inputs\":{\"ticker\":\"AAPL\",\"subject\":\"AAPL\"}}"))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.workflowKey").value("stock_analysis"))
+                .andExpect(jsonPath("$.status").value("COMPLETED"))
+                .andExpect(jsonPath("$.traceId", notNullValue()))
+                .andReturn().getResponse().getContentAsString();
+        String runId = runJson.replaceAll(".*\"runId\":\"([^\"]+)\".*", "$1");
+
+        // Verify all 9 nodes executed
+        mockMvc.perform(get("/_backend/workflow/runs/" + runId + "/nodes").header("Authorization", auth))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$", hasSize(9)));
     }
 
     private Map<String, Object> marketOverview() {

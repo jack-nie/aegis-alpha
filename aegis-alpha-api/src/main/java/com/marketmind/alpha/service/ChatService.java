@@ -24,7 +24,7 @@ public class ChatService {
 
     /* ---- the 6 valid workflow keys seeded in ExistingDataSeeder ---- */
     private static final Set<String> VALID_WORKFLOW_KEYS = Collections.unmodifiableSet(new HashSet<String>(Arrays.asList(
-            "daily", "deep_dive", "exit_workflow",
+            "daily", "deep_dive", "stock_recommendation_research", "exit_workflow",
             "portfolio_workflow", "position_workflow", "sector-analyst-workflow"
     )));
 
@@ -83,7 +83,7 @@ public class ChatService {
         }
         /* deep dive */
         if (matchesAny(msg,
-                "深度分析", "深度研究", "深入研究", "deep dive", "deep analysis")) {
+                "深度分析", "深度研究", "深入研究", "个股分析", "股票分析", "分析个股", "分析股票", "deep dive", "deep analysis", "stock analysis", "analyze stock")) {
             return "deep_dive";
         }
         /* exit workflow */
@@ -260,6 +260,11 @@ public class ChatService {
         String chineseResolved = marketDataService.resolveAShareSymbolPublic(msg);
         if (chineseResolved != null && !chineseResolved.equals(msg) && !chineseResolved.isEmpty()) {
             return cleanTicker(chineseResolved);
+        }
+
+        String normalized = marketDataService.normalizeSymbolPublic(msg);
+        if (normalized != null && !normalized.isEmpty()) {
+            return normalized;
         }
 
         Matcher aShareMatcher = A_SHARE_CODE_PATTERN.matcher(msg);

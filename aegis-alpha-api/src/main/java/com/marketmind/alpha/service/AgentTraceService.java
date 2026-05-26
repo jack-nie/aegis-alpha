@@ -10,6 +10,7 @@ import org.springframework.stereotype.Service;
 import java.time.Duration;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
+import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.UUID;
 
@@ -40,11 +41,31 @@ public class AgentTraceService {
         span.setStartedAt(nodeRun.getStartedAt());
         span.setCompletedAt(nodeRun.getCompletedAt() == null ? now() : nodeRun.getCompletedAt());
         span.setLatencyMs(latencyMillis(nodeRun.getStartedAt(), span.getCompletedAt()));
-        span.setPromptTokens(number(output, "promptTokens"));
-        span.setCompletionTokens(number(output, "completionTokens"));
-        span.setTotalTokens(number(output, "totalTokens"));
+        Map<String, Object> usage = usageFrom(output);
+        span.setPromptTokens(number(usage, "prompt_tokens"));
+        span.setCompletionTokens(number(usage, "completion_tokens"));
+        span.setTotalTokens(number(usage, "total_tokens"));
         span.setSortOrder(nodeRun.getSortOrder());
         mapper.insert(span);
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> usageFrom(Map<String, Object> output) {
+        if (output == null) {
+            return new LinkedHashMap<>();
+        }
+        Object data = output.get("data");
+        if (data instanceof Map) {
+            Object usage = ((Map<String, Object>) data).get("usage");
+            if (usage instanceof Map) {
+                return (Map<String, Object>) usage;
+            }
+        }
+        Object usage = output.get("usage");
+        if (usage instanceof Map) {
+            return (Map<String, Object>) usage;
+        }
+        return output;
     }
 
     private Long latencyMillis(String startedAt, String completedAt) {

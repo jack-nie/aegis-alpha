@@ -794,10 +794,15 @@ public class MarketDataService {
         CHINESE_STOCK_NAMES.put("紫金矿业", "601899.SH");
         CHINESE_STOCK_NAMES.put("中国中免", "601888.SH");
         CHINESE_STOCK_NAMES.put("片仔癌", "600436.SH");
+        CHINESE_STOCK_NAMES.put("生益科技", "600183.SH");
     }
 
     public String resolveAShareSymbolPublic(String input) {
         return resolveAShareSymbol(input);
+    }
+
+    public String normalizeSymbolPublic(String symbol) {
+        try { return normalizeSymbol(symbol); } catch (Exception e) { return ""; }
     }
 
     private String resolveAShareSymbol(String input) {

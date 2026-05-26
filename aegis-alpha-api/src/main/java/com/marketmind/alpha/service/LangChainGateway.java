@@ -96,8 +96,12 @@ public class LangChainGateway {
     private Map<String, Object> callLangGraph(AgentTemplate agent, Map<String, Object> state, Map<String, Object> node, String subject, String path) {
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("provider", provider);
-        body.put("apiKey", apiKey);
-        body.put("baseUrl", baseUrl);
+        if (apiKey != null && !apiKey.trim().isEmpty()) {
+            body.put("apiKey", apiKey);
+        }
+        if (baseUrl != null && !baseUrl.trim().isEmpty()) {
+            body.put("baseUrl", baseUrl);
+        }
         body.put("model", resolveModel(agent));
         body.put("agent", agent);
         body.put("state", state);
