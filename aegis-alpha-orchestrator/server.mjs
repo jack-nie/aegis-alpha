@@ -9,6 +9,7 @@ import { ChatOpenAI } from "@langchain/openai";
 import { HumanMessage, SystemMessage } from "@langchain/core/messages";
 
 import crypto from "crypto";
+import { StateGraph, START, END } from "@langchain/langgraph";
 
 const app = express();
 app.use(express.json({ limit: "2mb" }));
@@ -50,6 +51,186 @@ const HANDLERS = new Set([
   "finance.entry_strategy",
 ]);
 const FALLBACK_HANDLERS = new Set(["start", "end", "condition", "logic"]);
+
+// --- LangGraph StateGraph engine ---
+
+function buildWorkflowGraph(payload) {
+  const nodes = Array.isArray(payload.nodes) ? payload.nodes : [];
+  const edges = Array.isArray(payload.edges) ? payload.edges : [];
+  const config = {
+    apiKey: payload.apiKey,
+    baseUrl: payload.baseUrl,
+    provider: payload.provider,
+    model: payload.model,
+  };
+
+  // Build adjacency maps
+  const outgoing = {};
+  const incoming = {};
+  const nodeIds = new Set(nodes.map((n) => n.id));
+  for (const n of nodes) {
+    outgoing[n.id] = [];
+    incoming[n.id] = [];
+  }
+  for (const e of edges) {
+    if (nodeIds.has(e.source) && nodeIds.has(e.target)) {
+      outgoing[e.source] = outgoing[e.source] || [];
+      incoming[e.target] = incoming[e.target] || [];
+      outgoing[e.source].push(e.target);
+      incoming[e.target].push(e.source);
+    }
+  }
+
+  const graph = new StateGraph({
+    channels: {
+      finalState: {
+        reducer: (current, update) => ({ ...current, ...update }),
+        default: () => ({}),
+      },
+      trace: {
+        reducer: (current, update) => current.concat(update),
+        default: () => [],
+      },
+      nodeOutputs: {
+        reducer: (current, update) => ({ ...current, ...update }),
+        default: () => ({}),
+      },
+      subject: { default: () => "Aegis Alpha workflow" },
+      _config: { default: () => ({}) },
+    },
+  });
+
+  // Add a node function for each workflow node
+  for (const node of nodes) {
+    const nodeFn = async (state) => {
+      const startedAt = new Date().toISOString();
+      const nodePayload = {
+        ...config,
+        state: state.finalState,
+        node,
+        subject: state.subject,
+      };
+      let result;
+      try {
+        result = await executeNode(nodePayload);
+      } catch (error) {
+        result = fallbackNodeResult(nodePayload, error);
+      }
+      const traceEntry = {
+        nodeId: result.nodeId || node.id,
+        nodeName: result.nodeName || (node.data && node.data.label) || node.id,
+        handler: result.handler,
+        status: result.status,
+        ok: result.ok,
+        degraded: result.degraded,
+        startedAt,
+        completedAt: new Date().toISOString(),
+        durationMs: result.durationMs,
+      };
+      const stateUpdate = { [node.id]: result };
+      if (result.handler) {
+        stateUpdate[result.handler] = result;
+      }
+      return {
+        finalState: stateUpdate,
+        trace: [traceEntry],
+        nodeOutputs: { [node.id]: result },
+      };
+    };
+    graph.addNode(node.id, nodeFn);
+  }
+
+  // Wire edges
+  // Find source nodes (no incoming from other nodes) -> connect from START
+  for (const node of nodes) {
+    const incomers = incoming[node.id] || [];
+    if (incomers.length === 0) {
+      graph.addEdge(START, node.id);
+    }
+  }
+
+  // Wire inter-node edges
+  for (const e of edges) {
+    if (nodeIds.has(e.source) && nodeIds.has(e.target)) {
+      graph.addEdge(e.source, e.target);
+    }
+  }
+
+  // Find sink nodes (no outgoing to other nodes) -> connect to END
+  for (const node of nodes) {
+    const outgoers = outgoing[node.id] || [];
+    if (outgoers.length === 0) {
+      graph.addEdge(node.id, END);
+    }
+  }
+
+  return graph.compile();
+}
+
+// --- SSE streaming endpoint ---
+
+app.post("/stream-workflow", async (req, res) => {
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no");
+  res.flushHeaders();
+
+  try {
+    const payload = req.body || {};
+    const compiledGraph = buildWorkflowGraph(payload);
+    const subject = payload.subject || payload.state?.subject || "Aegis Alpha workflow";
+    const initialState = {
+      finalState: { ...(payload.state || {}), subject },
+      trace: [],
+      nodeOutputs: {},
+      subject,
+      _config: {
+        apiKey: payload.apiKey,
+        baseUrl: payload.baseUrl,
+        provider: payload.provider,
+        model: payload.model,
+      },
+    };
+
+    const stream = await compiledGraph.stream(initialState, { streamMode: "updates" });
+    for await (const chunk of stream) {
+      for (const [nodeName, update] of Object.entries(chunk)) {
+        const traceEntry = (update.trace && update.trace[0]) || {};
+        const nodeOutput = (update.nodeOutputs && update.nodeOutputs[nodeName]) || {};
+        const event = {
+          event: traceEntry.ok !== false ? "node_completed" : "node_failed",
+          nodeId: nodeName,
+          nodeName: traceEntry.nodeName || nodeName,
+          handler: traceEntry.handler,
+          status: nodeOutput.status || traceEntry.status || "ok",
+          ok: nodeOutput.ok !== undefined ? nodeOutput.ok : traceEntry.ok,
+          degraded: nodeOutput.degraded,
+          startedAt: traceEntry.startedAt,
+          completedAt: traceEntry.completedAt,
+          durationMs: traceEntry.durationMs,
+        };
+        res.write("event: node_update
+data: " + JSON.stringify(event) + "
+
+");
+      }
+    }
+
+    res.write("event: workflow_complete
+data: {"ok":true}
+
+");
+    res.end();
+  } catch (error) {
+    const errData = JSON.stringify({ ok: false, error: error?.message || String(error) });
+    res.write("event: error
+data: " + errData + "
+
+");
+    res.end();
+  }
+});
 
 app.get("/health", (_, res) => {
   res.json({
@@ -729,60 +910,96 @@ Answer in Chinese.`,
 
     "finance.stock_recommendation_aggregate": `你是资深投资研究分析师。请从上游工作流节点的输出中提取所有数据，生成一份完整的股票深度分析报告。
 
-**必须按照以下模板格式输出 summary（使用 Markdown 格式）：**
+**必须按照以下模板格式输出 summary（使用 Markdown 格式，包含 emoji 和表格）：**
 
-# {股票名称}（{代码}）深度分析
+# 📊 {股票名称}（{代码}）深度分析报告
 
-## 公司概览
-{公司简介：主营业务、总部、产品应用领域}
-行业：{行业分类}
-代码：{交易所代码}
-董事长/CEO：{姓名}
+> 📅 分析日期：{日期} | 🔍 数据来源：实时行情 + 公开财报
 
-## 行情与估值（截至 {日期}）
-| 指标 | 数据 |
+## 🏢 公司概览
+{公司简介：主营业务、总部、产品应用领域，2-3句话}
+
+| 属性 | 信息 |
 |------|------|
-| 最新股价 | {价格}（{涨跌幅}） |
-| 总市值 | {市值} |
-| TTM市盈率 | {PE} |
-| 市净率（PB） | {PB} |
-| 股息率 | {股息率} |
-| 每股净资产 | {数值} |
-| 52周区间 | {低} – {高} |
+| 🏭 行业 | {行业分类} |
+| 📋 代码 | {交易所代码} |
+| 👤 董事长/CEO | {姓名} |
+| 🌍 市场 | {交易所/市场} |
+| 🏆 行业地位 | {龙头/第二梯队/跟随者} |
 
-## 技术面分析
+## 💰 行情与估值（截至 {日期}）
+
+| 指标 | 数据 | 评价 |
+|------|------|------|
+| 💲 最新股价 | **{价格}**（{涨跌幅}） | {涨/跌/平} |
+| 📈 总市值 | {市值} | {大盘/中盘/小盘} |
+| 📊 TTM市盈率 | {PE} | {高估/合理/低估} |
+| 📘 市净率（PB） | {PB} | {偏高/适中/偏低} |
+| 💵 股息率 | {股息率} | {有无分红吸引力} |
+| 📉 52周区间 | {低} – {高} | {当前位置描述} |
+
+## 📉 技术面分析
+
 | 指标 | 数值 | 信号 |
 |------|------|------|
-| 布林带中轨 | {数值} | {信号} |
-| RSI | {数值} | {信号} |
-| MACD | {数值} | {信号} |
-趋势判断：{多头/空头/震荡}，{具体描述}
+| 📊 RSI | {数值} | {超买/超卖/中性} |
+| 📈 MACD | {数值} | {金叉/死叉/背离} |
+| 📉 KDJ | K={K} D={D} J={J} | {信号} |
+| 🎯 布林带 | 上:{上轨} 中:{中轨} 下:{下轨} | {位置} |
+| 📏 均线排列 | MA5/MA10/MA20/MA60 | {多头/空头/交织} |
 
-## 基本面分析
-### 最新业绩亮点
-| 指标 | 数值 | 同比变化 |
-|------|------|----------|
-| 营业收入 | {数值} | {变化} |
-| 归母净利润 | {数值} | {变化} |
-| 扣非净利润 | {数值} | {变化} |
+**趋势判断：** {多头/空头/震荡} — {具体描述2-3句}
+**关键位：** 支撑 {支撑位} | 阻力 {阻力位}
 
-### 核心催化剂
-{列出2-3个核心增长驱动力}
+## 📋 基本面分析
 
-## 主要风险
-| 风险因素 | 说明 |
-|----------|------|
-| {风险1} | {说明} |
-| {风险2} | {说明} |
-| {风险3} | {说明} |
+### 💎 最新业绩亮点
 
-## 总结判断
-{综合基本面、技术面、估值面的判断，2-3段}
-建议：{具体投资建议}
+| 指标 | 数值 | 同比变化 | 趋势 |
+|------|------|----------|------|
+| 营业收入 | {数值} | {变化} | {↑/↓/→} |
+| 归母净利润 | {数值} | {变化} | {↑/↓/→} |
+| 毛利率 | {数值} | {变化} | {↑/↓/→} |
+| ROE | {数值} | — | {优秀/良好/一般} |
 
-注：本分析基于公开数据，不构成投资建议。
+### 🔑 核心催化剂
+1. **{催化剂1}** — {简要说明}
+2. **{催化剂2}** — {简要说明}
+3. **{催化剂3}** — {简要说明}
 
-**重要：如果上游节点提供了具体数据（价格、PE、PB、新闻标题等），必须在报告中引用。不要说"数据不足"。**`,
+### 🆚 同业对比（如有数据）
+| 公司 | 市值 | PE | 毛利率 |
+|------|------|-----|--------|
+| **{本股票}** | **{数值}** | **{PE}** | **{毛利率}** |
+| {竞争对手1} | {数值} | {PE} | {毛利率} |
+| {竞争对手2} | {数值} | {PE} | {毛利率} |
+
+## ⚠️ 主要风险
+
+| 🔴 风险因素 | 📝 说明 | ⭐ 影响程度 |
+|-------------|---------|-----------|
+| {风险1} | {详细说明} | {高/中/低} |
+| {风险2} | {详细说明} | {高/中/低} |
+| {风险3} | {详细说明} | {高/中/低} |
+| {风险4} | {详细说明} | {高/中/低} |
+
+## 🎯 总结判断
+
+{综合基本面、技术面、估值面的判断，2-3段，需引用具体数据支撑}
+
+### 投资建议
+| 维度 | 判断 |
+|------|------|
+| 📈 短期（1-4周） | {看多/中性/看空} — {理由} |
+| 📊 中期（1-6月） | {看多/中性/看空} — {理由} |
+| 🏦 长期（6月+） | {看多/中性/看空} — {理由} |
+| 🎯 建议操作 | {买入/持有/观望/减仓} |
+| 💲 建议价位 | 回调至 {价位} 附近关注 |
+| 🛑 止损参考 | 跌破 {价位} 考虑止损 |
+
+> ⚠️ 免责声明：本分析基于公开数据，仅供参考，不构成投资建议。投资有风险，入市需谨慎。
+
+**重要：如果上游节点提供了具体数据（价格、PE、PB、新闻标题等），必须在报告中引用。不要说数据不足。**`,
 
     "finance.fundamental_analysis": `Perform deep fundamental analysis for the subject stock. Return JSON with these fields in data:
 - "revenue": latest quarterly/annual revenue with currency

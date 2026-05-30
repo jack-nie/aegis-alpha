@@ -11,9 +11,11 @@ import com.marketmind.alpha.service.WorkflowService;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
+import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
 
 @RestController
 @RequestMapping("/_backend")
@@ -171,6 +173,28 @@ public class WorkflowController {
                 ? workflowService.queueStart(workflowKey, subject, body == null ? null : objectMap(body.get("inputs")), idempotencyKey)
                 : workflowService.start(workflowKey, subject, body == null ? null : objectMap(body.get("inputs")), idempotencyKey);
         return ResponseEntity.status(async ? HttpStatus.ACCEPTED : HttpStatus.CREATED).body(run);
+    }
+
+    @PostMapping("/workflows/{workflowKey}/run/stream")
+    public SseEmitter streamWorkflow(@RequestHeader(value = "Authorization", required = false) String authorization,
+                                      @PathVariable String workflowKey,
+                                      @RequestBody(required = false) Map<String, Object> body) {
+        if (authService.me(authorization) == null) {
+            SseEmitter rejected = new SseEmitter();
+            rejected.completeWithError(new RuntimeException("Unauthorized"));
+            return rejected;
+        }
+        String subject = body == null ? null : string(body.get("subject"));
+        Map<String, Object> inputs = body == null ? null : objectMap(body.get("inputs"));
+        SseEmitter emitter = new SseEmitter(300000L);
+        CompletableFuture.runAsync(() -> {
+            try {
+                workflowService.startWithStreaming(workflowKey, subject, inputs, emitter);
+            } catch (Exception ex) {
+                try { emitter.completeWithError(ex); } catch (Exception ignored) {}
+            }
+        });
+        return emitter;
     }
 
     @PostMapping("/workflow/runs/{runId}/dispatch")

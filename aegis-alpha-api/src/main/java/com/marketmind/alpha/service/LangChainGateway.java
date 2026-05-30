@@ -122,6 +122,33 @@ public class LangChainGateway {
         return wrapped;
     }
 
+    public String streamWorkflowUrl() {
+        return trimSlash(engineUrl) + "/stream-workflow";
+    }
+
+    public String buildStreamBody(Map<String, Object> layout, String subject, Map<String, Object> inputs) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        if (apiKey != null && !apiKey.trim().isEmpty()) {
+            body.put("apiKey", apiKey);
+        }
+        if (baseUrl != null && !baseUrl.trim().isEmpty()) {
+            body.put("baseUrl", baseUrl);
+        }
+        body.put("provider", provider);
+        body.put("model", defaultModel);
+        body.put("nodes", layout.get("nodes"));
+        body.put("edges", layout.get("edges"));
+        body.put("subject", subject);
+        Map<String, Object> state = new LinkedHashMap<>(inputs);
+        state.put("subject", subject);
+        body.put("state", state);
+        try {
+            return objectMapper.writeValueAsString(body);
+        } catch (Exception ex) {
+            throw new IllegalStateException("Failed to build stream body", ex);
+        }
+    }
+
     @SuppressWarnings("unchecked")
     public Map<String, Object> classifyIntent(String message, java.util.List<Map<String, String>> workflows) {
         if (!enabled) {
