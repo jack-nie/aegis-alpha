@@ -17,19 +17,19 @@ import java.util.List;
 
 @Mapper
 public interface WorkflowMapper {
-    @Select("select workflow_key, name, description, engine, version, nodes, edges, readonly_flag, owner_username, updated_at from workflow_definition order by readonly_flag desc, updated_at desc, nodes asc")
+    @Select("select workflow_key, name, description, engine, version, nodes, edges, readonly_flag, owner_username, updated_at, trigger_keywords, routing_description from workflow_definition order by readonly_flag desc, updated_at desc, nodes asc")
     List<WorkflowDefinition> findDefinitions();
 
-    @Select("select workflow_key, name, description, engine, version, nodes, edges, readonly_flag, owner_username, updated_at from workflow_definition where workflow_key = #{workflowKey}")
+    @Select("select workflow_key, name, description, engine, version, nodes, edges, readonly_flag, owner_username, updated_at, trigger_keywords, routing_description from workflow_definition where workflow_key = #{workflowKey}")
     WorkflowDefinition findDefinition(String workflowKey);
 
     @Select("select count(*) from workflow_definition")
     int countDefinitions();
 
-    @Insert("insert into workflow_definition(workflow_key, name, description, engine, version, nodes, edges, readonly_flag, owner_username, updated_at) values(#{workflowKey}, #{name}, coalesce(#{description}, ''), coalesce(#{engine}, 'langgraph'), #{version}, #{nodes}, #{edges}, #{readonlyFlag}, #{ownerUsername}, coalesce(#{updatedAt}, ''))")
+    @Insert("insert into workflow_definition(workflow_key, name, description, engine, version, nodes, edges, readonly_flag, owner_username, updated_at, trigger_keywords, routing_description) values(#{workflowKey}, #{name}, coalesce(#{description}, ''),  coalesce(#{engine}, 'langgraph'), #{version}, #{nodes}, #{edges}, #{readonlyFlag}, #{ownerUsername}, coalesce(#{updatedAt}, ''), #{triggerKeywords}, #{routingDescription})")
     void insertDefinition(WorkflowDefinition definition);
 
-    @Update("update workflow_definition set name = #{name}, description = #{description}, engine = #{engine}, version = #{version}, nodes = #{nodes}, edges = #{edges}, readonly_flag = #{readonlyFlag}, owner_username = #{ownerUsername}, updated_at = #{updatedAt} where workflow_key = #{workflowKey}")
+    @Update("update workflow_definition set name = #{name}, description = #{description}, engine = #{engine}, version = #{version}, nodes = #{nodes}, edges = #{edges}, readonly_flag = #{readonlyFlag}, owner_username = #{ownerUsername}, updated_at = #{updatedAt}, trigger_keywords = #{triggerKeywords}, routing_description = #{routingDescription} where workflow_key = #{workflowKey}")
     void updateDefinition(WorkflowDefinition definition);
 
     @Delete("delete from workflow_definition where workflow_key = #{workflowKey} and readonly_flag = 0")

@@ -32,4 +32,10 @@ public class WorkflowDefinition {
     public void setOwnerUsername(String ownerUsername) { this.ownerUsername = ownerUsername; }
     public String getUpdatedAt() { return updatedAt; }
     public void setUpdatedAt(String updatedAt) { this.updatedAt = updatedAt; }
+    private String triggerKeywords;
+    private String routingDescription;
+    public String getTriggerKeywords() { return triggerKeywords; }
+    public void setTriggerKeywords(String triggerKeywords) { this.triggerKeywords = triggerKeywords; }
+    public String getRoutingDescription() { return routingDescription; }
+    public void setRoutingDescription(String routingDescription) { this.routingDescription = routingDescription; }
 }

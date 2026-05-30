@@ -58,13 +58,27 @@ public class ExistingDataSeeder implements CommandLineRunner {
 
     private void seedWorkflows() {
         if (workflowMapper.countDefinitions() == 0) {
-            workflow("daily", "Daily Graph", 1, 7, 7);
-            workflow("deep_dive", "Deep Dive Graph", 1, 17, 18);
-            workflow("exit_workflow", "Exit Workflow", 1, 9, 9);
-            workflow("portfolio_workflow", "Portfolio Workflow", 1, 7, 7);
-            workflow("position_workflow", "Position Workflow", 1, 15, 16);
-            workflow("sector-analyst-workflow", "Sector Analyst Workflow", 1, 15, 16);
-            workflow("stock_analysis", "Stock Analysis", 1, 9, 10);
+            workflow("daily", "Daily Graph", 1, 7, 7,
+                    "日报,晨报,每日,盘前,daily,morning briefing,daily graph",
+                    "Generate daily market briefing with market overview, sector rotation, sentiment pulse, and key indicators summary");
+            workflow("deep_dive", "Deep Dive Graph", 1, 17, 18,
+                    "深度分析,深度研究,个股分析,股票分析,分析个股,分析股票,deep dive,deep analysis,stock analysis,analyze stock,帮我分析,分析一下",
+                    "Perform comprehensive deep-dive analysis on a specific stock covering 15 dimensions: fundamental, technical, valuation, money flow, industry, sentiment, news, tech breakthrough, risk, peer comparison, catalyst, thesis, risk-reward, entry strategy, and final recommendation");
+            workflow("exit_workflow", "Exit Workflow", 1, 9, 9,
+                    "止损,止盈,卖出,平仓,退出,exit,stop loss,take profit,close position",
+                    "Analyze exit signals for a position including stop-loss review, take-profit review, signal decay, news risk scan, and exit decision");
+            workflow("portfolio_workflow", "Portfolio Workflow", 1, 7, 7,
+                    "投资组合,资产配置,组合分析,portfolio,asset allocation,portfolio workflow",
+                    "Analyze investment portfolio including holdings overview, market scan, sector exposure, risk metrics, and rebalancing plan");
+            workflow("position_workflow", "Position Workflow", 1, 15, 16,
+                    "仓位,持仓,建仓,加仓,减仓,头寸,position sizing,position management,open position,add position",
+                    "Manage position sizing and analysis including P&L analysis, cost basis, duration analysis, correlation, concentration risk, sector breakdown, cash flow, sentiment, tax impact, hedge ideas, and action items");
+            workflow("sector-analyst-workflow", "Sector Analyst Workflow", 1, 15, 16,
+                    "板块,行业,行业分析,sector,industry analysis,sector analyst",
+                    "Analyze an industry sector including macro environment, industry chain, policy impact, competitive map, top players, tech trends, valuation band, sector sentiment, capital flow, sector risk, catalyst calendar, rotation signal, and sector recommendation");
+            workflow("stock_analysis", "Stock Analysis", 1, 9, 10,
+                    "股票分析,综合分析,stock analysis,comprehensive analysis",
+                    "Comprehensive stock analysis covering fundamental, technical, valuation, money flow, sentiment, risk, and aggregate recommendation");
 
             WorkflowRun run = new WorkflowRun();
             run.setRunId(UUID.randomUUID().toString());
@@ -76,11 +90,13 @@ public class ExistingDataSeeder implements CommandLineRunner {
             workflowMapper.insertRun(run);
         }
         if (workflowMapper.findDefinition("stock_recommendation_research") == null) {
-            workflow("stock_recommendation_research", "股票推荐智能体编排", 1, 10, 9);
+            workflow("stock_recommendation_research", "股票推荐智能体编排", 1, 10, 9,
+                    "股票推荐,选股,推荐股票,recommendation,stock pick,stock screener",
+                    "Orchestrate multi-agent stock recommendation research pipeline with market analysis, industry share, sentiment monitoring, tech breakthrough, industry news, web search, financial interpretation, and final stock recommendation aggregation");
         }
     }
 
-    private void workflow(String key, String name, int version, int nodes, int edges) {
+    private void workflow(String key, String name, int version, int nodes, int edges, String triggerKeywords, String routingDescription) {
         WorkflowDefinition definition = new WorkflowDefinition();
         definition.setWorkflowKey(key);
         definition.setName(name);
@@ -91,6 +107,8 @@ public class ExistingDataSeeder implements CommandLineRunner {
         definition.setEdges(edges);
         definition.setReadonlyFlag(true);
         definition.setUpdatedAt(now());
+        definition.setTriggerKeywords(triggerKeywords);
+        definition.setRoutingDescription(routingDescription);
         workflowMapper.insertDefinition(definition);
     }
 

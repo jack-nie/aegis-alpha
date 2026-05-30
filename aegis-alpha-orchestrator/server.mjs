@@ -1,3 +1,9 @@
+import path from "path";
+import { fileURLToPath } from "url";
+import { config as dotenvConfig } from "dotenv";
+dotenvConfig({ path: path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", ".env"), override: true });
+
+
 import express from "express";
 import { ChatOpenAI } from "@langchain/openai";
 import { HumanMessage, SystemMessage } from "@langchain/core/messages";
@@ -37,6 +43,11 @@ const HANDLERS = new Set([
   "finance.valuation_analysis",
   "finance.money_flow_analysis",
   "finance.risk_assessment",
+  "finance.peer_comparison",
+  "finance.catalyst_analysis",
+  "finance.thesis_builder",
+  "finance.risk_reward_analysis",
+  "finance.entry_strategy",
 ]);
 const FALLBACK_HANDLERS = new Set(["start", "end", "condition", "logic"]);
 
@@ -48,7 +59,7 @@ app.get("/health", (_, res) => {
     provider: process.env.MARKETMIND_LANGCHAIN_PROVIDER || "openai",
     model: resolveModel(
       process.env.MARKETMIND_LANGCHAIN_MODEL,
-      process.env.MARKETMIND_LANGCHAIN_BASE_URL || process.env.OPENAI_BASE_URL
+      process.env.MARKETMIND_LANGCHAIN_BASE_URL || process.env.OPENAI_BASE_URL,
     ),
     hasApiKey: Boolean(process.env.OPENAI_API_KEY || process.env.MARKETMIND_LANGCHAIN_API_KEY),
     baseUrlConfigured: Boolean(process.env.MARKETMIND_LANGCHAIN_BASE_URL || process.env.OPENAI_BASE_URL),
@@ -90,6 +101,115 @@ app.post("/execute-workflow", async (req, res) => {
     });
   }
 });
+
+app.post("/classify-intent", async (req, res) => {
+  try {
+    const result = await classifyIntent(req.body || {});
+    res.json(result);
+  } catch (error) {
+    res.json({ workflowKey: null, ticker: null, confidence: 0, error: error?.message || String(error) });
+  }
+});
+
+async function classifyIntent(payload) {
+  const { message, workflows } = payload;
+  if (!message || !Array.isArray(workflows) || workflows.length === 0) {
+    return { workflowKey: null, ticker: null, confidence: 0, reason: "Missing message or workflows" };
+  }
+
+  const apiKey = payload.apiKey || process.env.OPENAI_API_KEY || process.env.MARKETMIND_LANGCHAIN_API_KEY;
+  const baseUrl = payload.baseUrl || process.env.MARKETMIND_LANGCHAIN_BASE_URL || process.env.OPENAI_BASE_URL;
+  const model = resolveModel(payload.model || process.env.MARKETMIND_LANGCHAIN_MODEL, baseUrl);
+
+  if (!apiKey || isMockMode()) {
+    return keywordFallback(message, workflows);
+  }
+
+  const tools = workflows.map((wf) => ({
+    type: "function",
+    function: {
+      name: "run_" + (wf.workflowKey || "unknown").replace(/-/g, "_"),
+      description: wf.routingDescription || wf.name || "Execute workflow",
+      parameters: {
+        type: "object",
+        properties: {
+          ticker: {
+            type: "string",
+            description: "Stock ticker or symbol mentioned by the user (e.g. AAPL, 600519.SH). Empty string if not applicable.",
+          },
+        },
+        required: ["ticker"],
+      },
+    },
+  }));
+
+  try {
+    const chat = new ChatOpenAI({
+      apiKey,
+      model,
+      temperature: 0,
+      timeout: 5000,
+      maxRetries: 0,
+      configuration: baseUrl ? { baseURL: baseUrl } : undefined,
+    });
+
+    const response = await chat.invoke(
+      [
+        new SystemMessage(
+          "You are an intent classifier. Based on the user message, call exactly ONE function that best matches the user's intent. " +
+          "If no function matches, do not call any function. Always respond with a function call or empty response."
+        ),
+        new HumanMessage(message),
+      ],
+      { tools, tool_choice: "auto" }
+    );
+
+    const toolCalls = response?.additional_kwargs?.tool_calls;
+    if (Array.isArray(toolCalls) && toolCalls.length > 0) {
+      const call = toolCalls[0];
+      const funcName = call?.function?.name || "";
+      const workflowKey = funcName.replace(/^run_/, "").replace(/_/g, "-");
+      let ticker = "";
+      try {
+        const args = JSON.parse(call.function.arguments || "{}");
+        ticker = args.ticker || "";
+      } catch (_) {}
+      const matched = workflows.find((wf) => (wf.workflowKey || "").replace(/-/g, "_") === funcName.replace(/^run_/, ""));
+      return {
+        workflowKey: matched ? matched.workflowKey : workflowKey,
+        ticker,
+        confidence: 0.9,
+        source: "llm_function_calling",
+      };
+    }
+
+    return { workflowKey: null, ticker: null, confidence: 0, source: "llm_no_match" };
+  } catch (error) {
+    return keywordFallback(message, workflows);
+  }
+}
+
+function keywordFallback(message, workflows) {
+  if (!message) return { workflowKey: null, ticker: null, confidence: 0, source: "keyword_no_message" };
+  const lower = message.toLowerCase();
+  let bestMatch = null;
+  let bestScore = 0;
+  for (const wf of workflows) {
+    const keywords = (wf.triggerKeywords || "").split(",").map((k) => k.trim().toLowerCase()).filter(Boolean);
+    for (const kw of keywords) {
+      if (lower.includes(kw) && kw.length > bestScore) {
+        bestScore = kw.length;
+        bestMatch = wf.workflowKey;
+      }
+    }
+  }
+  return {
+    workflowKey: bestMatch,
+    ticker: null,
+    confidence: bestMatch ? 0.6 : 0,
+    source: "keyword_fallback",
+  };
+}
 
 async function executeWorkflow(payload) {
   const nodes = Array.isArray(payload.nodes) ? payload.nodes : [];
@@ -219,7 +339,15 @@ async function executeNode(payload) {
       });
     }
 
-    const llm = await invokeModel({ payload: { ...payload, state: hydratedState }, state: hydratedState, subject, handler, apiKey, baseUrl, model });
+    const llm = await invokeModel({
+      payload: { ...payload, state: hydratedState },
+      state: hydratedState,
+      subject,
+      handler,
+      apiKey,
+      baseUrl,
+      model,
+    });
     return completeNodeResult(payload, startedAt, {
       ok: true,
       status: "completed",
@@ -247,7 +375,8 @@ async function invokeModel({ payload, state, subject, handler, apiKey, baseUrl, 
   const agent = payload.agent || {};
   const node = payload.node || {};
   const data = node.data || {};
-  const timeoutMs = Number(process.env.MARKETMIND_LANGCHAIN_TIMEOUT_MS || 25000);
+  const baseTimeout = Number(process.env.MARKETMIND_LANGCHAIN_TIMEOUT_MS || 25000);
+  const timeoutMs = handler === "finance.stock_recommendation_aggregate" ? Math.max(baseTimeout, 60000) : baseTimeout;
   const chat = new ChatOpenAI({
     apiKey,
     model,
@@ -256,31 +385,44 @@ async function invokeModel({ payload, state, subject, handler, apiKey, baseUrl, 
     maxRetries: 0,
     configuration: baseUrl ? { baseURL: baseUrl } : undefined,
   });
-  const system = [
-    `You are ${agent.name || data.label || "Aegis Alpha Agent"}.`,
-    "Return only JSON. Do not use markdown.",
-    "The JSON shape is {\"summary\":\"string\",\"signals\":[{\"name\":\"string\",\"value\":\"string\",\"weight\":0.5}],\"sources\":[{\"title\":\"string\",\"url\":\"string\",\"type\":\"string\"}],\"confidence\":0.5,\"data\":{}}.",
-  ].join("\n");
-  const context = JSON.stringify({ subject, state, node: data, handler }).slice(0, 12000);
+  const isAggregateNode = handler === "finance.stock_recommendation_aggregate";
+  const system = isAggregateNode
+    ? [
+        `You are ${agent.name || data.label || "Aegis Alpha Agent"}.`,
+        "You are a senior investment research analyst producing a comprehensive stock deep-dive report.",
+        "Return ONLY a JSON object. The summary field MUST contain a complete Markdown-formatted deep analysis report.",
+        'The JSON shape is {"summary":"Markdown report here","signals":[{"name":"string","value":"string","weight":0.5}],"sources":[{"title":"string","url":"string","type":"string"}],"confidence":0.5,"data":{}}.',
+        "The summary must follow the exact template structure provided in the user prompt. Include ALL sections: 公司概览, 行情与估值, 技术面分析, 基本面分析, 主要风险, 总结判断.",
+        "Use actual data values from the workflow state (price, PE, PB, market cap, news, financials). Never say data is insufficient.",
+      ].join("\n")
+    : [
+        `You are ${agent.name || data.label || "Aegis Alpha Agent"}.`,
+        "Return only JSON. Do not use markdown.",
+        'The JSON shape is {"summary":"string","signals":[{"name":"string","value":"string","weight":0.5}],"sources":[{"title":"string","url":"string","type":"string"}],"confidence":0.5,"data":{}}.',
+      ].join("\n");
+  const contextLimit = isAggregateNode ? 30000 : 12000;
+  const context = JSON.stringify({ subject, state, node: data, handler }).slice(0, contextLimit);
   const prompt = data.prompt || agent.prompt || promptForHandler(handler);
   const response = await withTimeout(
-    chat.invoke([
-      new SystemMessage(system),
-      new HumanMessage(`${prompt}\n\nWorkflow context:\n${context}`),
-    ]),
+    chat.invoke([new SystemMessage(system), new HumanMessage(`${prompt}\n\nWorkflow context:\n${context}`)]),
     timeoutMs,
-    `OpenAI request timed out after ${timeoutMs}ms`
+    `OpenAI request timed out after ${timeoutMs}ms`,
   );
   return normalizeLlmContent(response.content, extractUsage(response));
 }
 
 function normalizeLlmContent(content, usage = emptyUsage()) {
   const rawContent = typeof content === "string" ? content : JSON.stringify(content);
-  const cleaned = rawContent.trim().replace(/^```(?:json)?/i, "").replace(/```$/i, "").trim();
+  const cleaned = rawContent
+    .trim()
+    .replace(/^```(?:json)?/i, "")
+    .replace(/```$/i, "")
+    .trim();
   try {
     const parsed = JSON.parse(cleaned);
+    const summary = String(parsed.summary || parsed.content || "Model returned structured output.");
     return {
-      summary: String(parsed.summary || parsed.content || "Model returned structured output."),
+      summary,
       signals: asArray(parsed.signals),
       sources: asArray(parsed.sources),
       confidence: clampConfidence(parsed.confidence),
@@ -290,12 +432,44 @@ function normalizeLlmContent(content, usage = emptyUsage()) {
       },
     };
   } catch {
+    // If JSON parsing fails, check if the content itself is a markdown report
+    // (common for aggregate nodes that produce rich markdown output)
+    const looksLikeMarkdown =
+      cleaned.includes("# ") || cleaned.includes("## ") || cleaned.includes("**") || cleaned.includes("| ");
+    if (looksLikeMarkdown && cleaned.length > 200) {
+      return {
+        summary: cleaned,
+        signals: [],
+        sources: [],
+        confidence: 0.7,
+        data: { format: "markdown", usage },
+      };
+    }
+    // Try to extract JSON from within the content (LLM may wrap JSON in explanatory text)
+    const jsonMatch = cleaned.match(/\{[\s\S]*"summary"[\s\S]*\}/);
+    if (jsonMatch) {
+      try {
+        const parsed = JSON.parse(jsonMatch[0]);
+        return {
+          summary: String(parsed.summary || parsed.content || cleaned.slice(0, 500)),
+          signals: asArray(parsed.signals),
+          sources: asArray(parsed.sources),
+          confidence: clampConfidence(parsed.confidence),
+          data: {
+            ...(typeof parsed.data === "object" && parsed.data !== null ? parsed.data : { parsed }),
+            usage,
+          },
+        };
+      } catch {
+        /* fall through */
+      }
+    }
     return {
-      summary: rawContent.slice(0, 500) || "Model returned empty content.",
+      summary: cleaned.slice(0, 2000) || "Model returned empty content.",
       signals: [],
       sources: [],
       confidence: 0.5,
-      data: { rawContent, usage },
+      data: { rawContent: cleaned.slice(0, 500), usage },
     };
   }
 }
@@ -379,8 +553,12 @@ function fallbackNodeResult(payload, error, startedAt, model, handler, state, su
 }
 
 function isDeterministicToolNode(handler, data) {
-  const nodeType = String(data.nodeType || data.type || "").trim().toLowerCase();
-  return HANDLERS.has(handler) && nodeType && nodeType !== "agent" && handler !== "finance.stock_recommendation_aggregate";
+  const nodeType = String(data.nodeType || data.type || "")
+    .trim()
+    .toLowerCase();
+  return (
+    HANDLERS.has(handler) && nodeType && nodeType !== "agent" && handler !== "finance.stock_recommendation_aggregate"
+  );
 }
 
 async function hydrateMarketDataContext({ handler, state, subject, node }) {
@@ -393,7 +571,9 @@ async function hydrateMarketDataContext({ handler, state, subject, node }) {
   if (state?.marketDataContext && typeof state.marketDataContext === "object") {
     return state.marketDataContext;
   }
-  const backendUrl = String(process.env.MARKETMIND_BACKEND_URL || process.env.MARKETMIND_NODE_CALLBACK_BASE_URL || DEFAULT_BACKEND_URL).replace(/\/+$/, "");
+  const backendUrl = String(
+    process.env.MARKETMIND_BACKEND_URL || process.env.MARKETMIND_NODE_CALLBACK_BASE_URL || DEFAULT_BACKEND_URL,
+  ).replace(/\/+$/, "");
   if (!backendUrl) {
     return null;
   }
@@ -481,22 +661,278 @@ function handlerType(handler) {
 
 function promptForHandler(handler) {
   const prompts = {
-    "finance.market_analysis": "Analyze market conditions, valuation direction, catalysts, and risk factors for the subject.",
-    "finance.industry_share": "Estimate industry position and share dynamics for the subject.",
-    "finance.sentiment_monitor": "Assess investor, media, and analyst sentiment for the subject.",
-    "finance.tech_breakthrough": "Identify technical or product breakthroughs relevant to the subject.",
-    "finance.industry_news": "Summarize important recent industry news relevant to the subject.",
-    "general.agent": "You are an investment research assistant. Use the marketDataContext (quote, financials, news) in the workflow state to provide a concrete analysis. Always reference actual data values (price, PE, PB, news titles) in your response. Do NOT say data is insufficient if marketDataContext is present. Answer in Chinese.",
-    "general.web_search": "Find concise web-search style evidence relevant to the subject.",
-    "finance.financial_interpretation": "Interpret financial performance, margins, growth, cash flow, and balance-sheet signals.",
-    "finance.stock_recommendation_aggregate": "Aggregate prior workflow findings into a stock recommendation with confidence and caveats.",
-    "finance.fundamental_analysis": "Perform deep fundamental analysis: review income statement, balance sheet, and cash flow. Evaluate profitability (gross/net margins, ROE, ROA), solvency (debt-to-equity, current ratio), growth (revenue/EPS CAGR), and earnings quality. Reference actual financial data from marketDataContext.",
-    "finance.technical_analysis": "Perform technical analysis: analyze price action, moving averages (MA5/10/20/60), MACD, RSI, KDJ, Bollinger Bands, volume trends, and support/resistance levels. Identify trend direction, momentum, and key technical signals.",
-    "finance.valuation_analysis": "Perform valuation analysis: assess PE/PB/PS ratios vs historical averages and sector peers. Evaluate dividend yield, PEG ratio, EV/EBITDA. Determine whether the stock is overvalued, fairly valued, or undervalued relative to intrinsic value.",
-    "finance.money_flow_analysis": "Analyze money flow patterns: institutional vs retail flow, net inflow/outflow trends, block trade activity, margin trading data, and foreign capital (northbound flow for A-shares) positioning changes.",
-    "finance.risk_assessment": "Perform comprehensive risk assessment: identify systemic risks (macro, policy, rate), sector-specific risks, company-specific risks (governance, leverage, litigation), and black swan probability. Assign risk level and key risk factors.",
+    "finance.market_analysis": `Analyze market conditions for the subject stock. Return JSON with these fields in data:
+- "market_cap": total market capitalization with currency
+- "pe_ratio": TTM P/E ratio
+- "pb_ratio": price-to-book ratio
+- "dividend_yield": dividend yield percentage
+- "eps": earnings per share
+- "book_value_per_share": book value per share
+- "week52_high": 52-week high price
+- "week52_low": 52-week low price
+- "current_price": latest closing price
+- "price_change_pct": recent price change percentage
+- "sector": industry sector
+- "exchange": stock exchange
+Use actual data from marketDataContext if available. Answer in Chinese.`,
+
+    "finance.industry_share": `Analyze the industry position and competitive landscape for the subject stock. Return JSON with these fields in data:
+- "industry": specific industry name (e.g. "覆铜板/PCB材料")
+- "company_description": 2-3 sentence company overview including what it does, headquarters, and key products
+- "market_position": company's position in the industry (leader/strong/challenger/niche)
+- "main_competitors": list of top 3-5 competitors
+- "competitive_advantages": key moats and advantages
+- "industry_growth_rate": industry growth rate or trend
+- "chairman": chairman or CEO name if known
+Answer in Chinese.`,
+
+    "finance.sentiment_monitor": `Assess market sentiment for the subject stock. Return JSON with these fields in data:
+- "sentiment_score": overall sentiment score 1-10 (10=extremely bullish)
+- "analyst_consensus": analyst consensus (买入/增持/中性/减持/卖出)
+- "institutional_sentiment": institutional investor sentiment description
+- "retail_sentiment": retail investor sentiment
+- "media_tone": media coverage tone (positive/neutral/negative)
+- "recent_events": list of 2-3 recent events affecting sentiment
+Answer in Chinese.`,
+
+    "finance.tech_breakthrough": `Identify recent technology or product breakthroughs for the subject stock. Return JSON with these fields in data:
+- "breakthroughs": list of objects with "date", "title", "description" for each breakthrough
+- "r_and_d_spending": R&D spending trend if available
+- "patent_count": recent patent filings or count
+- "product_pipeline": key upcoming products or services
+- "technology_moat": description of technology competitive advantage
+Answer in Chinese.`,
+
+    "finance.industry_news": `Summarize the most important recent industry news for the subject stock. Return JSON with these fields in data:
+- "news_items": list of objects with "date", "title", "summary" (3-5 most important news)
+- "policy_impact": any recent policy or regulatory changes affecting the industry
+- "global_trends": relevant global industry trends
+Answer in Chinese.`,
+
+    "general.agent": `You are a senior investment research analyst. Use the marketDataContext (quote, financials, news) in the workflow state to provide a concrete, data-rich analysis. Always reference actual data values (price, PE, PB, market cap, news titles) in your response. Do NOT say data is insufficient if marketDataContext is present. Provide specific numbers and percentages. Answer in Chinese.`,
+
+    "general.web_search":
+      "Find concise web-search style evidence relevant to the subject. Return key facts, data points, and sources.",
+
+    "finance.financial_interpretation": `Interpret the financial performance for the subject stock. Return JSON with these fields in data:
+- "revenue": latest revenue with currency and period
+- "revenue_growth_yoy": revenue year-over-year growth percentage
+- "net_profit": latest net profit
+- "net_profit_growth_yoy": net profit year-over-year growth percentage
+- "gross_margin": gross margin percentage
+- "net_margin": net margin percentage
+- "roe": return on equity percentage
+- "debt_to_equity": debt-to-equity ratio
+- "operating_cash_flow": operating cash flow
+- "earnings_quality": assessment of earnings quality (high/medium/low)
+Answer in Chinese.`,
+
+    "finance.stock_recommendation_aggregate": `你是资深投资研究分析师。请从上游工作流节点的输出中提取所有数据，生成一份完整的股票深度分析报告。
+
+**必须按照以下模板格式输出 summary（使用 Markdown 格式）：**
+
+# {股票名称}（{代码}）深度分析
+
+## 公司概览
+{公司简介：主营业务、总部、产品应用领域}
+行业：{行业分类}
+代码：{交易所代码}
+董事长/CEO：{姓名}
+
+## 行情与估值（截至 {日期}）
+| 指标 | 数据 |
+|------|------|
+| 最新股价 | {价格}（{涨跌幅}） |
+| 总市值 | {市值} |
+| TTM市盈率 | {PE} |
+| 市净率（PB） | {PB} |
+| 股息率 | {股息率} |
+| 每股净资产 | {数值} |
+| 52周区间 | {低} – {高} |
+
+## 技术面分析
+| 指标 | 数值 | 信号 |
+|------|------|------|
+| 布林带中轨 | {数值} | {信号} |
+| RSI | {数值} | {信号} |
+| MACD | {数值} | {信号} |
+趋势判断：{多头/空头/震荡}，{具体描述}
+
+## 基本面分析
+### 最新业绩亮点
+| 指标 | 数值 | 同比变化 |
+|------|------|----------|
+| 营业收入 | {数值} | {变化} |
+| 归母净利润 | {数值} | {变化} |
+| 扣非净利润 | {数值} | {变化} |
+
+### 核心催化剂
+{列出2-3个核心增长驱动力}
+
+## 主要风险
+| 风险因素 | 说明 |
+|----------|------|
+| {风险1} | {说明} |
+| {风险2} | {说明} |
+| {风险3} | {说明} |
+
+## 总结判断
+{综合基本面、技术面、估值面的判断，2-3段}
+建议：{具体投资建议}
+
+注：本分析基于公开数据，不构成投资建议。
+
+**重要：如果上游节点提供了具体数据（价格、PE、PB、新闻标题等），必须在报告中引用。不要说"数据不足"。**`,
+
+    "finance.fundamental_analysis": `Perform deep fundamental analysis for the subject stock. Return JSON with these fields in data:
+- "revenue": latest quarterly/annual revenue with currency
+- "revenue_growth_yoy": revenue YoY growth percentage
+- "net_profit": latest net profit
+- "net_profit_growth_yoy": net profit YoY growth percentage
+- "deducted_net_profit": deducted (扣非) net profit if available
+- "gross_margin": gross margin percentage
+- "net_margin": net margin percentage
+- "roe": return on equity percentage
+- "roa": return on assets percentage
+- "debt_to_equity": debt-to-equity ratio
+- "current_ratio": current ratio
+- "operating_cash_flow": operating cash flow
+- "eps": earnings per share
+- "book_value_per_share": book value per share
+- "business_segments": key business segment performance
+Reference actual financial data from marketDataContext. Answer in Chinese.`,
+
+    "finance.technical_analysis": `Perform technical analysis for the subject stock. Return JSON with these fields in data:
+- "current_price": latest closing price
+- "ma5": 5-day moving average
+- "ma10": 10-day moving average
+- "ma20": 20-day moving average
+- "ma60": 60-day moving average
+- "rsi": RSI value (0-100)
+- "macd_signal": MACD signal (bullish/bearish/divergence)
+- "kdj_signal": KDJ signal
+- "bollinger_upper": Bollinger upper band
+- "bollinger_middle": Bollinger middle band
+- "bollinger_lower": Bollinger lower band
+- "volume_trend": volume trend (increasing/decreasing/stable)
+- "support_level": key support price
+- "resistance_level": key resistance price
+- "trend": overall trend (strong_upward/upward/neutral/downward/strong_downward)
+- "overbought_oversold": overbought/oversold/neutral assessment
+Answer in Chinese.`,
+
+    "finance.valuation_analysis": `Perform valuation analysis for the subject stock. Return JSON with these fields in data:
+- "pe_ttm": TTM P/E ratio
+- "pb": price-to-book ratio
+- "ps": price-to-sales ratio if available
+- "peg": PEG ratio if available
+- "ev_ebitda": EV/EBITDA if available
+- "dividend_yield": dividend yield percentage
+- "pe_sector_median": sector median PE for comparison
+- "pb_sector_median": sector median PB for comparison
+- "pe_historical_avg": historical average PE
+- "valuation_assessment": overvalued/fairly_valued/undervalued
+- "week52_high": 52-week high
+- "week52_low": 52-week low
+- "price_to_52w_high_pct": current price vs 52w high percentage
+Answer in Chinese.`,
+
+    "finance.money_flow_analysis": `Analyze money flow patterns for the subject stock. Return JSON with these fields in data:
+- "net_inflow": net capital inflow/outflow amount
+- "main_force_flow": main force (主力) net flow direction and amount
+- "retail_flow": retail investor flow direction
+- "northbound_flow": northbound (北向) capital flow if A-share
+- "margin_trading": margin trading balance and change
+- "block_trade": recent block trade activity
+- "flow_trend": 5-day flow trend (inflow/outflow/mixed)
+- "institutional_activity": institutional buying/selling description
+Answer in Chinese.`,
+
+    "finance.risk_assessment": `Perform comprehensive risk assessment for the subject stock. Return JSON with these fields in data:
+- "overall_risk_level": risk level (低/中低/中/中高/高)
+- "valuation_risk": valuation risk description
+- "cycle_risk": industry cycle risk description
+- "competition_risk": competition intensification risk
+- "macro_risk": macroeconomic risk factors
+- "policy_risk": policy/regulatory risk
+- "governance_risk": corporate governance risk
+- "risk_factors": list of 3-5 key risk factors with descriptions
+- "risk_level_label": concise risk label for display
+Answer in Chinese.`,
+
+    "finance.peer_comparison": `You are an industry peer comparison analyst. Analyze the subject stock against its top competitors using data from the workflow state and marketDataContext.
+
+Return JSON with these fields in data:
+- "peers": list of 3-5 competitor objects, each with "name", "code", "market_cap", "pe", "revenue_growth_pct", "gross_margin_pct"
+- "subject_position": company position in industry ("龙头"/"第二梯队"/"跟随者")
+- "relative_valuation": relative to peers ("高估"/"合理"/"低估")
+- "competitive_advantages": list of 2-3 key competitive advantages
+- "competitive_weaknesses": list of 1-2 competitive weaknesses
+- "peer_avg_pe": peer group average PE ratio (number)
+- "peer_avg_pb": peer group average PB ratio (number)
+Use actual data from marketDataContext and upstream industry_news. Answer in Chinese.`,
+
+    "finance.catalyst_analysis": `You are a catalyst and event-driven analyst. Identify upcoming catalysts and recent events that could move the subject stock.
+
+Consume upstream data: tech_breakthrough (technology breakthroughs), industry_news (industry news), and marketDataContext.
+
+Return JSON with these fields in data:
+- "upcoming_catalysts": list of objects with "event", "expected_date", "impact" ("利好"/"利空"), "impact_score" (1-10)
+- "recent_positive": list of recent positive events (strings)
+- "recent_negative": list of recent negative events (strings)
+- "earnings_date": next earnings report date if known
+- "catalyst_score": overall catalyst score 1-10
+- "event_risk": upcoming risk events description
+Use actual data from upstream nodes. Answer in Chinese.`,
+
+    "finance.thesis_builder": `You are an investment thesis builder. Construct bull and bear cases with evidence from the workflow state.
+
+Consume upstream data: risk_assessment output, and state entries for fundamental_analysis, technical_analysis, valuation_analysis, marketDataContext.
+
+Return JSON with these fields in data:
+- "bull_case": list of 3-4 bull arguments, each must reference specific data (price, PE, growth %, etc.)
+- "bear_case": list of 3-4 bear arguments, each must reference specific data
+- "base_case": base case scenario description (2-3 sentences)
+- "base_case_probability": base case probability as percentage (number)
+- "key_metrics_to_watch": list of 3-5 key metrics to monitor
+- "investment_horizon": "短线" / "中线" / "长线"
+- "conviction_level": conviction level 1-10 (number)
+Answer in Chinese.`,
+
+    "finance.risk_reward_analysis": `You are a risk-reward analyst. Calculate upside/downside targets and position sizing.
+
+Consume upstream data: peer_comp (peer comparison with valuation data), catalysts (catalyst analysis with event scores).
+
+Return JSON with these fields in data:
+- "bullish_target": bullish price target (number)
+- "bearish_target": bearish price target (number)
+- "current_price": current stock price (number)
+- "upside_pct": upside percentage (number)
+- "downside_pct": downside percentage (number)
+- "risk_reward_ratio": risk-reward ratio (number)
+- "expected_value": expected return percentage (number)
+- "suggested_position_pct": suggested portfolio position percentage 1-100 (number)
+- "confidence": confidence level 1-10 (number)
+Use actual price data from marketDataContext. Answer in Chinese.`,
+
+    "finance.entry_strategy": `You are an entry strategy analyst. Define precise entry zones, stop-loss, and take-profit levels.
+
+Consume upstream data: thesis (investment thesis with bull/bear cases and horizon), marketDataContext (current price, 52-week range).
+
+Return JSON with these fields in data:
+- "entry_zone_low": entry zone lower bound price (number)
+- "entry_zone_high": entry zone upper bound price (number)
+- "entry_signal": entry signal description ("突破"/"回踩"/"放量" etc.)
+- "stop_loss": stop-loss price level (number)
+- "stop_loss_pct": stop-loss percentage (number)
+- "take_profit_1": first take-profit target (number)
+- "take_profit_2": second take-profit target (number)
+- "position_sizing": "轻仓" / "标准" / "重仓"
+- "holding_period": suggested holding period
+- "entry_timing": "立即" / "等待回调" / "观望"
+Use actual price data from marketDataContext. Answer in Chinese.`,
   };
-  return prompts[handler] || "Pass through workflow state and produce concise structured output.";
+  return prompts[handler] || "Pass through workflow state and produce concise structured output. Answer in Chinese.";
 }
 
 function mockSummary(handler, subject, state) {
@@ -512,7 +948,6 @@ function mockSummary(handler, subject, state) {
     const keys = Object.keys(state).filter((key) => key !== "subject");
     return `Mock aggregate recommendation for ${subject} based on ${keys.length} upstream outputs.`;
   }
-  return `Mock ${handler} result for ${subject}.`;
   if (handler === "finance.fundamental_analysis") {
     return `Mock fundamental analysis for ${subject}: Revenue growth stable, margins healthy, balance sheet strong.`;
   }
@@ -528,6 +963,22 @@ function mockSummary(handler, subject, state) {
   if (handler === "finance.risk_assessment") {
     return `Mock risk assessment for ${subject}: Overall risk level moderate, key risks include market volatility and sector rotation.`;
   }
+  if (handler === "finance.peer_comparison") {
+    return "Peer comparison for " + subject + ": Subject trades at premium to sector median, competitive position strong with 2 key moats identified. Peer avg PE 25x vs subject 30x.";
+  }
+  if (handler === "finance.catalyst_analysis") {
+    return "Catalyst analysis for " + subject + ": 3 upcoming catalysts identified including earnings report and product launch. Overall catalyst score 7/10. Next earnings in 45 days.";
+  }
+  if (handler === "finance.thesis_builder") {
+    return "Investment thesis for " + subject + ": Bull case - revenue growth 20%+ and margin expansion. Bear case - valuation stretched at 30x PE. Base case probability 60%. Conviction 7/10.";
+  }
+  if (handler === "finance.risk_reward_analysis") {
+    return "Risk-reward for " + subject + ": Bullish target +25%, bearish target -10%, risk-reward ratio 2.5:1. Suggested position 5% of portfolio. Confidence 7/10.";
+  }
+  if (handler === "finance.entry_strategy") {
+    return "Entry strategy for " + subject + ": Enter on pullback to support zone. Stop loss below key level at -8%. First target at resistance (+15%). Standard position sizing. Hold 3-6 months.";
+  }
+  return "Mock " + handler + " result for " + subject + ".";
 }
 
 function mockSignals(handler, subject) {
@@ -585,13 +1036,16 @@ function asArray(value) {
 }
 
 function extractUsage(response) {
-  const usage = response?.usage_metadata || response?.response_metadata?.tokenUsage || response?.response_metadata?.usage;
+  const usage =
+    response?.usage_metadata || response?.response_metadata?.tokenUsage || response?.response_metadata?.usage;
   return normalizeUsage(usage);
 }
 
 function normalizeUsage(usage) {
   const prompt = numberOrNull(usage?.prompt_tokens ?? usage?.promptTokens ?? usage?.input_tokens ?? usage?.inputTokens);
-  const completion = numberOrNull(usage?.completion_tokens ?? usage?.completionTokens ?? usage?.output_tokens ?? usage?.outputTokens);
+  const completion = numberOrNull(
+    usage?.completion_tokens ?? usage?.completionTokens ?? usage?.output_tokens ?? usage?.outputTokens,
+  );
   const total = numberOrNull(usage?.total_tokens ?? usage?.totalTokens);
   return {
     prompt_tokens: prompt,
@@ -641,8 +1095,10 @@ function resolveModel(requested, baseUrl) {
 }
 
 function usesDeepSeekCompatibleEndpoint(baseUrl) {
-  return Boolean(baseUrl || process.env.MARKETMIND_LANGCHAIN_BASE_URL || process.env.OPENAI_BASE_URL)
-    || SUPPORTED_DEEPSEEK_MODELS.has(process.env.MARKETMIND_LANGCHAIN_MODEL);
+  return (
+    Boolean(baseUrl || process.env.MARKETMIND_LANGCHAIN_BASE_URL || process.env.OPENAI_BASE_URL) ||
+    SUPPORTED_DEEPSEEK_MODELS.has(process.env.MARKETMIND_LANGCHAIN_MODEL)
+  );
 }
 
 function withTimeout(promise, timeoutMs, message) {
@@ -653,6 +1109,14 @@ function withTimeout(promise, timeoutMs, message) {
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
-app.listen(port, "127.0.0.1", () => {
-  console.log(`Aegis Alpha orchestrator listening on http://127.0.0.1:${port}`);
-});
+// Start server only when run directly
+const _isDirectRun = fileURLToPath(import.meta.url) === process.argv[1];
+if (_isDirectRun) {
+  app.listen(port, '127.0.0.1', () => {
+    console.log('Aegis Alpha orchestrator listening on http://127.0.0.1:' + port);
+  });
+}
+
+
+// --- Test exports ---
+export { HANDLERS, promptForHandler, mockSummary };
