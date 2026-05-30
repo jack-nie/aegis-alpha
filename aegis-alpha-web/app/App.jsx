@@ -1650,8 +1650,7 @@ function WorkflowComposer({ api }) {
         const { done, value } = await reader.read();
         if (done) break;
         buffer += decoder.decode(value, { stream: true });
-        const parts = buffer.split("
-");
+        const parts = buffer.split(String.fromCharCode(10));
         buffer = parts.pop() || "";
         let currentEvent = "";
         for (const part of parts) {
