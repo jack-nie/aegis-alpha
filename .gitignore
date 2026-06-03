@@ -18,3 +18,6 @@ fix_*.py
 patch_*.py
 apply_fix.py
 _p.py
+
+# Local config
+application-local.yml
