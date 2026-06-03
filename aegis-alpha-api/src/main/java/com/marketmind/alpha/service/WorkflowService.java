@@ -279,6 +279,47 @@ public class WorkflowService {
         }
     }
 
+    public WorkflowRun createRun(String workflowKey, String subject, Map<String, Object> inputs) {
+        String key = workflowKey == null || workflowKey.trim().isEmpty() ? "daily" : workflowKey.trim();
+        WorkflowVersion version = mapper.findLatestVersion(key);
+        Map<String, Object> runLayout = layoutForRun(key, version);
+        validationService.validateLayout(runLayout);
+        Map<String, Object> safeInputs = inputs == null ? new LinkedHashMap<String, Object>() : new LinkedHashMap<>(inputs);
+        WorkflowRun run = new WorkflowRun();
+        run.setRunId(UUID.randomUUID().toString());
+        run.setWorkflowKey(key);
+        run.setTraceId(UUID.randomUUID().toString());
+        run.setStatus("RUNNING");
+        run.setSubject(subject);
+        run.setStartedAt(now());
+        run.setNodeCount(0);
+        run.setWorkflowVersionId(version == null ? null : version.getVersionId());
+        run.setInputsJson(toJson(safeInputs));
+        run.setControlStatus("ACTIVE");
+        run.setPauseRequested(0);
+        run.setCancelRequested(0);
+        mapper.insertRun(run);
+        recordRunEvent(run, "RUN_CREATED", null, null, "RUNNING", "Workflow run created.", null, 0);
+        return run;
+    }
+
+    public void executeAsync(WorkflowRun run, Map<String, Object> inputs, String workflowKey) {
+        WorkflowVersion version = mapper.findLatestVersion(workflowKey);
+        Map<String, Object> runLayout = layoutForRun(workflowKey, version);
+        try {
+            execute(run, inputs, runLayout);
+            backtestService.createFromWorkflowRun(mapper.findRun(run.getRunId()), inputs);
+        } catch (WorkflowStoppedException stopped) {
+            // run already updated by execute()
+        } catch (Exception ex) {
+            run.setStatus("FAILED");
+            run.setCompletedAt(now());
+            run.setErrorMessage(ex.getMessage());
+            run.setControlStatus("FAILED");
+            mapper.updateRun(run);
+            recordRunEvent(run, "RUN_FAILED", null, null, "FAILED", ex.getMessage(), null, 1000000);
+        }
+    }
     public WorkflowRun start(String workflowKey, String subject) {
         return start(workflowKey, subject, new LinkedHashMap<String, Object>(), null);
     }

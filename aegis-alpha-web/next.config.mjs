@@ -8,6 +8,10 @@ const nextConfig = {
       },
     ];
   },
+  // Workflow execution (deep_dive = 17 LLM nodes) can take 2-3 minutes
+  experimental: {
+    proxyTimeout: 300000,
+  },
 };
 
 export default nextConfig;

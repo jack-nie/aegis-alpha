@@ -89,7 +89,7 @@ public class IntentRouterService {
         String lower = message.toLowerCase();
         // regex patterns first (higher precision)
         if (STOCK_ANALYSIS_PATTERN.matcher(lower).find()) {
-            String key = findKey(definitions, "deep_dive");
+            String key = findKey(definitions, "stock_analysis");
             if (key != null) {
                 return new IntentResult(key, extractTicker(message), 0.7, "keyword_regex");
             }

@@ -62,7 +62,7 @@ public class ExistingDataSeeder implements CommandLineRunner {
                     "日报,晨报,每日,盘前,daily,morning briefing,daily graph",
                     "Generate daily market briefing with market overview, sector rotation, sentiment pulse, and key indicators summary");
             workflow("deep_dive", "Deep Dive Graph", 1, 17, 18,
-                    "深度分析,深度研究,个股分析,股票分析,分析个股,分析股票,deep dive,deep analysis,stock analysis,analyze stock,帮我分析,分析一下",
+                    "深度分析,深度研究,个股分析,股票分析,分析个股,分析股票,deep dive,deep analysis",
                     "Perform comprehensive deep-dive analysis on a specific stock covering 15 dimensions: fundamental, technical, valuation, money flow, industry, sentiment, news, tech breakthrough, risk, peer comparison, catalyst, thesis, risk-reward, entry strategy, and final recommendation");
             workflow("exit_workflow", "Exit Workflow", 1, 9, 9,
                     "止损,止盈,卖出,平仓,退出,exit,stop loss,take profit,close position",
@@ -77,7 +77,7 @@ public class ExistingDataSeeder implements CommandLineRunner {
                     "板块,行业,行业分析,sector,industry analysis,sector analyst",
                     "Analyze an industry sector including macro environment, industry chain, policy impact, competitive map, top players, tech trends, valuation band, sector sentiment, capital flow, sector risk, catalyst calendar, rotation signal, and sector recommendation");
             workflow("stock_analysis", "Stock Analysis", 1, 9, 10,
-                    "股票分析,综合分析,stock analysis,comprehensive analysis",
+                    "股票分析,综合分析,帮我分析,分析一下,stock analysis,comprehensive analysis",
                     "Comprehensive stock analysis covering fundamental, technical, valuation, money flow, sentiment, risk, and aggregate recommendation");
 
             WorkflowRun run = new WorkflowRun();

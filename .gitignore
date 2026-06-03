@@ -10,3 +10,11 @@ dist/
 *.log
 .env*.local
 target/
+.ace-tool/
+.env
+
+# Temporary fix/patch scripts
+fix_*.py
+patch_*.py
+apply_fix.py
+_p.py

@@ -1,6 +1,5 @@
 "use client";
 
-import { AgentTestPage, WorkflowTestPage } from "./TestPages";
 import ReactMarkdown from "react-markdown";
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
@@ -26,9 +25,7 @@ const KNOWN_APP_PATHS = new Set([
   "/portfolio/trades",
   "/portfolio/portfolios",
   "/agent",
-  "/agent/test",
   "/workflow",
-  "/workflow/test",
   "/workflow/runs",
   "/data-center/dashboard",
   "/data-center/macro",
@@ -74,9 +71,7 @@ const pageTitles = {
   "/portfolio/trades": "投资组合 / 交易流水",
   "/portfolio/portfolios": "组合列表",
   "/agent": "AI+ / Agent",
-  "/agent/test": "AI+ / Agent test",
   "/workflow": "AI+ / 工作流",
-  "/workflow/test": "AI+ / workflow test",
   "/workflow/runs": "AI+ / 运行中心",
   "/report": "Report",
   "/backtest": "回测管理",
@@ -113,9 +108,7 @@ const navItems = [
     icon: "bolt",
     children: [
       { label: "Agent", path: "/agent" },
-      { label: "Agent test", path: "/agent/test" },
       { label: "工作流", path: "/workflow" },
-      { label: "Workflow test", path: "/workflow/test" },
       { label: "运行中心", path: "/workflow/runs" },
       { label: "报告", path: "/report" },
     ],
@@ -153,13 +146,7 @@ const nodeTypeStyles = {
   end: { border: "border-red-400", bg: "bg-red-50", icon: "⚑", label: "结束" },
 };
 
-const nodePalette = [
-  { label: "Start", nodeType: "start", handler: "scheduler.manual" },
-  { label: "Logic", nodeType: "logic", handler: "portfolio.get_context" },
-  { label: "Agent", nodeType: "agent", handler: "general.agent" },
-  { label: "Condition", nodeType: "condition", handler: "condition.pass" },
-  { label: "END", nodeType: "end", handler: "workflow.end" },
-];
+/* nodePalette removed - unused */
 
 const workflowCatalogGroups = [
   {
@@ -473,6 +460,91 @@ const defaultWorkflowLayouts = {
       { id: "e-aggregate-end", source: "aggregate", target: "end", label: "recommendation" },
     ],
   },
+  portfolio_workflow: {
+    nodes: [
+      {
+        id: "start",
+        type: "workflowNode",
+        position: { x: 80, y: 260 },
+        data: { label: "Start", nodeType: "start", handler: "scheduler.manual" },
+      },
+      {
+        id: "holdings",
+        type: "workflowNode",
+        position: { x: 320, y: 140 },
+        data: {
+          label: "Holdings Overview",
+          nodeType: "logic",
+          handler: "portfolio.get_context",
+          inputKeys: ["portfolioId"],
+          outputKeys: ["holdings"],
+        },
+      },
+      {
+        id: "market_scan",
+        type: "workflowNode",
+        position: { x: 320, y: 380 },
+        data: {
+          label: "Market Scan",
+          nodeType: "agent",
+          handler: "finance.market_analysis",
+          inputKeys: ["ticker", "subject"],
+          outputKeys: ["market_view"],
+        },
+      },
+      {
+        id: "sector_exposure",
+        type: "workflowNode",
+        position: { x: 580, y: 140 },
+        data: {
+          label: "Sector Exposure",
+          nodeType: "agent",
+          handler: "finance.industry_share",
+          inputKeys: ["industry"],
+          outputKeys: ["sector_exposure"],
+        },
+      },
+      {
+        id: "risk_metrics",
+        type: "workflowNode",
+        position: { x: 580, y: 380 },
+        data: {
+          label: "Risk Metrics",
+          nodeType: "agent",
+          handler: "finance.risk_assessment",
+          inputKeys: ["ticker", "market_view"],
+          outputKeys: ["risk_assessment"],
+        },
+      },
+      {
+        id: "rebalance",
+        type: "workflowNode",
+        position: { x: 840, y: 260 },
+        data: {
+          label: "Rebalancing Plan",
+          nodeType: "agent",
+          handler: "finance.stock_recommendation_aggregate",
+          inputKeys: ["sector_exposure", "risk_assessment"],
+          outputKeys: ["rebalancing_plan"],
+        },
+      },
+      {
+        id: "end",
+        type: "workflowNode",
+        position: { x: 1100, y: 260 },
+        data: { label: "End", nodeType: "end", handler: "workflow.end" },
+      },
+    ],
+    edges: [
+      { id: "e-start-holdings", source: "start", target: "holdings", label: "portfolio" },
+      { id: "e-start-market", source: "start", target: "market_scan", label: "ticker" },
+      { id: "e-holdings-sector", source: "holdings", target: "sector_exposure", label: "holdings" },
+      { id: "e-market-risk", source: "market_scan", target: "risk_metrics", label: "market" },
+      { id: "e-sector-rebalance", source: "sector_exposure", target: "rebalance", label: "sector" },
+      { id: "e-risk-rebalance", source: "risk_metrics", target: "rebalance", label: "risk" },
+      { id: "e-rebalance-end", source: "rebalance", target: "end", label: "plan" },
+    ],
+  },
 };
 
 const tradeFieldGroups = [
@@ -731,7 +803,7 @@ function DrawerShell({ title, onClose, children, widthClass = "max-w-3xl", topCl
   );
 }
 
-function Sidebar({ path, navigate, collapsed, setCollapsed, mobile = false, onNavigate }) {
+function Sidebar({ path, navigate, _collapsed, _setCollapsed, mobile = false, onNavigate }) {
   const [expandedMenus, setExpandedMenus] = useState(["投资组合", "AI+", "回测"]);
 
   useEffect(() => {
@@ -886,21 +958,69 @@ function AICopilot({ setCopilotOpen, api, promptRequest, onPromptHandled }) {
         const result = await api("/chat/messages", { method: "POST", body: JSON.stringify({ message: text }) });
         let content = result?.content || result?.message || "后端没有返回内容。";
         if (result?.routedToWorkflow && result?.runId) {
-          const workflowName = result?.workflowKey || "analysis";
-          // POST /chat/messages is synchronous — workflow already completed
           try {
-            const run = await api(`/workflow/runs/${result.runId}`);
+            // Poll until workflow completes (async dispatch may still be RUNNING)
+            let run = await api(`/workflow/runs/${result.runId}`);
+            const pollStart = Date.now();
+            while (run?.status === "RUNNING" || run?.status === "QUEUED") {
+              if (Date.now() - pollStart > 90000) break;
+              await new Promise((r) => setTimeout(r, 2000));
+              run = await api(`/workflow/runs/${result.runId}`);
+            }
             const runResult = run?.resultJson ? JSON.parse(run.resultJson) : null;
-            if (runResult?.recommendation?.summary) {
-              content = runResult.recommendation.summary;
-            } else if (runResult?.recommendation?.content) {
-              content = runResult.recommendation.content;
-            } else if (runResult) {
-              // Find any node with a summary
-              const summaryNode = Object.values(runResult).find((v) => v && typeof v === "object" && v.summary && v.status === "completed");
-              content = summaryNode?.summary || content;
+            if (runResult) {
+              // Try recommendation node first
+              const rec = runResult.recommendation;
+              if (rec) {
+                content =
+                  rec.summary ||
+                  rec.content ||
+                  (rec.data && typeof rec.data === "object" && (rec.data.summary || rec.data.content)) ||
+                  "";
+                if (rec.data && typeof rec.data === "object" && !content) {
+                  const textParts = Object.values(rec.data)
+                    .filter((v) => typeof v === "string" && v.trim())
+                    .join(String.fromCharCode(10));
+                  if (textParts) content = textParts;
+                }
+              }
+              // Collect summaries from all executed nodes
+              if (!content) {
+                const nodeEntries = Object.entries(runResult)
+                  .filter(([, v]) => v && typeof v === "object" && v.nodeId && v.status)
+                  .map(([k, v]) => {
+                    const label = v.nodeName || k;
+                    const summary =
+                      v.summary || v.content || (v.data && v.data.summary) || (v.data && v.data.content) || "";
+                    return { label, summary, ok: v.ok, status: v.status };
+                  })
+                  .filter((n) => n.summary.trim());
+                if (nodeEntries.length > 0) {
+                  content = nodeEntries
+                    .map((n) => "**" + n.label + "** (" + n.status + "): " + n.summary)
+                    .join(String.fromCharCode(10) + String.fromCharCode(10));
+                }
+              }
+              // Final fallback
+              if (!content) {
+                const sep = String.fromCharCode(10);
+                const nodeStatuses = Object.entries(runResult)
+                  .filter(([, v]) => v && typeof v === "object" && v.nodeId)
+                  .map(([, v]) => "- " + (v.nodeName || v.nodeId) + ": " + v.status)
+                  .join(sep);
+                const nodeCount = run.nodeCount || 0;
+                content =
+                  "工作流 " +
+                  (result.workflowKey || "") +
+                  " 已完成，" +
+                  nodeCount +
+                  " 个节点已执行：" +
+                  sep +
+                  nodeStatuses;
+              }
             }
           } catch (fetchErr) {
+            // eslint-disable-next-line no-console
             console.warn("Failed to fetch workflow run result:", fetchErr);
           }
         }
@@ -963,36 +1083,77 @@ function AICopilot({ setCopilotOpen, api, promptRequest, onPromptHandled }) {
         {messages.map((msg, idx) => (
           <div key={idx} className={`flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}>
             <div
-              className={`max-w-[85%] whitespace-pre-wrap rounded-lg px-4 py-2.5 text-sm leading-relaxed ${msg.role === "user" ? "rounded-br-none bg-white border border-gray-200 text-gray-800 shadow-sm" : msg.ok === false ? "rounded-bl-none border border-red-200 bg-red-50 text-red-700 shadow-sm" : "rounded-bl-none border border-gray-200 bg-white text-gray-700 shadow-sm"}`}
+              className={`max-w-[85%] whitespace-pre-wrap rounded-lg px-4 py-2.5 text-sm leading-relaxed ${msg.role === "user" ? "rounded-br-none border border-gray-200 bg-white text-gray-800 shadow-sm" : msg.ok === false ? "rounded-bl-none border border-red-200 bg-red-50 text-red-700 shadow-sm" : "rounded-bl-none border border-gray-200 bg-white text-gray-700 shadow-sm"}`}
             >
               <div className="chat-markdown text-sm leading-relaxed">
                 <ReactMarkdown
                   components={{
-                    h1: ({ children }) => <h1 className="text-lg font-bold text-gray-900 mt-4 mb-2 pb-1 border-b border-gray-200">{children}</h1>,
-                    h2: ({ children }) => <h2 className="text-base font-bold text-gray-800 mt-3 mb-1.5 flex items-center gap-1">{children}</h2>,
-                    h3: ({ children }) => <h3 className="text-sm font-semibold text-gray-700 mt-2 mb-1">{children}</h3>,
+                    h1: ({ children }) => (
+                      <h1 className="mb-2 mt-4 border-b border-gray-200 pb-1 text-lg font-bold text-gray-900">
+                        {children}
+                      </h1>
+                    ),
+                    h2: ({ children }) => (
+                      <h2 className="mb-1.5 mt-3 flex items-center gap-1 text-base font-bold text-gray-800">
+                        {children}
+                      </h2>
+                    ),
+                    h3: ({ children }) => <h3 className="mb-1 mt-2 text-sm font-semibold text-gray-700">{children}</h3>,
                     p: ({ children }) => <p className="my-1 text-gray-700">{children}</p>,
                     ul: ({ children }) => <ul className="my-1 ml-4 list-disc space-y-0.5">{children}</ul>,
                     ol: ({ children }) => <ol className="my-1 ml-4 list-decimal space-y-0.5">{children}</ol>,
                     li: ({ children }) => <li className="text-gray-700">{children}</li>,
                     strong: ({ children }) => <strong className="font-semibold text-gray-900">{children}</strong>,
-                    blockquote: ({ children }) => <blockquote className="my-2 rounded-lg border-l-4 border-blue-400 bg-blue-50 px-3 py-2 text-xs text-blue-800">{children}</blockquote>,
-                    table: ({ children }) => <div className="my-2 overflow-x-auto rounded-lg border border-gray-200"><table className="w-full text-xs">{children}</table></div>,
+                    blockquote: ({ children }) => (
+                      <blockquote className="my-2 rounded-lg border-l-4 border-blue-400 bg-blue-50 px-3 py-2 text-xs text-blue-800">
+                        {children}
+                      </blockquote>
+                    ),
+                    table: ({ children }) => (
+                      <div className="my-2 overflow-x-auto rounded-lg border border-gray-200">
+                        <table className="w-full text-xs">{children}</table>
+                      </div>
+                    ),
                     thead: ({ children }) => <thead className="bg-gray-50">{children}</thead>,
-                    th: ({ children }) => <th className="px-3 py-1.5 text-left font-semibold text-gray-700 border-b border-gray-200">{children}</th>,
-                    td: ({ children }) => <td className="px-3 py-1.5 text-gray-600 border-b border-gray-100">{children}</td>,
-                    tr: ({ children, ...props }) => {
-                      const isRow = props.node?.position?.start?.line;
+                    th: ({ children }) => (
+                      <th className="border-b border-gray-200 px-3 py-1.5 text-left font-semibold text-gray-700">
+                        {children}
+                      </th>
+                    ),
+                    td: ({ children }) => (
+                      <td className="border-b border-gray-100 px-3 py-1.5 text-gray-600">{children}</td>
+                    ),
+                    tr: ({ children }) => {
                       return <tr className="even:bg-gray-50/50">{children}</tr>;
                     },
-                    code: ({ inline, className, children }) => {
-                      if (inline) return <code className="rounded bg-slate-100 px-1 py-0.5 text-xs font-mono text-blue-700">{children}</code>;
-                      return <code className="block rounded-lg bg-slate-900 p-3 text-xs font-mono text-slate-100 overflow-x-auto">{children}</code>;
+                    code: ({ inline, children }) => {
+                      if (inline)
+                        return (
+                          <code className="rounded bg-slate-100 px-1 py-0.5 font-mono text-xs text-blue-700">
+                            {children}
+                          </code>
+                        );
+                      return (
+                        <code className="block overflow-x-auto rounded-lg bg-slate-900 p-3 font-mono text-xs text-slate-100">
+                          {children}
+                        </code>
+                      );
                     },
                     hr: () => <hr className="my-3 border-gray-200" />,
-                    a: ({ href, children }) => <a href={href} target="_blank" rel="noopener noreferrer" className="text-blue-600 underline hover:text-blue-800">{children}</a>,
+                    a: ({ href, children }) => (
+                      <a
+                        href={href}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="text-blue-600 underline hover:text-blue-800"
+                      >
+                        {children}
+                      </a>
+                    ),
                   }}
-                >{String(msg.content)}</ReactMarkdown>
+                >
+                  {String(msg.content)}
+                </ReactMarkdown>
               </div>
               {msg.role === "assistant" && msg.provider && (
                 <div className={`mt-2 text-[11px] ${msg.ok === false ? "text-red-500" : "text-gray-400"}`}>
@@ -1149,6 +1310,7 @@ function AgentPage({ api }) {
   const [busy, setBusy] = useState(false);
   const [logResult, setLogResult] = useState(null);
   const [configNotice, setConfigNotice] = useState("");
+  const [runForm, setRunForm] = useState({ subject: "manual agent test", ticker: "AAPL", model: "", apiKey: "" });
 
   const load = useCallback(() => api("/agents").then(setAgents), [api]);
   useEffect(() => {
@@ -1259,12 +1421,21 @@ function AgentPage({ api }) {
   };
   const runAgent = async (agent) => {
     setSelectedAgent(agent);
-    setModalMode("log");
+    setModalMode("run");
+  };
+  const executeAgentRun = async () => {
+    if (!selectedAgent) return;
     setLogResult({ loading: true });
     try {
-      const result = await api(`/agents/${agent.agentId}/run`, {
+      const body = {
+        subject: runForm.subject,
+        model: runForm.model || undefined,
+        state: { ticker: runForm.ticker, subject: runForm.subject },
+      };
+      if (runForm.apiKey.trim()) body.apiKey = runForm.apiKey.trim();
+      const result = await api(`/agents/${selectedAgent.agentId}/run`, {
         method: "POST",
-        body: JSON.stringify({ subject: "manual agent test", state: { ticker: "GOOG" } }),
+        body: JSON.stringify(body),
       });
       setLogResult(result);
       await load();
@@ -1447,23 +1618,93 @@ function AgentPage({ api }) {
           </div>
         </ModalShell>
       )}
+      {modalMode === "run" && selectedAgent && (
+        <ModalShell title={`运行 ${selectedAgent.name}`} onClose={closeModal} widthClass="max-w-xl">
+          <div className="p-6">
+            <p className="mb-4 text-sm text-gray-500">填写运行参数，直接调用底层大模型验证连通性。</p>
+            <div className="space-y-4">
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                <label className="block">
+                  <span className="mb-1 block text-sm font-medium text-gray-700">Subject</span>
+                  <input
+                    className="input-field"
+                    value={runForm.subject}
+                    onChange={(e) => setRunForm((c) => ({ ...c, subject: e.target.value }))}
+                  />
+                </label>
+                <label className="block">
+                  <span className="mb-1 block text-sm font-medium text-gray-700">Ticker</span>
+                  <input
+                    className="input-field"
+                    value={runForm.ticker}
+                    onChange={(e) => setRunForm((c) => ({ ...c, ticker: e.target.value }))}
+                  />
+                </label>
+                <label className="block">
+                  <span className="mb-1 block text-sm font-medium text-gray-700">模型</span>
+                  <input
+                    className="input-field"
+                    value={runForm.model}
+                    onChange={(e) => setRunForm((c) => ({ ...c, model: e.target.value }))}
+                    placeholder="默认使用后端配置"
+                  />
+                </label>
+                <label className="block">
+                  <span className="mb-1 block text-sm font-medium text-gray-700">API Key（可选）</span>
+                  <input
+                    className="input-field"
+                    value={runForm.apiKey}
+                    onChange={(e) => setRunForm((c) => ({ ...c, apiKey: e.target.value }))}
+                    placeholder="不填则使用后端/编排引擎配置"
+                  />
+                </label>
+              </div>
+              <div className="flex justify-end gap-3">
+                <button type="button" onClick={closeModal} className="btn-secondary">
+                  取消
+                </button>
+                <button type="button" onClick={executeAgentRun} disabled={busy} className="btn-primary">
+                  {busy ? "调用中..." : "测试调用大模型"}
+                </button>
+              </div>
+              {logResult && !logResult.loading && (
+                <div className="rounded-xl border border-gray-200 bg-gray-50 p-4 text-sm">
+                  <div className="mb-2 text-xs text-gray-500">provider: {logResult.provider || "langgraph"}</div>
+                  <div className="whitespace-pre-wrap text-gray-800">
+                    {logResult.content || logResult.message || logResult.summary || JSON.stringify(logResult, null, 2)}
+                  </div>
+                </div>
+              )}
+              {logResult?.loading && (
+                <div className="flex items-center gap-3 rounded-lg border border-gray-200 bg-gray-50 px-4 py-3">
+                  <div className="relative h-5 w-5">
+                    <div className="absolute inset-0 rounded-full border-2 border-gray-200" />
+                    <div className="absolute inset-0 animate-spin rounded-full border-2 border-transparent border-t-blue-500" />
+                  </div>
+                  <span className="text-sm text-gray-500">Agent 正在调用中...</span>
+                </div>
+              )}
+            </div>
+          </div>
+        </ModalShell>
+      )}
     </div>
   );
 }
 
-function WorkflowPage({ api }) {
+function WorkflowPage({ api, token }) {
   return (
     <ReactFlowProvider>
-      <WorkflowComposer api={api} />
+      <WorkflowComposer api={api} token={token} />
     </ReactFlowProvider>
   );
 }
 
-function WorkflowComposer({ api }) {
+function WorkflowComposer({ api, token }) {
   const [workflows, setWorkflows] = useState([]);
   const [agents, setAgents] = useState([]);
   const [workflow, setWorkflow] = useState(null);
-  const [showWorkflowList, setShowWorkflowList] = useState(false);
+  const [, setShowWorkflowList] = useState(false);
   const [activeTab, setActiveTab] = useState("graph");
   const [jsonText, setJsonText] = useState("");
   const [search, setSearch] = useState("");
@@ -1476,6 +1717,8 @@ function WorkflowComposer({ api }) {
     ticker: "AAPL",
     industry: "AI Infrastructure",
     subject: "stock recommendation research",
+    model: "",
+    apiKey: "",
   });
   const [nodes, setNodes] = useState([]);
   const [edges, setEdges] = useState([]);
@@ -1541,7 +1784,7 @@ function WorkflowComposer({ api }) {
     });
   }, [workflows]);
 
-  const createWorkflow = async () => {
+  const _createWorkflow = async () => {
     const created = await api("/workflows", {
       method: "POST",
       body: JSON.stringify({
@@ -1596,6 +1839,8 @@ function WorkflowComposer({ api }) {
       industry: runForm.industry.trim() || "AI Infrastructure",
       subject: runForm.subject.trim() || "stock recommendation research",
       trade_date: new Date().toISOString().slice(0, 10),
+      ...(runForm.model.trim() ? { model: runForm.model.trim() } : {}),
+      ...(runForm.apiKey.trim() ? { apiKey: runForm.apiKey.trim() } : {}),
     };
     const run = await api(`/workflows/${workflow.workflowKey}/run`, {
       method: "POST",
@@ -1629,10 +1874,11 @@ function WorkflowComposer({ api }) {
       industry: runForm.industry.trim() || "AI Infrastructure",
       subject: runForm.subject.trim() || "stock recommendation research",
       trade_date: new Date().toISOString().slice(0, 10),
+      ...(runForm.model.trim() ? { model: runForm.model.trim() } : {}),
+      ...(runForm.apiKey.trim() ? { apiKey: runForm.apiKey.trim() } : {}),
     };
     try {
-      const baseUrl = process.env.NEXT_PUBLIC_API_BASE || "";
-      const resp = await fetch(`${baseUrl}/_backend/workflows/${workflow.workflowKey}/run/stream`, {
+      const resp = await fetch(`${API_BASE}/workflows/${workflow.workflowKey}/run/stream`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -1665,16 +1911,12 @@ function WorkflowComposer({ api }) {
                 const status = data.event === "node_failed" || data.ok === false ? "error" : "success";
                 setRunStatuses((prev) => ({ ...prev, [nid]: "running" }));
                 setNodes((cur) =>
-                  cur.map((n) =>
-                    n.id === nid ? { ...n, data: { ...n.data, runStatus: "running" } } : n,
-                  ),
+                  cur.map((n) => (n.id === nid ? { ...n, data: { ...n.data, runStatus: "running" } } : n)),
                 );
                 setTimeout(() => {
                   setRunStatuses((prev) => ({ ...prev, [nid]: status }));
                   setNodes((cur) =>
-                    cur.map((n) =>
-                      n.id === nid ? { ...n, data: { ...n.data, runStatus: status } } : n,
-                    ),
+                    cur.map((n) => (n.id === nid ? { ...n, data: { ...n.data, runStatus: status } } : n)),
                   );
                 }, 300);
               } else if (currentEvent === "workflow_complete") {
@@ -1682,13 +1924,13 @@ function WorkflowComposer({ api }) {
               } else if (currentEvent === "error") {
                 showToast(`运行错误：${data.error || "unknown"}`);
               }
-            } catch (e) {
+            } catch {
               // skip unparseable data
             }
           }
         }
       }
-    } catch (e) {
+    } catch {
       return runWorkflowSync();
     }
   };
@@ -1829,6 +2071,24 @@ function WorkflowComposer({ api }) {
                 className="h-9 w-60 rounded-lg border border-gray-200 px-3 text-sm outline-none focus:border-gray-300 focus:ring-2 focus:ring-gray-100"
               />
             </label>
+            <label className="block">
+              <span className="mb-1 block text-xs font-medium text-gray-600">Model</span>
+              <input
+                value={runForm.model}
+                onChange={(event) => setRunForm((current) => ({ ...current, model: event.target.value }))}
+                placeholder="默认"
+                className="h-9 w-32 rounded-lg border border-gray-200 px-3 text-sm outline-none focus:border-gray-300 focus:ring-2 focus:ring-gray-100"
+              />
+            </label>
+            <label className="block">
+              <span className="mb-1 block text-xs font-medium text-gray-600">API Key</span>
+              <input
+                value={runForm.apiKey}
+                onChange={(event) => setRunForm((current) => ({ ...current, apiKey: event.target.value }))}
+                placeholder="可选"
+                className="h-9 w-32 rounded-lg border border-gray-200 px-3 text-sm outline-none focus:border-gray-300 focus:ring-2 focus:ring-gray-100"
+              />
+            </label>
             <button
               onClick={runWorkflow}
               className="rounded-lg border border-gray-200 bg-white px-4 py-2 text-sm font-semibold text-black shadow-sm hover:bg-gray-50"
@@ -1922,7 +2182,9 @@ function WorkflowComposer({ api }) {
           ) : (
             <div className="flex min-h-0 flex-1 flex-col gap-2">
               <div className="flex items-center justify-between">
-                <span className="text-xs text-gray-500">编辑 JSON 后点击「同步到图形」，确认后点「保存布局」持久化</span>
+                <span className="text-xs text-gray-500">
+                  编辑 JSON 后点击「同步到图形」，确认后点「保存布局」持久化
+                </span>
                 <button
                   onClick={() => {
                     try {
@@ -1940,7 +2202,7 @@ function WorkflowComposer({ api }) {
                 </button>
               </div>
               <textarea
-                className="min-h-0 flex-1 w-full resize-none rounded-lg bg-slate-950 p-3 font-mono text-xs leading-5 text-slate-100 outline-none focus:ring-2 focus:ring-blue-500"
+                className="min-h-0 w-full flex-1 resize-none rounded-lg bg-slate-950 p-3 font-mono text-xs leading-5 text-slate-100 outline-none focus:ring-2 focus:ring-blue-500"
                 value={jsonText}
                 onChange={(e) => setJsonText(e.target.value)}
                 onFocus={() => setJsonText(JSON.stringify(denormalizeForSave(nodes, edges), null, 2))}
@@ -2004,11 +2266,11 @@ function NodeCatalog({
   groupedNodes,
   search,
   setSearch,
-  selectedNodeId,
-  onSelectNode,
-  onAddNode,
+  _selectedNodeId,
+  _onSelectNode,
+  _onAddNode,
   onOpenDetail,
-  readonly = false,
+  _readonly = false,
 }) {
   return (
     <aside className="flex w-[288px] flex-shrink-0 flex-col rounded-xl border border-gray-200 bg-white p-3">
@@ -2340,6 +2602,15 @@ function Portfolio({ api, navigate, path }) {
   const [includeClosedPositions, setIncludeClosedPositions] = useState(false);
   const [holdingView, setHoldingView] = useState("list");
   const [tradeDrawerOpen, setTradeDrawerOpen] = useState(false);
+  const [createModalOpen, setCreateModalOpen] = useState(false);
+  const [manualTradeModalOpen, setManualTradeModalOpen] = useState(false);
+  const [tradeSearch, setTradeSearch] = useState("");
+  const [tradeFilterSide, setTradeFilterSide] = useState("ALL");
+  const [tradeFilterMarket, setTradeFilterMarket] = useState("ALL");
+  const [tradePage, setTradePage] = useState(1);
+  const [expandedTradeIdx, setExpandedTradeIdx] = useState(-1);
+  const TRADE_PAGE_SIZE = 20;
+  const [newPortfolioName, setNewPortfolioName] = useState("");
   const fileInputRef = useRef(null);
 
   const selectedPortfolioId = form.portfolioId || portfolios[0]?.id || "";
@@ -2473,16 +2744,19 @@ function Portfolio({ api, navigate, path }) {
 
   const patchForm = (patch) => setForm((current) => ({ ...current, ...patch }));
 
-  async function createPortfolio() {
+  async function createPortfolio(name) {
+    const portfolioName = (name || "").trim() || `Trading Portfolio ${portfolios.length + 1}`;
     setBusy(true);
     setMessage("");
     try {
       const created = await api("/portfolio/portfolios", {
         method: "POST",
-        body: JSON.stringify({ name: `Trading Portfolio ${portfolios.length + 1}` }),
+        body: JSON.stringify({ name: portfolioName }),
       });
       await load();
       patchForm({ portfolioId: created.id });
+      setCreateModalOpen(false);
+      setNewPortfolioName("");
       setMessage("已创建组合，可以开始录入交易。");
     } catch (ex) {
       setMessage(ex.message);
@@ -2491,7 +2765,7 @@ function Portfolio({ api, navigate, path }) {
     }
   }
 
-  async function submitManualTrade(event) {
+  async function _submitManualTrade(event) {
     event.preventDefault();
     setBusy(true);
     setMessage("");
@@ -2771,7 +3045,268 @@ function Portfolio({ api, navigate, path }) {
   };
 
   if (path === "/portfolio/trades") {
-    return renderTradeEditor(() => navigate("/portfolio/assets"));
+    const filteredTrades = visibleTrades.filter((trade) => {
+      if (tradeSearch) {
+        const q = tradeSearch.toLowerCase();
+        const matchesSymbol = (trade.symbol || "").toLowerCase().includes(q);
+        const matchesName = (trade.securityName || "").toLowerCase().includes(q);
+        const matchesStrategy = (trade.strategy || "").toLowerCase().includes(q);
+        if (!matchesSymbol && !matchesName && !matchesStrategy) return false;
+      }
+      if (tradeFilterSide !== "ALL" && trade.side !== tradeFilterSide) return false;
+      if (tradeFilterMarket !== "ALL" && (trade.market || "").toUpperCase() !== tradeFilterMarket) return false;
+      return true;
+    });
+    const tradeTotalPages = Math.max(1, Math.ceil(filteredTrades.length / TRADE_PAGE_SIZE));
+    const tradeCurrentPage = filteredTrades.slice((tradePage - 1) * TRADE_PAGE_SIZE, tradePage * TRADE_PAGE_SIZE);
+    const tradePageBtns = [];
+    for (let i = 1; i <= tradeTotalPages; i += 1) {
+      if (tradeTotalPages <= 7 || i === 1 || i === tradeTotalPages || Math.abs(i - tradePage) <= 1) {
+        tradePageBtns.push(i);
+      } else if (tradePageBtns[tradePageBtns.length - 1] !== "...") {
+        tradePageBtns.push("...");
+      }
+    }
+
+    const tradeTotalFees = filteredTrades.reduce((s, t) => s + totalFees(t), 0);
+    const tradeNetFlow = filteredTrades.reduce((s, t) => s + Number(t.netAmount || 0), 0);
+
+    return (
+      <>
+        <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+          <h2 className="text-[26px] font-bold leading-8 text-black">交易流水</h2>
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              onClick={() => setManualTradeModalOpen(true)}
+              className="h-8 rounded-lg bg-blue-600 px-4 text-sm font-semibold text-white hover:bg-blue-700 disabled:opacity-50"
+              disabled={busy}
+            >
+              录入交易
+            </button>
+            <button
+              type="button"
+              onClick={() => fileInputRef.current?.click()}
+              className="h-8 rounded-lg border border-gray-200 bg-white px-3 text-sm font-semibold text-black hover:bg-gray-50"
+            >
+              导入 Excel
+            </button>
+            <button
+              type="button"
+              onClick={exportAssets}
+              className="h-8 rounded-lg border border-gray-200 bg-white px-3 text-sm font-semibold text-black hover:bg-gray-50"
+            >
+              导出 CSV
+            </button>
+          </div>
+        </div>
+
+        <div className="mb-4 grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
+          {[
+            { label: "总交易数", value: filteredTrades.length },
+            {
+              label: "买入/卖出",
+              value: `${filteredTrades.filter((t) => t.side === "BUY").length}/${filteredTrades.filter((t) => t.side === "SELL").length}`,
+            },
+            {
+              label: "总成交额",
+              value: formatMoney(
+                filteredTrades.reduce(
+                  (s, t) => s + Number(t.grossAmount || Number(t.quantity || 0) * Number(t.price || 0)),
+                  0,
+                ),
+              ),
+            },
+            { label: "总费用", value: formatNumber(tradeTotalFees) },
+            { label: "净流入", value: formatMoney(tradeNetFlow) },
+          ].map((card) => (
+            <div key={card.label} className="rounded-lg border border-gray-200 bg-white p-4">
+              <div className="text-xs text-gray-500">{card.label}</div>
+              <div className="mt-1 text-lg font-bold text-gray-900">{card.value}</div>
+            </div>
+          ))}
+        </div>
+
+        <div className="mb-4 flex flex-wrap items-center gap-3">
+          <input
+            value={tradeSearch}
+            onChange={(e) => {
+              setTradeSearch(e.target.value);
+              setTradePage(1);
+            }}
+            placeholder="搜索代码 / 名称 / 策略..."
+            className="h-8 w-64 rounded-lg border border-gray-200 px-3 text-sm focus:border-blue-500 focus:outline-none"
+          />
+          <select
+            value={tradeFilterSide}
+            onChange={(e) => {
+              setTradeFilterSide(e.target.value);
+              setTradePage(1);
+            }}
+            className="h-8 rounded-lg border border-gray-200 px-2 text-sm"
+          >
+            <option value="ALL">全部方向</option>
+            <option value="BUY">买入</option>
+            <option value="SELL">卖出</option>
+          </select>
+          <select
+            value={tradeFilterMarket}
+            onChange={(e) => {
+              setTradeFilterMarket(e.target.value);
+              setTradePage(1);
+            }}
+            className="h-8 rounded-lg border border-gray-200 px-2 text-sm"
+          >
+            <option value="ALL">全部市场</option>
+            <option value="US">美股</option>
+            <option value="HK">港股</option>
+            <option value="CN">A股</option>
+          </select>
+        </div>
+
+        {tradeCurrentPage.length === 0 ? (
+          <div className="rounded-lg border border-dashed border-gray-300 bg-gray-50 py-14 text-center text-sm text-gray-400">
+            暂无交易记录，先导入 Excel 或手动录入一笔交易。
+          </div>
+        ) : (
+          <div className="overflow-auto rounded-lg border border-gray-200">
+            <table className="w-full min-w-[980px] divide-y divide-gray-200">
+              <thead className="bg-gray-50">
+                <tr>
+                  {["交易日", "代码", "名称", "方向", "数量", "成交价", "成交额", "费用", "净金额", "策略"].map(
+                    (head) => (
+                      <th key={head} className="table-header">
+                        {head}
+                      </th>
+                    ),
+                  )}
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-gray-100 bg-white">
+                {tradeCurrentPage.map((trade, idx) => {
+                  const globalIdx = (tradePage - 1) * TRADE_PAGE_SIZE + idx;
+                  return (
+                    <React.Fragment key={trade.tradeId || `${trade.symbol}-${trade.tradeDate}-${idx}`}>
+                      <tr
+                        className="cursor-pointer hover:bg-blue-50/40"
+                        onClick={() => setExpandedTradeIdx(expandedTradeIdx === globalIdx ? -1 : globalIdx)}
+                      >
+                        <td className="table-cell">{trade.tradeDate}</td>
+                        <td className="table-cell font-semibold text-gray-900">{trade.symbol}</td>
+                        <td className="table-cell">{trade.securityName || "-"}</td>
+                        <td className="table-cell">
+                          <span className={trade.side === "SELL" ? "badge-red" : "badge-green"}>
+                            {trade.side === "SELL" ? "卖出" : "买入"}
+                          </span>
+                        </td>
+                        <td className="table-cell">{formatNumber(trade.quantity)}</td>
+                        <td className="table-cell">{formatNumber(trade.price)}</td>
+                        <td className="table-cell">
+                          {formatMoney(
+                            Number(trade.grossAmount || 0) || Number(trade.quantity || 0) * Number(trade.price || 0),
+                            trade.currency || "USD",
+                          )}
+                        </td>
+                        <td className="table-cell">{formatNumber(totalFees(trade))}</td>
+                        <td className="table-cell font-medium">
+                          {formatMoney(trade.netAmount, trade.currency || "USD")}
+                        </td>
+                        <td className="table-cell">{trade.strategy || "-"}</td>
+                      </tr>
+                      {expandedTradeIdx === globalIdx && (
+                        <tr>
+                          <td colSpan={10} className="bg-gray-50 px-6 py-4">
+                            <div className="grid grid-cols-2 gap-x-8 gap-y-2 text-sm sm:grid-cols-3 lg:grid-cols-5">
+                              <div>
+                                <span className="text-gray-500">结算日：</span>
+                                {trade.settlementDate || "-"}
+                              </div>
+                              <div>
+                                <span className="text-gray-500">市场：</span>
+                                {trade.market || "-"}
+                              </div>
+                              <div>
+                                <span className="text-gray-500">券商：</span>
+                                {trade.broker || "-"}
+                              </div>
+                              <div>
+                                <span className="text-gray-500">币种：</span>
+                                {trade.currency || "USD"}
+                              </div>
+                              <div>
+                                <span className="text-gray-500">佣金：</span>
+                                {formatNumber(trade.commission)}
+                              </div>
+                              <div>
+                                <span className="text-gray-500">税费：</span>
+                                {formatNumber(trade.tax)}
+                              </div>
+                              <div>
+                                <span className="text-gray-500">汇率：</span>
+                                {trade.fxRate || "-"}
+                              </div>
+                              <div>
+                                <span className="text-gray-500">来源：</span>
+                                {trade.sourceType || "MANUAL"}
+                              </div>
+                              <div className="col-span-2 sm:col-span-3 lg:col-span-5">
+                                <span className="text-gray-500">备注：</span>
+                                {trade.notes || "-"}
+                              </div>
+                            </div>
+                          </td>
+                        </tr>
+                      )}
+                    </React.Fragment>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+
+        {tradeTotalPages > 1 && (
+          <div className="mt-4 flex items-center justify-center gap-1">
+            <button
+              type="button"
+              disabled={tradePage <= 1}
+              onClick={() => setTradePage(tradePage - 1)}
+              className="h-8 rounded-lg border border-gray-200 bg-white px-3 text-sm text-gray-700 hover:bg-gray-50 disabled:opacity-50"
+            >
+              上一页
+            </button>
+            {tradePageBtns.map((p, i) =>
+              p === "..." ? (
+                <span key={`ellipsis-${i}`} className="px-2 text-sm text-gray-400">
+                  ...
+                </span>
+              ) : (
+                <button
+                  type="button"
+                  key={p}
+                  onClick={() => setTradePage(p)}
+                  className={`h-8 min-w-[32px] rounded-lg px-2 text-sm ${
+                    p === tradePage
+                      ? "bg-blue-600 font-semibold text-white"
+                      : "border border-gray-200 bg-white text-gray-700 hover:bg-gray-50"
+                  }`}
+                >
+                  {p}
+                </button>
+              ),
+            )}
+            <button
+              type="button"
+              disabled={tradePage >= tradeTotalPages}
+              onClick={() => setTradePage(tradePage + 1)}
+              className="h-8 rounded-lg border border-gray-200 bg-white px-3 text-sm text-gray-700 hover:bg-gray-50 disabled:opacity-50"
+            >
+              下一页
+            </button>
+          </div>
+        )}
+      </>
+    );
   }
 
   if (path === "/portfolio/portfolios") {
@@ -2789,9 +3324,11 @@ function Portfolio({ api, navigate, path }) {
             </button>
             <button
               type="button"
-              onClick={createPortfolio}
-              disabled={busy}
-              className="h-8 rounded-lg bg-neutral-950 px-3 text-sm font-semibold text-white hover:bg-neutral-800 disabled:cursor-not-allowed disabled:opacity-60"
+              onClick={() => {
+                setNewPortfolioName("");
+                setCreateModalOpen(true);
+              }}
+              className="h-8 rounded-lg bg-neutral-950 px-3 text-sm font-semibold text-white hover:bg-neutral-800"
             >
               新建组合
             </button>
@@ -3025,7 +3562,13 @@ function Portfolio({ api, navigate, path }) {
           >
             导入 Excel
           </button>
-          <button onClick={createPortfolio} disabled={busy} className="btn-secondary">
+          <button
+            onClick={() => {
+              setNewPortfolioName("");
+              setCreateModalOpen(true);
+            }}
+            className="btn-secondary"
+          >
             新建组合
           </button>
           <button onClick={() => navigate("/portfolio")} className="btn-secondary">
@@ -3078,164 +3621,18 @@ function Portfolio({ api, navigate, path }) {
         </section>
 
         <section className="card">
-          <h3 className="text-sm font-semibold text-gray-800">手动录入交易</h3>
-          <form onSubmit={submitManualTrade} className="mt-4 space-y-4">
-            <div className="grid grid-cols-2 gap-3">
-              <TradeInput label="交易日" required>
-                <input
-                  type="date"
-                  className="input-field"
-                  value={form.tradeDate}
-                  onChange={(e) => patchForm({ tradeDate: e.target.value })}
-                />
-              </TradeInput>
-              <TradeInput label="结算日">
-                <input
-                  type="date"
-                  className="input-field"
-                  value={form.settlementDate}
-                  onChange={(e) => patchForm({ settlementDate: e.target.value })}
-                />
-              </TradeInput>
-              <TradeInput label="股票代码" required>
-                <input
-                  className="input-field uppercase"
-                  value={form.symbol}
-                  onChange={(e) => patchForm({ symbol: e.target.value.toUpperCase() })}
-                  placeholder="AAPL"
-                />
-              </TradeInput>
-              <TradeInput label="名称">
-                <input
-                  className="input-field"
-                  value={form.securityName}
-                  onChange={(e) => patchForm({ securityName: e.target.value })}
-                  placeholder="Apple Inc."
-                />
-              </TradeInput>
-              <TradeInput label="方向" required>
-                <select className="input-field" value={form.side} onChange={(e) => patchForm({ side: e.target.value })}>
-                  <option value="BUY">买入</option>
-                  <option value="SELL">卖出</option>
-                </select>
-              </TradeInput>
-              <TradeInput label="市场">
-                <select
-                  className="input-field"
-                  value={form.market}
-                  onChange={(e) => patchForm({ market: e.target.value })}
-                >
-                  <option value="US">美股</option>
-                  <option value="HK">港股</option>
-                  <option value="CN">A股</option>
-                  <option value="OTHER">其他</option>
-                </select>
-              </TradeInput>
-              <TradeInput label="数量" required>
-                <input
-                  type="number"
-                  min="0"
-                  step="0.0001"
-                  className="input-field"
-                  value={form.quantity}
-                  onChange={(e) => patchForm({ quantity: e.target.value })}
-                />
-              </TradeInput>
-              <TradeInput label="成交价" required>
-                <input
-                  type="number"
-                  min="0"
-                  step="0.0001"
-                  className="input-field"
-                  value={form.price}
-                  onChange={(e) => patchForm({ price: e.target.value })}
-                />
-              </TradeInput>
-              <TradeInput label="佣金">
-                <input
-                  type="number"
-                  min="0"
-                  step="0.01"
-                  className="input-field"
-                  value={form.commission}
-                  onChange={(e) => patchForm({ commission: e.target.value })}
-                />
-              </TradeInput>
-              <TradeInput label="印花税">
-                <input
-                  type="number"
-                  min="0"
-                  step="0.01"
-                  className="input-field"
-                  value={form.tax}
-                  onChange={(e) => patchForm({ tax: e.target.value })}
-                />
-              </TradeInput>
-              <TradeInput label="平台费">
-                <input
-                  type="number"
-                  min="0"
-                  step="0.01"
-                  className="input-field"
-                  value={form.fee}
-                  onChange={(e) => patchForm({ fee: e.target.value })}
-                />
-              </TradeInput>
-              <TradeInput label="其他费用">
-                <input
-                  type="number"
-                  min="0"
-                  step="0.01"
-                  className="input-field"
-                  value={form.otherFee}
-                  onChange={(e) => patchForm({ otherFee: e.target.value })}
-                />
-              </TradeInput>
-              <TradeInput label="币种">
-                <input
-                  className="input-field uppercase"
-                  value={form.currency}
-                  onChange={(e) => patchForm({ currency: e.target.value.toUpperCase() })}
-                />
-              </TradeInput>
-              <TradeInput label="汇率">
-                <input
-                  type="number"
-                  min="0"
-                  step="0.0001"
-                  className="input-field"
-                  value={form.fxRate}
-                  onChange={(e) => patchForm({ fxRate: e.target.value })}
-                />
-              </TradeInput>
-              <TradeInput label="券商">
-                <input
-                  className="input-field"
-                  value={form.broker}
-                  onChange={(e) => patchForm({ broker: e.target.value })}
-                />
-              </TradeInput>
-              <TradeInput label="策略">
-                <input
-                  className="input-field"
-                  value={form.strategy}
-                  onChange={(e) => patchForm({ strategy: e.target.value })}
-                  placeholder="Core / Swing / Hedge"
-                />
-              </TradeInput>
-            </div>
-            <TradeInput label="备注">
-              <textarea
-                className="input-field min-h-20 resize-y"
-                value={form.notes}
-                onChange={(e) => patchForm({ notes: e.target.value })}
-                placeholder="交易理由、风控条件、复盘标签"
-              />
-            </TradeInput>
-            <button type="submit" disabled={busy || !selectedPortfolioId} className="btn-primary w-full">
-              保存交易
+          <div className="flex items-center justify-between">
+            <h3 className="text-sm font-semibold text-gray-800">手动录入交易</h3>
+            <button
+              type="button"
+              onClick={() => setManualTradeModalOpen(true)}
+              disabled={!selectedPortfolioId}
+              className="rounded-lg bg-neutral-950 px-4 py-2 text-sm font-semibold text-white hover:bg-neutral-800 disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              录入交易
             </button>
-          </form>
+          </div>
+          <p className="mt-2 text-xs text-gray-400">手动录入单笔交易，支持美股、港股、A股市场。</p>
         </section>
       </div>
 
@@ -3254,6 +3651,56 @@ function Portfolio({ api, navigate, path }) {
         </div>
         {importPreview.length > 0 && <JsonViewer className="mt-4" value={importPreview} compact />}
       </section>
+
+      {createModalOpen && (
+        <ModalShell title="新建组合" onClose={() => setCreateModalOpen(false)}>
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              createPortfolio(newPortfolioName);
+            }}
+            className="p-6"
+          >
+            <div className="space-y-4">
+              <label className="block">
+                <span className="mb-1 block text-sm font-medium text-gray-700">组合名称</span>
+                <input
+                  value={newPortfolioName}
+                  onChange={(e) => setNewPortfolioName(e.target.value)}
+                  className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  placeholder="例如：美股核心持仓 / A股量化组合"
+                  autoFocus
+                />
+              </label>
+              <p className="text-xs text-gray-400">留空将自动生成默认名称。</p>
+            </div>
+            <div className="mt-6 flex justify-end gap-3">
+              <button
+                type="button"
+                onClick={() => setCreateModalOpen(false)}
+                className="rounded-lg border border-gray-200 px-4 py-2 text-sm text-gray-600 hover:bg-gray-50"
+              >
+                取消
+              </button>
+              <button
+                type="submit"
+                disabled={busy}
+                className="rounded-lg bg-neutral-950 px-4 py-2 text-sm font-semibold text-white hover:bg-neutral-800 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {busy ? "创建中..." : "确认创建"}
+              </button>
+            </div>
+          </form>
+        </ModalShell>
+      )}
+
+      {manualTradeModalOpen && (
+        <ModalShell title="录入交易" onClose={() => setManualTradeModalOpen(false)} widthClass="max-w-4xl">
+          <div className="min-h-0 flex-1 overflow-y-auto p-6">
+            {renderTradeEditor(() => setManualTradeModalOpen(false))}
+          </div>
+        </ModalShell>
+      )}
     </div>
   );
 }
@@ -3276,7 +3723,7 @@ function MetricTile({ label, value }) {
   );
 }
 
-function TradeInput({ label, required, children }) {
+function _TradeInput({ label, required, children }) {
   return (
     <label className="block">
       <span className="mb-1.5 block text-xs font-medium text-gray-600">
@@ -3566,12 +4013,12 @@ function Dashboard({ api }) {
   const news = marketDataResult?.news;
   const metrics = Array.isArray(financials?.metrics) ? financials.metrics.slice(0, 5) : [];
   const articles = Array.isArray(news?.articles) ? news.articles.slice(0, 5) : [];
-  const [analysisResult, setAnalysisResult] = useState(null);
-  const [analysisLoading, setAnalysisLoading] = useState(false);
-  const [analysisError, setAnalysisError] = useState("");
-  const [showDataRequest, setShowDataRequest] = useState(false);
-  const [missingFields, setMissingFields] = useState([]);
-  const [extraInfo, setExtraInfo] = useState({ sector: "", industry: "", timeframe: "", notes: "" });
+  const [, setAnalysisResult] = useState(null);
+  const [, setAnalysisLoading] = useState(false);
+  const [, setAnalysisError] = useState("");
+  const [, setShowDataRequest] = useState(false);
+  const [, setMissingFields] = useState([]);
+  const [extraInfo] = useState({ sector: "", industry: "", timeframe: "", notes: "" });
 
   const REQUIRED_ANALYSIS_FIELDS = [
     { key: "price", label: "\u6700\u65b0\u4ef7\u683c" },
@@ -3610,13 +4057,14 @@ function Dashboard({ api }) {
     }
   }
 
-  const openDataRequest = useCallback(() => {
+  const _openDataRequest = useCallback(() => {
     const missing = REQUIRED_ANALYSIS_FIELDS.filter((field) => !resolveAnalysisFieldValue(field.key));
     setMissingFields(missing);
     setShowDataRequest(true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [quote, financials]);
 
-  const generateDeepAnalysis = useCallback(async () => {
+  const _generateDeepAnalysis = useCallback(async () => {
     const missing = REQUIRED_ANALYSIS_FIELDS.filter((field) => !resolveAnalysisFieldValue(field.key));
     if (missing.length) {
       setMissingFields(missing);
@@ -3666,6 +4114,7 @@ function Dashboard({ api }) {
             content = runResult.recommendation.content;
           }
         } catch (fetchErr) {
+          // eslint-disable-next-line no-console
           console.warn("Failed to fetch workflow run result:", fetchErr);
         }
       }
@@ -3675,6 +4124,7 @@ function Dashboard({ api }) {
     } finally {
       setAnalysisLoading(false);
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [api, marketSymbol, quote, financials, extraInfo]);
 
   return (
@@ -5477,21 +5927,7 @@ function Badge({ children, tone = "default" }) {
     </span>
   );
 }
-function Tabs({ active, setActive }) {
-  return (
-    <div className="flex rounded-lg border border-slate-200 bg-slate-50 p-1">
-      <button onClick={() => setActive("graph")} className={tabClass(active === "graph")}>
-        图形视图
-      </button>
-      <button onClick={() => setActive("json")} className={tabClass(active === "json")}>
-        JSON 视图
-      </button>
-    </div>
-  );
-}
-function tabClass(active) {
-  return `rounded-md px-3 py-1.5 text-sm font-semibold ${active ? "bg-slate-950 text-white" : "text-slate-600 hover:text-slate-950"}`;
-}
+/* Tabs / tabClass removed - unused */
 
 export default function App() {
   const [path, setPath] = useState(readInitialPathname);
@@ -5556,11 +5992,9 @@ export default function App() {
   if (!token) return <LoginPage onLogin={login} />;
 
   let page = <Home navigate={navigate} openCopilotWithPrompt={openCopilotWithPrompt} />;
-  if (path === "/agent/test") page = <AgentTestPage api={api} />;
-  else if (path === "/agent") page = <AgentPage api={api} />;
+  if (path === "/agent") page = <AgentPage api={api} />;
   else if (path === "/workflow/runs") page = <WorkflowRunCenterPage api={api} />;
-  else if (path === "/workflow/test") page = <WorkflowTestPage api={api} />;
-  else if (path === "/workflow") page = <WorkflowPage api={api} />;
+  else if (path === "/workflow") page = <WorkflowPage api={api} token={token} />;
   else if (path.startsWith("/portfolio")) page = <Portfolio api={api} navigate={navigate} path={path} />;
   else if (path === "/data-center/dashboard") page = <Dashboard api={api} />;
   else if (path.startsWith("/data-center")) page = <Dashboard api={api} />;

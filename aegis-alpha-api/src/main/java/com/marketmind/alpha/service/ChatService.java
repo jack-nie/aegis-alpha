@@ -13,6 +13,7 @@ import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -167,14 +168,18 @@ public class ChatService {
 
         WorkflowRun run;
         try {
-            run = workflowService.start(workflowKey, subject, inputs);
+            run = workflowService.createRun(workflowKey, subject, inputs);
         } catch (Exception ex) {
             /* If workflow layout is not published or invalid, fall back to copilot */
             return copilotReply(message, threadId, body);
         }
 
+        final String runId = run.getRunId();
+        final Map<String, Object> safeInputs = new LinkedHashMap<>(inputs);
+        CompletableFuture.runAsync(() -> workflowService.executeAsync(run, safeInputs, workflowKey));
+
         String reply = String.format("\u5df2\u81ea\u52a8\u8def\u7531\u5230\u5de5\u4f5c\u6d41 [%s]\uff0c\u8fd0\u884c ID: %s\uff0c\u72b6\u6001: %s",
-                workflowKey, run.getRunId(), run.getStatus());
+                workflowKey, runId, "RUNNING");
         mapper.insertMessage(UUID.randomUUID().toString(), threadId, "assistant", reply);
 
         Map<String, Object> response = new LinkedHashMap<String, Object>();
@@ -182,8 +187,8 @@ public class ChatService {
         response.put("message", reply);
         response.put("content", reply);
         response.put("workflowKey", workflowKey);
-        response.put("runId", run.getRunId());
-        response.put("runStatus", run.getStatus());
+        response.put("runId", runId);
+        response.put("runStatus", "RUNNING");
         response.put("routedToWorkflow", true);
         return response;
     }

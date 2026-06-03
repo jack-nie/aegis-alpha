@@ -210,24 +210,15 @@ app.post("/stream-workflow", async (req, res) => {
           completedAt: traceEntry.completedAt,
           durationMs: traceEntry.durationMs,
         };
-        res.write("event: node_update
-data: " + JSON.stringify(event) + "
-
-");
+        res.write("event: node_update\ndata: " + JSON.stringify(event) + "\n\n");
       }
     }
 
-    res.write("event: workflow_complete
-data: {"ok":true}
-
-");
+    res.write("event: workflow_complete\ndata: {\"ok\":true}\n\n");
     res.end();
   } catch (error) {
     const errData = JSON.stringify({ ok: false, error: error?.message || String(error) });
-    res.write("event: error
-data: " + errData + "
-
-");
+    res.write("event: error\ndata: " + errData + "\n\n");
     res.end();
   }
 });
