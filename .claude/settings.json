@@ -1,0 +1,21 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "npx prettier --write $CLAUDE_FILE_PATH",
+            "on_failure": "warn"
+          },
+          {
+            "type": "command",
+            "command": "npx eslint --no-warn-ignored --max-warnings=0 $CLAUDE_FILE_PATH 2>&1 || true",
+            "on_failure": "warn"
+          }
+        ]
+      }
+    ]
+  }
+}
