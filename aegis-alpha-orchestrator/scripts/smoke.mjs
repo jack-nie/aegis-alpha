@@ -116,24 +116,26 @@ function startMalformedModelServer() {
     }
     req.resume();
     res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({
-      id: "chatcmpl-smoke",
-      object: "chat.completion",
-      created: Math.floor(Date.now() / 1000),
-      model: "deepseek-v4-flash",
-      choices: [
-        {
-          index: 0,
-          finish_reason: "stop",
-          message: { role: "assistant", content: "this is not json" },
+    res.end(
+      JSON.stringify({
+        id: "chatcmpl-smoke",
+        object: "chat.completion",
+        created: Math.floor(Date.now() / 1000),
+        model: "deepseek-v4-flash",
+        choices: [
+          {
+            index: 0,
+            finish_reason: "stop",
+            message: { role: "assistant", content: "this is not json" },
+          },
+        ],
+        usage: {
+          prompt_tokens: 11,
+          completion_tokens: 7,
+          total_tokens: 18,
         },
-      ],
-      usage: {
-        prompt_tokens: 11,
-        completion_tokens: 7,
-        total_tokens: 18,
-      },
-    }));
+      }),
+    );
   });
   return new Promise((resolve, reject) => {
     server.once("error", reject);
@@ -187,7 +189,10 @@ const copilotResult = await request("/execute-node", {
   }),
 });
 assertNodeResult(copilotResult, "general.agent");
-assert(copilotResult.summary.includes("模拟模式"), `copilot mock summary should be user-facing Chinese, got ${copilotResult.summary}`);
+assert(
+  copilotResult.summary.includes("模拟模式"),
+  `copilot mock summary should be user-facing Chinese, got ${copilotResult.summary}`,
+);
 
 const copilotFallback = await request("/execute-node", {
   method: "POST",
@@ -209,7 +214,10 @@ const copilotFallback = await request("/execute-node", {
 });
 assertNodeResult(copilotFallback, "general.agent");
 assert(copilotFallback.provider === "fallback", `expected fallback provider, got ${copilotFallback.provider}`);
-assert(copilotFallback.summary.includes("暂时无法连接真实模型"), `copilot fallback should be user-facing Chinese, got ${copilotFallback.summary}`);
+assert(
+  copilotFallback.summary.includes("暂时无法连接真实模型"),
+  `copilot fallback should be user-facing Chinese, got ${copilotFallback.summary}`,
+);
 
 const unsupported = await request("/execute-node", {
   method: "POST",

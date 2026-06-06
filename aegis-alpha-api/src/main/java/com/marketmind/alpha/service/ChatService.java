@@ -1,6 +1,7 @@
 package com.marketmind.alpha.service;
 
 import com.marketmind.alpha.domain.AgentTemplate;
+import com.marketmind.alpha.service.IntentRouterService.IntentResult;
 import com.marketmind.alpha.domain.WorkflowRun;
 import com.marketmind.alpha.mapper.ChatMapper;
 import org.springframework.stereotype.Service;
@@ -12,6 +13,7 @@ import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -21,6 +23,12 @@ public class ChatService {
     private static final Set<String> SYMBOL_STOPWORDS = new HashSet<String>(Arrays.asList(
             "AI", "API", "CPI", "ETF", "GDP", "IPO", "LLM", "SEC", "USA", "USD", "CEO", "CFO", "ESG"
     ));
+
+    /* Flexible patterns: analysis + stock name + stock/sector keywords */
+    private static final Pattern STOCK_ANALYSIS_PATTERN =
+            Pattern.compile("分析.{0,20}(?:股票|个股)|(?:股票|个股).{0,10}分析|分析一下.{0,20}");
+    private static final Pattern SECTOR_ANALYSIS_PATTERN =
+            Pattern.compile("分析.{0,20}(?:板块|行业)|(?:板块|行业).{0,10}分析");
 
     /* ---- the 6 valid workflow keys seeded in ExistingDataSeeder ---- */
     private static final Set<String> VALID_WORKFLOW_KEYS = Collections.unmodifiableSet(new HashSet<String>(Arrays.asList(
@@ -32,15 +40,18 @@ public class ChatService {
     private final LangChainGateway langChainGateway;
     private final MarketDataService marketDataService;
     private final WorkflowService workflowService;
+    private final IntentRouterService intentRouterService;
 
     public ChatService(ChatMapper mapper,
                        LangChainGateway langChainGateway,
                        MarketDataService marketDataService,
-                       WorkflowService workflowService) {
+                       WorkflowService workflowService,
+                       IntentRouterService intentRouterService) {
         this.mapper = mapper;
         this.langChainGateway = langChainGateway;
         this.marketDataService = marketDataService;
         this.workflowService = workflowService;
+        this.intentRouterService = intentRouterService;
     }
 
     public Object threads() {
@@ -53,8 +64,14 @@ public class ChatService {
         mapper.insertThread(threadId, title(message));
         mapper.insertMessage(UUID.randomUUID().toString(), threadId, "user", message);
 
-        /* ---- intent-based workflow routing ---- */
-        String workflowKey = resolveWorkflowKey(body, message);
+        /* ---- intent-based workflow routing via LLM + DB keywords ---- */
+        IntentResult intent = intentRouterService.classify(message);
+        String workflowKey = intent != null ? intent.getWorkflowKey() : null;
+        // explicit override from caller takes priority
+        String explicit = text(body, "workflowKey", "");
+        if (!explicit.isEmpty()) {
+            workflowKey = explicit;
+        }
         if (workflowKey != null) {
             return dispatchWorkflow(workflowKey, message, threadId, body);
         }
@@ -83,7 +100,12 @@ public class ChatService {
         }
         /* deep dive */
         if (matchesAny(msg,
-                "深度分析", "深度研究", "深入研究", "个股分析", "股票分析", "分析个股", "分析股票", "deep dive", "deep analysis", "stock analysis", "analyze stock")) {
+                "深度分析", "深度研究", "深入研究", "个股分析", "股票分析", "分析个股", "分析股票", "deep dive", "deep analysis", "stock analysis", "analyze stock",
+                "帮我分析", "分析一下")) {
+            return "deep_dive";
+        }
+        /* deep dive - flexible regex: analysis + stock name + stock keywords */
+        if (STOCK_ANALYSIS_PATTERN.matcher(msg).find()) {
             return "deep_dive";
         }
         /* exit workflow */
@@ -105,6 +127,10 @@ public class ChatService {
         /* sector analyst */
         if (matchesAny(msg,
                 "板块", "行业", "行业分析", "sector", "industry analysis", "sector analyst")) {
+            return "sector-analyst-workflow";
+        }
+        /* sector analyst - flexible regex: analysis + sector/industry name */
+        if (SECTOR_ANALYSIS_PATTERN.matcher(msg).find()) {
             return "sector-analyst-workflow";
         }
 
@@ -142,14 +168,18 @@ public class ChatService {
 
         WorkflowRun run;
         try {
-            run = workflowService.start(workflowKey, subject, inputs);
+            run = workflowService.createRun(workflowKey, subject, inputs);
         } catch (Exception ex) {
             /* If workflow layout is not published or invalid, fall back to copilot */
             return copilotReply(message, threadId, body);
         }
 
+        final String runId = run.getRunId();
+        final Map<String, Object> safeInputs = new LinkedHashMap<>(inputs);
+        CompletableFuture.runAsync(() -> workflowService.executeAsync(run, safeInputs, workflowKey));
+
         String reply = String.format("\u5df2\u81ea\u52a8\u8def\u7531\u5230\u5de5\u4f5c\u6d41 [%s]\uff0c\u8fd0\u884c ID: %s\uff0c\u72b6\u6001: %s",
-                workflowKey, run.getRunId(), run.getStatus());
+                workflowKey, runId, "RUNNING");
         mapper.insertMessage(UUID.randomUUID().toString(), threadId, "assistant", reply);
 
         Map<String, Object> response = new LinkedHashMap<String, Object>();
@@ -157,8 +187,8 @@ public class ChatService {
         response.put("message", reply);
         response.put("content", reply);
         response.put("workflowKey", workflowKey);
-        response.put("runId", run.getRunId());
-        response.put("runStatus", run.getStatus());
+        response.put("runId", runId);
+        response.put("runStatus", "RUNNING");
         response.put("routedToWorkflow", true);
         return response;
     }

@@ -96,7 +96,10 @@ try {
     }),
   });
 
-  assert(cachedFallback.data.marketDataContext.quote.provider === "chat-cache", "did not reuse chat marketDataOverview");
+  assert(
+    cachedFallback.data.marketDataContext.quote.provider === "chat-cache",
+    "did not reuse chat marketDataOverview",
+  );
   assert(backend.calls === 2, `expected cached chat hydration to avoid a backend call, got ${backend.calls}`);
   console.log("market data hydration ok");
 } finally {
@@ -138,13 +141,15 @@ async function startBackendStub() {
       const payload = JSON.parse(raw || "{}");
       calls += 1;
       res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({
-        functionName: payload.functionName,
-        status: "ok",
-        provider: "yahoo-chart",
-        rows: [{ symbol: "AAPL", price: 205.35, provider: "yahoo-chart" }],
-        sources: [{ title: "Yahoo Finance chart", type: "quote" }],
-      }));
+      res.end(
+        JSON.stringify({
+          functionName: payload.functionName,
+          status: "ok",
+          provider: "yahoo-chart",
+          rows: [{ symbol: "AAPL", price: 205.35, provider: "yahoo-chart" }],
+          sources: [{ title: "Yahoo Finance chart", type: "quote" }],
+        }),
+      );
     });
   });
   await new Promise((resolve, reject) => {

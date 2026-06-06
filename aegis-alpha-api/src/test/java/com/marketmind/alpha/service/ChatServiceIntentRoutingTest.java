@@ -19,7 +19,7 @@ class ChatServiceIntentRoutingTest {
     void setUp() {
         /* resolveWorkflowKey is package-private; ChatService needs deps but we only
            call the pure intent method so nulls are safe for the unused collaborators. */
-        chatService = new ChatService(null, null, null, null);
+        chatService = new ChatService(null, null, null, null, null);
     }
 
     /* ---- explicit workflowKey override ---- */

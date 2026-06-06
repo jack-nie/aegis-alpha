@@ -1,0 +1,23 @@
+{
+  "name": "aegis-alpha",
+  "private": true,
+  "type": "module",
+  "description": "Investment research & AI agent workflow orchestration platform",
+  "scripts": {
+    "format": "prettier --write \"aegis-alpha-web/**/*.{js,jsx,json,css,md}\" \"aegis-alpha-orchestrator/**/*.{js,mjs,json,md}\"",
+    "format:check": "prettier --check \"aegis-alpha-web/**/*.{js,jsx,json,css,md}\" \"aegis-alpha-orchestrator/**/*.{js,mjs,json,md}\"",
+    "lint": "eslint aegis-alpha-web/app aegis-alpha-orchestrator/server.mjs",
+    "lint:fix": "eslint --fix aegis-alpha-web/app aegis-alpha-orchestrator/server.mjs"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.0.0",
+    "eslint": "^9.0.0",
+    "eslint-plugin-react": "^7.37.0",
+    "eslint-plugin-react-hooks": "^5.0.0",
+    "globals": "^16.0.0",
+    "husky": "^9.1.7",
+    "lint-staged": "^16.4.0",
+    "prettier": "^3.5.0",
+    "prettier-plugin-tailwindcss": "^0.6.0"
+  }
+}

@@ -72,6 +72,8 @@ public class SchemaMigrationRunner implements CommandLineRunner {
         createGovernanceTables();
         createPortfolioTradeTable();
         createAuditEventTable();
+        addColumn("workflow_definition", "trigger_keywords", "VARCHAR(1024)");
+        addColumn("workflow_definition", "routing_description", "VARCHAR(512)");
         seedDefaultModelConfig();
         updateLegacyAgentModels();
     }

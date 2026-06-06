@@ -11,7 +11,14 @@
   --red: #ff3868;
   --blue: #4b8bed;
   --teal: #16b8a6;
-  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-family:
+    Inter,
+    ui-sans-serif,
+    system-ui,
+    -apple-system,
+    BlinkMacSystemFont,
+    "Segoe UI",
+    sans-serif;
 }
 
 * {
@@ -46,8 +53,7 @@ button {
   padding: 80px 16px;
   background:
     radial-gradient(circle at 50% 18%, rgba(178, 138, 255, 0.22), transparent 24%),
-    radial-gradient(circle at 68% 92%, rgba(63, 190, 226, 0.15), transparent 28%),
-    #fff;
+    radial-gradient(circle at 68% 92%, rgba(63, 190, 226, 0.15), transparent 28%), #fff;
 }
 
 .login-card {
@@ -415,10 +421,18 @@ button.secondary {
   background: #8ea0b8;
 }
 
-.pill.cn { background: #5d9cec; }
-.pill.us { background: #7f8ee8; }
-.pill.eu { background: #23b9aa; }
-.pill.jp { background: #40bd85; }
+.pill.cn {
+  background: #5d9cec;
+}
+.pill.us {
+  background: #7f8ee8;
+}
+.pill.eu {
+  background: #23b9aa;
+}
+.pill.jp {
+  background: #40bd85;
+}
 
 table {
   width: 100%;
@@ -446,9 +460,15 @@ th {
   font-weight: 500;
 }
 
-.positive { color: var(--green); }
-.negative { color: var(--red); }
-.muted { color: var(--muted); }
+.positive {
+  color: var(--green);
+}
+.negative {
+  color: var(--red);
+}
+.muted {
+  color: var(--muted);
+}
 
 .list {
   display: grid;

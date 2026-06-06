@@ -17,6 +17,8 @@ import java.time.Duration;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayDeque;
+import java.util.concurrent.CompletableFuture;
+import com.fasterxml.jackson.databind.JsonNode;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -33,11 +35,11 @@ public class WorkflowService {
     private final WorkflowMapper mapper;
     private final AgentMapper agentMapper;
     private final ObjectMapper objectMapper;
-    private final LangChainGateway langChainGateway;
     private final CacheService cacheService;
     private final BacktestService backtestService;
     private final AgentTraceService agentTraceService;
     private final WorkflowValidationService validationService;
+    private final LangChainGateway langChainGateway;
 
     public WorkflowService(WorkflowMapper mapper,
                            AgentMapper agentMapper,
@@ -277,6 +279,47 @@ public class WorkflowService {
         }
     }
 
+    public WorkflowRun createRun(String workflowKey, String subject, Map<String, Object> inputs) {
+        String key = workflowKey == null || workflowKey.trim().isEmpty() ? "daily" : workflowKey.trim();
+        WorkflowVersion version = mapper.findLatestVersion(key);
+        Map<String, Object> runLayout = layoutForRun(key, version);
+        validationService.validateLayout(runLayout);
+        Map<String, Object> safeInputs = inputs == null ? new LinkedHashMap<String, Object>() : new LinkedHashMap<>(inputs);
+        WorkflowRun run = new WorkflowRun();
+        run.setRunId(UUID.randomUUID().toString());
+        run.setWorkflowKey(key);
+        run.setTraceId(UUID.randomUUID().toString());
+        run.setStatus("RUNNING");
+        run.setSubject(subject);
+        run.setStartedAt(now());
+        run.setNodeCount(0);
+        run.setWorkflowVersionId(version == null ? null : version.getVersionId());
+        run.setInputsJson(toJson(safeInputs));
+        run.setControlStatus("ACTIVE");
+        run.setPauseRequested(0);
+        run.setCancelRequested(0);
+        mapper.insertRun(run);
+        recordRunEvent(run, "RUN_CREATED", null, null, "RUNNING", "Workflow run created.", null, 0);
+        return run;
+    }
+
+    public void executeAsync(WorkflowRun run, Map<String, Object> inputs, String workflowKey) {
+        WorkflowVersion version = mapper.findLatestVersion(workflowKey);
+        Map<String, Object> runLayout = layoutForRun(workflowKey, version);
+        try {
+            execute(run, inputs, runLayout);
+            backtestService.createFromWorkflowRun(mapper.findRun(run.getRunId()), inputs);
+        } catch (WorkflowStoppedException stopped) {
+            // run already updated by execute()
+        } catch (Exception ex) {
+            run.setStatus("FAILED");
+            run.setCompletedAt(now());
+            run.setErrorMessage(ex.getMessage());
+            run.setControlStatus("FAILED");
+            mapper.updateRun(run);
+            recordRunEvent(run, "RUN_FAILED", null, null, "FAILED", ex.getMessage(), null, 1000000);
+        }
+    }
     public WorkflowRun start(String workflowKey, String subject) {
         return start(workflowKey, subject, new LinkedHashMap<String, Object>(), null);
     }
@@ -332,6 +375,100 @@ public class WorkflowService {
             return failed;
         }
     }
+
+    public WorkflowRun startWithStreaming(String workflowKey, String subject, Map<String, Object> inputs,
+                                          org.springframework.web.servlet.mvc.method.annotation.SseEmitter emitter) {
+        String key = workflowKey == null || workflowKey.trim().isEmpty() ? "daily" : workflowKey.trim();
+        WorkflowVersion version = mapper.findLatestVersion(key);
+        Map<String, Object> runLayout = layoutForRun(key, version);
+        validationService.validateLayout(runLayout);
+        Map<String, Object> safeInputs = inputs == null ? new LinkedHashMap<String, Object>() : new LinkedHashMap<String, Object>(inputs);
+        final WorkflowRun run = new WorkflowRun();
+        run.setRunId(UUID.randomUUID().toString());
+        run.setWorkflowKey(key);
+        run.setTraceId(UUID.randomUUID().toString());
+        run.setStatus("RUNNING");
+        run.setSubject(subject);
+        run.setStartedAt(now());
+        run.setNodeCount(0);
+        run.setWorkflowVersionId(version == null ? null : version.getVersionId());
+        run.setInputsJson(toJson(safeInputs));
+        run.setControlStatus("ACTIVE");
+        run.setPauseRequested(0);
+        run.setCancelRequested(0);
+        mapper.insertRun(run);
+        recordRunEvent(run, "RUN_CREATED", null, null, "RUNNING", "Workflow run created (streaming).", null, 0);
+        String streamUrl = langChainGateway.streamWorkflowUrl();
+        String streamBody = langChainGateway.buildStreamBody(runLayout, subject, safeInputs);
+        final String runId = run.getRunId();
+        SseStreamReader.readSse(streamUrl, streamBody, new SseStreamReader.SseEventHandler() {
+            @Override public void onEvent(String eventName, String data) {
+                try {
+                    if ("node_update".equals(eventName)) {
+                        JsonNode nd = objectMapper.readTree(data);
+                        String nodeId = nd.has("nodeId") ? nd.get("nodeId").asText() : "unknown";
+                        String nodeName = nd.has("nodeName") ? nd.get("nodeName").asText() : nodeId;
+                        WorkflowRunEvent ev = new WorkflowRunEvent();
+                        ev.setEventId(UUID.randomUUID().toString());
+                        ev.setRunId(runId);
+                        ev.setEventType("NODE_COMPLETED");
+                        ev.setNodeId(nodeId);
+                        ev.setStatus("COMPLETED");
+                        ev.setMessage("Node completed: " + nodeName);
+                        ev.setPayloadJson(data);
+                        ev.setCreatedAt(now());
+                        ev.setSortOrder(0);
+                        mapper.insertRunEvent(ev);
+                        emitter.send(org.springframework.web.servlet.mvc.method.annotation.SseEmitter.event().name("node_update").data(data));
+                    } else if ("workflow_complete".equals(eventName)) {
+                        run.setStatus("COMPLETED");
+                        run.setCompletedAt(now());
+                        run.setControlStatus("COMPLETED");
+                        run.setPauseRequested(0);
+                        run.setCancelRequested(0);
+                        mapper.updateRun(run);
+                        recordRunEvent(run, "RUN_COMPLETED", null, null, "COMPLETED", "Workflow run completed (streaming).", null, 1000000);
+                        emitter.send(org.springframework.web.servlet.mvc.method.annotation.SseEmitter.event().name("workflow_complete").data("{\"ok\":true}"));
+                        emitter.complete();
+                    } else if ("error".equals(eventName)) {
+                        JsonNode en = objectMapper.readTree(data);
+                        run.setStatus("FAILED");
+                        run.setCompletedAt(now());
+                        run.setErrorMessage(en.has("error") ? en.get("error").asText() : "Unknown error");
+                        run.setControlStatus("FAILED");
+                        mapper.updateRun(run);
+                        recordRunEvent(run, "RUN_FAILED", null, null, "FAILED", run.getErrorMessage(), null, 1000000);
+                        emitter.send(org.springframework.web.servlet.mvc.method.annotation.SseEmitter.event().name("error").data(data));
+                        emitter.complete();
+                    }
+                } catch (Exception ex) {
+                    try { run.setStatus("FAILED"); run.setCompletedAt(now()); run.setControlStatus("FAILED"); mapper.updateRun(run); } catch (Exception ignored) {}
+                    try { emitter.completeWithError(ex); } catch (Exception ignored) {}
+                }
+            }
+            @Override public void onError(Exception ex) {
+                try {
+                    run.setStatus("FAILED"); run.setCompletedAt(now());
+                    run.setErrorMessage("Stream error: " + ex.getMessage());
+                    run.setControlStatus("FAILED");
+                    mapper.updateRun(run);
+                    recordRunEvent(run, "RUN_FAILED", null, null, "FAILED", run.getErrorMessage(), null, 1000000);
+                    emitter.send(org.springframework.web.servlet.mvc.method.annotation.SseEmitter.event().name("error").data("{\"ok\":false}"));
+                } catch (Exception ignored) {}
+                try { emitter.completeWithError(ex); } catch (Exception ignored) {}
+            }
+            @Override public void onComplete() {
+                WorkflowRun latest = mapper.findRun(runId);
+                if (latest != null && "RUNNING".equals(latest.getStatus())) {
+                    latest.setStatus("COMPLETED"); latest.setCompletedAt(now());
+                    latest.setControlStatus("COMPLETED");
+                    mapper.updateRun(latest);
+                }
+            }
+        });
+        return mapper.findRun(runId);
+    }
+
 
     public WorkflowRun queueStart(String workflowKey, String subject, Map<String, Object> inputs, String idempotencyKey) {
         String key = workflowKey == null || workflowKey.trim().isEmpty() ? "daily" : workflowKey.trim();
@@ -653,27 +790,28 @@ public class WorkflowService {
     private Map<String, Object> executeNode(Map<String, Object> node, Map<String, Object> state, WorkflowRun run) {
         String type = nodeType(node);
         String handler = handler(node);
-        if ("agent".equals(type) || isExternalResearchHandler(handler)) {
-            AgentTemplate agent = resolveAgent(node);
-            return langChainGateway.executeNode(agent, state, node, run.getSubject());
+        if (isControlFlowNode(type, handler)) {
+            Map<String, Object> result = new LinkedHashMap<>();
+            result.put("type", type);
+            result.put("handler", handler);
+            result.put("summary", simulatedNodeMessage(type, handler, run.getSubject()));
+            result.put("message", result.get("summary"));
+            result.put("ok", true);
+            return result;
         }
-        Map<String, Object> result = new LinkedHashMap<>();
-        result.put("type", type);
-        result.put("handler", handler);
-        result.put("summary", simulatedNodeMessage(type, handler, run.getSubject()));
-        result.put("message", result.get("summary"));
-        result.put("ok", true);
-        return result;
+        AgentTemplate agent = resolveAgent(node);
+        return langChainGateway.executeNode(agent, state, node, run.getSubject());
     }
 
-    private boolean isExternalResearchHandler(String handler) {
-        return handler != null && (handler.startsWith("finance.")
-                || "general.web_search".equals(handler)
-                || "general.fetch_news".equals(handler)
-                || "general.get_market_share".equals(handler)
-                || "general.get_sector_news".equals(handler)
-                || "general.get_tech_breakthroughs".equals(handler)
-                || "general.stock_screener_agent".equals(handler));
+    private boolean isControlFlowNode(String type, String handler) {
+        if ("start".equals(type) || "end".equals(type) || "condition".equals(type)) {
+            return true;
+        }
+        if (handler == null) {
+            return true;
+        }
+        // Only truly deterministic control-flow handlers skip LLM
+        return handler.equals("workflow.end") || handler.equals("scheduler.manual") || handler.equals("scheduler.daily");
     }
 
     private AgentTemplate resolveAgent(Map<String, Object> node) {
@@ -845,13 +983,13 @@ public class WorkflowService {
     private List<Map<String, Object>> stockRecommendationNodes() {
         List<Map<String, Object>> nodes = new ArrayList<>();
         nodes.add(flowNode("start", "Start", "start", 80, 260, "scheduler.manual", null));
-        nodes.add(flowNode("market_analysis", "市场分析", "logic", 320, 120, "finance.market_analysis", null));
-        nodes.add(flowNode("industry_share", "行业份额", "logic", 320, 260, "finance.industry_share", null));
-        nodes.add(flowNode("sentiment_monitor", "舆情监测", "logic", 320, 400, "finance.sentiment_monitor", null));
-        nodes.add(flowNode("tech_breakthrough", "技术突破", "logic", 590, 120, "finance.tech_breakthrough", null));
-        nodes.add(flowNode("industry_news", "行业新闻", "logic", 590, 260, "finance.industry_news", null));
-        nodes.add(flowNode("web_search", "网页搜索", "logic", 590, 400, "general.web_search", null));
-        nodes.add(flowNode("financial_interpretation", "财务解读", "logic", 860, 260, "finance.financial_interpretation", null));
+        nodes.add(flowNode("market_analysis", "市场分析", "agent", 320, 120, "finance.market_analysis", null));
+        nodes.add(flowNode("industry_share", "行业份额", "agent", 320, 260, "finance.industry_share", null));
+        nodes.add(flowNode("sentiment_monitor", "舆情监测", "agent", 320, 400, "finance.sentiment_monitor", null));
+        nodes.add(flowNode("tech_breakthrough", "技术突破", "agent", 590, 120, "finance.tech_breakthrough", null));
+        nodes.add(flowNode("industry_news", "行业新闻", "agent", 590, 260, "finance.industry_news", null));
+        nodes.add(flowNode("web_search", "网页搜索", "agent", 590, 400, "general.web_search", null));
+        nodes.add(flowNode("financial_interpretation", "财务解读", "agent", 860, 260, "finance.financial_interpretation", null));
         nodes.add(flowNode("recommendation", "股票推荐聚合", "agent", 1130, 260, "finance.stock_recommendation_aggregate", null));
         nodes.add(flowNode("end", "End", "end", 1400, 260, "workflow.end", null));
         return nodes;
@@ -874,12 +1012,12 @@ public class WorkflowService {
     private List<Map<String, Object>> stockAnalysisNodes() {
         List<Map<String, Object>> nodes = new ArrayList<>();
         nodes.add(flowNode("start", "Start", "start", 80, 340, "scheduler.manual", null));
-        nodes.add(flowNode("fundamental_analysis", "Fundamental Analysis", "logic", 320, 120, "finance.fundamental_analysis", null));
-        nodes.add(flowNode("technical_analysis", "Technical Analysis", "logic", 320, 340, "finance.technical_analysis", null));
-        nodes.add(flowNode("valuation_analysis", "Valuation Analysis", "logic", 320, 560, "finance.valuation_analysis", null));
-        nodes.add(flowNode("money_flow_analysis", "Money Flow Analysis", "logic", 620, 120, "finance.money_flow_analysis", null));
-        nodes.add(flowNode("sentiment_monitor", "Sentiment Monitor", "logic", 620, 340, "finance.sentiment_monitor", null));
-        nodes.add(flowNode("risk_assessment", "Risk Assessment", "logic", 620, 560, "finance.risk_assessment", null));
+        nodes.add(flowNode("fundamental_analysis", "Fundamental Analysis", "agent", 320, 120, "finance.fundamental_analysis", null));
+        nodes.add(flowNode("technical_analysis", "Technical Analysis", "agent", 320, 340, "finance.technical_analysis", null));
+        nodes.add(flowNode("valuation_analysis", "Valuation Analysis", "agent", 320, 560, "finance.valuation_analysis", null));
+        nodes.add(flowNode("money_flow_analysis", "Money Flow Analysis", "agent", 620, 120, "finance.money_flow_analysis", null));
+        nodes.add(flowNode("sentiment_monitor", "Sentiment Monitor", "agent", 620, 340, "finance.sentiment_monitor", null));
+        nodes.add(flowNode("risk_assessment", "Risk Assessment", "agent", 620, 560, "finance.risk_assessment", null));
         nodes.add(flowNode("recommendation", "Aggregate Recommendation", "agent", 920, 340, "finance.stock_recommendation_aggregate", null));
         nodes.add(flowNode("end", "End", "end", 1200, 340, "workflow.end", null));
         return nodes;
@@ -904,10 +1042,10 @@ public class WorkflowService {
     private List<Map<String, Object>> dailyNodes() {
         List<Map<String, Object>> nodes = new ArrayList<>();
         nodes.add(flowNode("start", "Start", "start", 80, 260, "scheduler.manual", null));
-        nodes.add(flowNode("market_overview", "Market Overview", "logic", 320, 120, "finance.market_analysis", null));
-        nodes.add(flowNode("sector_rotation", "Sector Rotation", "logic", 320, 400, "finance.industry_share", null));
-        nodes.add(flowNode("sentiment_pulse", "Sentiment Pulse", "logic", 600, 120, "finance.sentiment_monitor", null));
-        nodes.add(flowNode("key_indicators", "Key Indicators", "logic", 600, 400, "finance.financial_interpretation", null));
+        nodes.add(flowNode("market_overview", "Market Overview", "agent", 320, 120, "finance.market_analysis", null));
+        nodes.add(flowNode("sector_rotation", "Sector Rotation", "agent", 320, 400, "finance.industry_share", null));
+        nodes.add(flowNode("sentiment_pulse", "Sentiment Pulse", "agent", 600, 120, "finance.sentiment_monitor", null));
+        nodes.add(flowNode("key_indicators", "Key Indicators", "agent", 600, 400, "finance.financial_interpretation", null));
         nodes.add(flowNode("daily_summary", "Daily Briefing", "agent", 880, 260, "finance.stock_recommendation_aggregate", null));
         nodes.add(flowNode("end", "End", "end", 1140, 260, "workflow.end", null));
         return nodes;
@@ -928,20 +1066,20 @@ public class WorkflowService {
     private List<Map<String, Object>> deepDiveNodes() {
         List<Map<String, Object>> nodes = new ArrayList<>();
         nodes.add(flowNode("start", "Start", "start", 80, 360, "scheduler.manual", null));
-        nodes.add(flowNode("fundamental", "Fundamental", "logic", 260, 100, "finance.fundamental_analysis", "agent-preset-fundamental"));
-        nodes.add(flowNode("technical", "Technical", "logic", 260, 280, "finance.technical_analysis", "agent-preset-technical"));
-        nodes.add(flowNode("valuation", "Valuation", "logic", 260, 460, "finance.valuation_analysis", "agent-preset-value-investing"));
-        nodes.add(flowNode("money_flow", "Money Flow", "logic", 480, 100, "finance.money_flow_analysis", null));
-        nodes.add(flowNode("industry", "Industry", "logic", 480, 280, "finance.industry_share", null));
-        nodes.add(flowNode("sentiment", "Sentiment", "logic", 480, 460, "finance.sentiment_monitor", null));
-        nodes.add(flowNode("news", "News", "logic", 700, 100, "finance.industry_news", null));
-        nodes.add(flowNode("tech_break", "Tech Breakthrough", "logic", 700, 280, "finance.tech_breakthrough", null));
-        nodes.add(flowNode("risk", "Risk Assessment", "logic", 700, 460, "finance.risk_assessment", "agent-preset-risk-exit"));
-        nodes.add(flowNode("peer_comp", "Peer Comparison", "agent", 920, 100, "general.agent", null));
-        nodes.add(flowNode("catalysts", "Catalyst Analysis", "agent", 920, 280, "general.agent", null));
-        nodes.add(flowNode("thesis", "Thesis Builder", "agent", 920, 460, "general.agent", null));
-        nodes.add(flowNode("risk_reward", "Risk-Reward", "agent", 1140, 180, "general.agent", null));
-        nodes.add(flowNode("entry", "Entry Strategy", "agent", 1140, 380, "general.agent", "agent-preset-price-action"));
+        nodes.add(flowNode("fundamental", "Fundamental", "agent", 260, 100, "finance.fundamental_analysis", "agent-preset-fundamental"));
+        nodes.add(flowNode("technical", "Technical", "agent", 260, 280, "finance.technical_analysis", "agent-preset-technical"));
+        nodes.add(flowNode("valuation", "Valuation", "agent", 260, 460, "finance.valuation_analysis", "agent-preset-value-investing"));
+        nodes.add(flowNode("money_flow", "Money Flow", "agent", 480, 100, "finance.money_flow_analysis", null));
+        nodes.add(flowNode("industry", "Industry", "agent", 480, 280, "finance.industry_share", null));
+        nodes.add(flowNode("sentiment", "Sentiment", "agent", 480, 460, "finance.sentiment_monitor", null));
+        nodes.add(flowNode("news", "News", "agent", 700, 100, "finance.industry_news", null));
+        nodes.add(flowNode("tech_break", "Tech Breakthrough", "agent", 700, 280, "finance.tech_breakthrough", null));
+        nodes.add(flowNode("risk", "Risk Assessment", "agent", 700, 460, "finance.risk_assessment", "agent-preset-risk-exit"));
+        nodes.add(flowNode("peer_comp", "Peer Comparison", "agent", 920, 100, "finance.peer_comparison", null));
+        nodes.add(flowNode("catalysts", "Catalyst Analysis", "agent", 920, 280, "finance.catalyst_analysis", null));
+        nodes.add(flowNode("thesis", "Thesis Builder", "agent", 920, 460, "finance.thesis_builder", null));
+        nodes.add(flowNode("risk_reward", "Risk-Reward", "agent", 1140, 180, "finance.risk_reward_analysis", null));
+        nodes.add(flowNode("entry", "Entry Strategy", "agent", 1140, 380, "finance.entry_strategy", "agent-preset-price-action"));
         nodes.add(flowNode("recommendation", "Recommendation", "agent", 1360, 280, "finance.stock_recommendation_aggregate", null));
         nodes.add(flowNode("end", "End", "end", 1580, 280, "workflow.end", null));
         return nodes;
@@ -974,11 +1112,11 @@ public class WorkflowService {
         List<Map<String, Object>> nodes = new ArrayList<>();
         nodes.add(flowNode("start", "Start", "start", 80, 260, "scheduler.manual", null));
         nodes.add(flowNode("position_check", "Position Check", "logic", 300, 140, "portfolio.get_positions", null));
-        nodes.add(flowNode("pnl_analysis", "P&L Analysis", "logic", 300, 380, "finance.market_analysis", null));
+        nodes.add(flowNode("pnl_analysis", "P&L Analysis", "agent", 300, 380, "finance.market_analysis", null));
         nodes.add(flowNode("stop_loss", "Stop Loss Review", "agent", 540, 140, "general.agent", null));
         nodes.add(flowNode("take_profit", "Take Profit Review", "agent", 540, 380, "general.agent", null));
-        nodes.add(flowNode("signal_decay", "Signal Decay", "logic", 780, 140, "finance.risk_assessment", null));
-        nodes.add(flowNode("news_risk", "News Risk Scan", "logic", 780, 380, "finance.industry_news", null));
+        nodes.add(flowNode("signal_decay", "Signal Decay", "agent", 780, 140, "finance.risk_assessment", null));
+        nodes.add(flowNode("news_risk", "News Risk Scan", "agent", 780, 380, "finance.industry_news", null));
         nodes.add(flowNode("exit_decision", "Exit Decision", "agent", 1020, 260, "finance.stock_recommendation_aggregate", null));
         nodes.add(flowNode("end", "End", "end", 1260, 260, "workflow.end", null));
         return nodes;
@@ -1002,9 +1140,9 @@ public class WorkflowService {
         List<Map<String, Object>> nodes = new ArrayList<>();
         nodes.add(flowNode("start", "Start", "start", 80, 260, "scheduler.manual", null));
         nodes.add(flowNode("holdings", "Holdings Overview", "logic", 320, 140, "portfolio.get_context", null));
-        nodes.add(flowNode("market_scan", "Market Scan", "logic", 320, 380, "finance.market_analysis", null));
-        nodes.add(flowNode("sector_exposure", "Sector Exposure", "logic", 580, 140, "finance.industry_share", null));
-        nodes.add(flowNode("risk_metrics", "Risk Metrics", "logic", 580, 380, "finance.risk_assessment", null));
+        nodes.add(flowNode("market_scan", "Market Scan", "agent", 320, 380, "finance.market_analysis", null));
+        nodes.add(flowNode("sector_exposure", "Sector Exposure", "agent", 580, 140, "finance.industry_share", null));
+        nodes.add(flowNode("risk_metrics", "Risk Metrics", "agent", 580, 380, "finance.risk_assessment", null));
         nodes.add(flowNode("rebalance", "Rebalancing Plan", "agent", 840, 260, "finance.stock_recommendation_aggregate", null));
         nodes.add(flowNode("end", "End", "end", 1100, 260, "workflow.end", null));
         return nodes;
@@ -1026,14 +1164,14 @@ public class WorkflowService {
         List<Map<String, Object>> nodes = new ArrayList<>();
         nodes.add(flowNode("start", "Start", "start", 80, 340, "scheduler.manual", null));
         nodes.add(flowNode("holdings", "Load Holdings", "logic", 260, 340, "portfolio.get_positions", null));
-        nodes.add(flowNode("pnl", "P&L Analysis", "logic", 440, 140, "finance.market_analysis", null));
-        nodes.add(flowNode("cost_basis", "Cost Basis", "logic", 440, 340, "finance.financial_interpretation", null));
-        nodes.add(flowNode("duration", "Duration Analysis", "logic", 440, 540, "finance.technical_analysis", null));
-        nodes.add(flowNode("correlation", "Correlation", "logic", 640, 140, "finance.valuation_analysis", null));
-        nodes.add(flowNode("concentration", "Concentration Risk", "logic", 640, 340, "finance.risk_assessment", null));
-        nodes.add(flowNode("sector_break", "Sector Breakdown", "logic", 640, 540, "finance.industry_share", null));
-        nodes.add(flowNode("money_flow", "Cash Flow", "logic", 840, 140, "finance.money_flow_analysis", null));
-        nodes.add(flowNode("sentiment", "Position Sentiment", "logic", 840, 340, "finance.sentiment_monitor", null));
+        nodes.add(flowNode("pnl", "P&L Analysis", "agent", 440, 140, "finance.market_analysis", null));
+        nodes.add(flowNode("cost_basis", "Cost Basis", "agent", 440, 340, "finance.financial_interpretation", null));
+        nodes.add(flowNode("duration", "Duration Analysis", "agent", 440, 540, "finance.technical_analysis", null));
+        nodes.add(flowNode("correlation", "Correlation", "agent", 640, 140, "finance.valuation_analysis", null));
+        nodes.add(flowNode("concentration", "Concentration Risk", "agent", 640, 340, "finance.risk_assessment", null));
+        nodes.add(flowNode("sector_break", "Sector Breakdown", "agent", 640, 540, "finance.industry_share", null));
+        nodes.add(flowNode("money_flow", "Cash Flow", "agent", 840, 140, "finance.money_flow_analysis", null));
+        nodes.add(flowNode("sentiment", "Position Sentiment", "agent", 840, 340, "finance.sentiment_monitor", null));
         nodes.add(flowNode("tax_impact", "Tax Impact", "agent", 840, 540, "general.agent", null));
         nodes.add(flowNode("hedge", "Hedge Ideas", "agent", 1040, 140, "general.agent", null));
         nodes.add(flowNode("action_items", "Action Items", "agent", 1040, 440, "general.agent", null));
@@ -1067,15 +1205,15 @@ public class WorkflowService {
         List<Map<String, Object>> nodes = new ArrayList<>();
         nodes.add(flowNode("start", "Start", "start", 80, 340, "scheduler.manual", null));
         nodes.add(flowNode("macro", "Macro Environment", "agent", 280, 100, "general.agent", null));
-        nodes.add(flowNode("industry_chain", "Industry Chain", "logic", 280, 340, "finance.industry_share", null));
+        nodes.add(flowNode("industry_chain", "Industry Chain", "agent", 280, 340, "finance.industry_share", null));
         nodes.add(flowNode("policy", "Policy Impact", "agent", 280, 580, "general.agent", null));
         nodes.add(flowNode("competitive", "Competitive Map", "agent", 520, 100, "finance.industry_news", null));
-        nodes.add(flowNode("top_players", "Top Players", "logic", 520, 340, "finance.fundamental_analysis", null));
-        nodes.add(flowNode("tech_trends", "Tech Trends", "logic", 520, 580, "finance.tech_breakthrough", null));
-        nodes.add(flowNode("valuation_band", "Valuation Band", "logic", 760, 100, "finance.valuation_analysis", null));
-        nodes.add(flowNode("sentiment", "Sector Sentiment", "logic", 760, 340, "finance.sentiment_monitor", null));
-        nodes.add(flowNode("money_flow", "Capital Flow", "logic", 760, 580, "finance.money_flow_analysis", null));
-        nodes.add(flowNode("risk", "Sector Risk", "logic", 1000, 100, "finance.risk_assessment", null));
+        nodes.add(flowNode("top_players", "Top Players", "agent", 520, 340, "finance.fundamental_analysis", null));
+        nodes.add(flowNode("tech_trends", "Tech Trends", "agent", 520, 580, "finance.tech_breakthrough", null));
+        nodes.add(flowNode("valuation_band", "Valuation Band", "agent", 760, 100, "finance.valuation_analysis", null));
+        nodes.add(flowNode("sentiment", "Sector Sentiment", "agent", 760, 340, "finance.sentiment_monitor", null));
+        nodes.add(flowNode("money_flow", "Capital Flow", "agent", 760, 580, "finance.money_flow_analysis", null));
+        nodes.add(flowNode("risk", "Sector Risk", "agent", 1000, 100, "finance.risk_assessment", null));
         nodes.add(flowNode("catalysts", "Catalyst Calendar", "agent", 1000, 340, "general.agent", null));
         nodes.add(flowNode("rotation", "Rotation Signal", "agent", 1000, 580, "finance.market_analysis", null));
         nodes.add(flowNode("recommendation", "Sector Call", "agent", 1240, 340, "finance.stock_recommendation_aggregate", null));
@@ -1107,8 +1245,8 @@ public class WorkflowService {
     private List<Map<String, Object>> telegramDigestNodes() {
         List<Map<String, Object>> nodes = new ArrayList<>();
         nodes.add(flowNode("start", "Start", "start", 80, 200, "scheduler.manual", null));
-        nodes.add(flowNode("news_fetch", "Fetch News", "logic", 320, 200, "general.web_search", null));
-        nodes.add(flowNode("sentiment_filter", "Sentiment Filter", "logic", 560, 200, "finance.sentiment_monitor", null));
+        nodes.add(flowNode("news_fetch", "Fetch News", "agent", 320, 200, "general.web_search", null));
+        nodes.add(flowNode("sentiment_filter", "Sentiment Filter", "agent", 560, 200, "finance.sentiment_monitor", null));
         nodes.add(flowNode("end", "End", "end", 800, 200, "workflow.end", null));
         return nodes;
     }
