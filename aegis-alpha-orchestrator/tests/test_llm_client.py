@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 def test_resolve_model_default():
     from app.config import Settings
     from app.core.llm_client import LLMClient
-    settings = Settings(MARKETMIND_LANGCHAIN_API_KEY="test-key", MARKETMIND_LANGCHAIN_BASE_URL="", MARKETMIND_LANGCHAIN_MODEL="gpt-4o-mini")
+    settings = Settings(AEGIS_ALPHA_LANGCHAIN_API_KEY="test-key", AEGIS_ALPHA_LANGCHAIN_BASE_URL="", AEGIS_ALPHA_LANGCHAIN_MODEL="gpt-4o-mini")
     client = LLMClient(settings)
     assert client._resolve_model() == "gpt-4o-mini"
 
@@ -15,7 +15,7 @@ def test_resolve_model_default():
 def test_resolve_model_explicit():
     from app.config import Settings
     from app.core.llm_client import LLMClient
-    settings = Settings(MARKETMIND_LANGCHAIN_API_KEY="test-key", MARKETMIND_LANGCHAIN_BASE_URL="")
+    settings = Settings(AEGIS_ALPHA_LANGCHAIN_API_KEY="test-key", AEGIS_ALPHA_LANGCHAIN_BASE_URL="")
     client = LLMClient(settings)
     assert client._resolve_model("gpt-4") == "gpt-4"
 
@@ -24,9 +24,9 @@ def test_resolve_model_deepseek():
     from app.config import Settings
     from app.core.llm_client import LLMClient
     settings = Settings(
-        MARKETMIND_LANGCHAIN_API_KEY="test",
-        MARKETMIND_LANGCHAIN_BASE_URL="https://api.deepseek.com/v1",
-        MARKETMIND_LANGCHAIN_MODEL="gpt-4",
+        AEGIS_ALPHA_LANGCHAIN_API_KEY="test",
+        AEGIS_ALPHA_LANGCHAIN_BASE_URL="https://api.deepseek.com/v1",
+        AEGIS_ALPHA_LANGCHAIN_MODEL="gpt-4",
     )
     client = LLMClient(settings)
     assert client._resolve_model() == "deepseek-v4-flash"
@@ -36,9 +36,9 @@ def test_resolve_model_deepseek_supported():
     from app.config import Settings
     from app.core.llm_client import LLMClient
     settings = Settings(
-        MARKETMIND_LANGCHAIN_API_KEY="test",
-        MARKETMIND_LANGCHAIN_BASE_URL="https://api.deepseek.com/v1",
-        MARKETMIND_LANGCHAIN_MODEL="deepseek-v4-pro",
+        AEGIS_ALPHA_LANGCHAIN_API_KEY="test",
+        AEGIS_ALPHA_LANGCHAIN_BASE_URL="https://api.deepseek.com/v1",
+        AEGIS_ALPHA_LANGCHAIN_MODEL="deepseek-v4-pro",
     )
     client = LLMClient(settings)
     assert client._resolve_model() == "deepseek-v4-pro"
@@ -47,7 +47,7 @@ def test_resolve_model_deepseek_supported():
 def test_uses_deepseek_endpoint():
     from app.core.llm_client import LLMClient
     from app.config import Settings
-    settings = Settings(MARKETMIND_LANGCHAIN_API_KEY="test")
+    settings = Settings(AEGIS_ALPHA_LANGCHAIN_API_KEY="test")
     client = LLMClient(settings)
     assert client._uses_deepseek_endpoint("https://api.deepseek.com/v1") is True
     assert client._uses_deepseek_endpoint("https://api.openai.com/v1") is False

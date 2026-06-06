@@ -9,8 +9,8 @@
 - memory_store.py 提供跨线程记忆（PersistentStore + SQLite + TTL）
 - persistent_store.py 是 SQLite 持久化存储的底层实现
 - 支持 OpenAI 和 DeepSeek 两个 provider（通过 OpenAI-compatible API）
-- Mock 模式 (`MARKETMIND_LANGCHAIN_MOCK=true`) 用于离线测试
-- 环境变量使用 MARKETMIND_* 前缀（历史原因）
+- Mock 模式 (`AEGIS_ALPHA_LANGCHAIN_MOCK=true`) 用于离线测试
+- 环境变量使用 AEGIS_ALPHA_* 前缀
 
 ## Architecture
 
@@ -47,5 +47,5 @@ app/
 
 - Graph 编译结果会缓存（LRU 100），相同拓扑不会重复编译
 - LLM client 实例会复用（缓存 10 个）
-- `MARKETMIND_DATA_DIR` 控制 SQLite 存储目录，默认 `data/`
+- `AEGIS_ALPHA_DATA_DIR` 控制 SQLite 存储目录，默认 `data/`
 - 前端通过 `/_backend/*` 代理到此服务（Next.js rewrite），端口 8787

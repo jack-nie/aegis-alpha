@@ -5,7 +5,7 @@ Claude 每次新任务开始前应读取此文件。
 
 ## Architecture Decisions
 
-- 项目从 MarketMind 重命名为 Aegis Alpha，但代码中包名/变量名/CI 配置仍是旧名
+- 项目已从 MarketMind 完成重命名为 Aegis Alpha（包名、变量名、CI 配置均已更新）
 - 自定义 Token 认证（HmacSHA256），不是标准 JWT — TokenService 是核心不可轻改
 - 前端是 catch-all routing，所有页面逻辑集中在 App.jsx
 - orchestrator 已从 Node.js 重写为 Python FastAPI + LangGraph，分层架构
@@ -22,7 +22,7 @@ Claude 每次新任务开始前应读取此文件。
 - 修改 auth 模块前必须先理解 TokenService 的 Base64+HMAC 签名机制
 - orchestrator 的 mock 模式是重要的离线测试手段，新功能必须兼容
 - MyBatis mapper XML 和接口必须同步修改
-- 环境变量使用 MARKETMIND\_\* 前缀（历史原因）
+- 环境变量使用 AEGIS_ALPHA\_\* 前缀
 - PersistentStore 的 TTL 是通过 _expires_at 字段实现的，读取时自动过期检查
 - SqliteSaver 和 InMemoryStore 需要在 dependencies.py 中初始化，main.py 的 lifespan 中 close
 - ticker insights TTL 30 分钟，用户偏好和 workflow pattern 永不过期（TTL=0）
@@ -36,5 +36,5 @@ Claude 每次新任务开始前应读取此文件。
 
 ## Active Issues
 
-- CI workflow 引用旧目录名，可能需要更新
+- CI workflow 已重命名为 aegis-ci.yml
 - 根目录存在多个临时 fix\_\*.py 脚本，应定期清理

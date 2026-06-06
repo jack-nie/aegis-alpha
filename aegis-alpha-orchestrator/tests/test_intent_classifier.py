@@ -8,7 +8,7 @@ def test_build_tools():
     from app.config import Settings
     from app.core.intent_classifier import IntentClassifier
     from app.core.llm_client import LLMClient
-    settings = Settings(MARKETMIND_LANGCHAIN_API_KEY="test")
+    settings = Settings(AEGIS_ALPHA_LANGCHAIN_API_KEY="test")
     client = LLMClient(settings)
     classifier = IntentClassifier(client)
     workflows = [
@@ -26,7 +26,7 @@ def test_build_tools_multiple():
     from app.config import Settings
     from app.core.intent_classifier import IntentClassifier
     from app.core.llm_client import LLMClient
-    settings = Settings(MARKETMIND_LANGCHAIN_API_KEY="test")
+    settings = Settings(AEGIS_ALPHA_LANGCHAIN_API_KEY="test")
     client = LLMClient(settings)
     classifier = IntentClassifier(client)
     workflows = [
@@ -41,7 +41,7 @@ def test_keyword_fallback_match():
     from app.config import Settings
     from app.core.intent_classifier import IntentClassifier
     from app.core.llm_client import LLMClient
-    settings = Settings(MARKETMIND_LANGCHAIN_API_KEY="test")
+    settings = Settings(AEGIS_ALPHA_LANGCHAIN_API_KEY="test")
     client = LLMClient(settings)
     classifier = IntentClassifier(client)
     workflows = [
@@ -56,7 +56,7 @@ def test_keyword_fallback_no_match():
     from app.config import Settings
     from app.core.intent_classifier import IntentClassifier
     from app.core.llm_client import LLMClient
-    settings = Settings(MARKETMIND_LANGCHAIN_API_KEY="test")
+    settings = Settings(AEGIS_ALPHA_LANGCHAIN_API_KEY="test")
     client = LLMClient(settings)
     classifier = IntentClassifier(client)
     workflows = [
@@ -71,7 +71,7 @@ def test_keyword_fallback_ticker_extraction():
     from app.config import Settings
     from app.core.intent_classifier import IntentClassifier
     from app.core.llm_client import LLMClient
-    settings = Settings(MARKETMIND_LANGCHAIN_API_KEY="test")
+    settings = Settings(AEGIS_ALPHA_LANGCHAIN_API_KEY="test")
     client = LLMClient(settings)
     classifier = IntentClassifier(client)
     workflows = [
@@ -86,7 +86,7 @@ async def test_classify_empty_message():
     from app.config import Settings
     from app.core.intent_classifier import IntentClassifier
     from app.core.llm_client import LLMClient
-    settings = Settings(MARKETMIND_LANGCHAIN_API_KEY="test")
+    settings = Settings(AEGIS_ALPHA_LANGCHAIN_API_KEY="test")
     client = LLMClient(settings)
     classifier = IntentClassifier(client)
     result = await classifier.classify("", [{"workflowKey": "test"}])

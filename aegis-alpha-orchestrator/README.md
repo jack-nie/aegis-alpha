@@ -94,11 +94,11 @@ Manages 18 financial analysis prompt templates.
 
 See `.env` in project root. Key variables:
 
-- `MARKETMIND_LANGGRAPH_PORT` - Server port (default: 8787)
-- `MARKETMIND_LANGCHAIN_PROVIDER` - LLM provider (default: openai)
-- `MARKETMIND_LANGCHAIN_MODEL` - LLM model (default: deepseek-v4-flash)
-- `MARKETMIND_LANGCHAIN_API_KEY` - API key
-- `MARKETMIND_LANGCHAIN_MOCK` - Enable mock mode
+- `AEGIS_ALPHA_LANGGRAPH_PORT` - Server port (default: 8787)
+- `AEGIS_ALPHA_LANGCHAIN_PROVIDER` - LLM provider (default: openai)
+- `AEGIS_ALPHA_LANGCHAIN_MODEL` - LLM model (default: deepseek-v4-flash)
+- `AEGIS_ALPHA_LANGCHAIN_API_KEY` - API key
+- `AEGIS_ALPHA_LANGCHAIN_MOCK` - Enable mock mode
 
 ## Migration from Node.js
 

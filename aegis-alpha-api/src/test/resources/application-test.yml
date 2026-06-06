@@ -1,6 +1,6 @@
 spring:
   datasource:
-    url: jdbc:h2:mem:marketmind_alpha;MODE=MySQL;DATABASE_TO_UPPER=false;DB_CLOSE_DELAY=-1;NON_KEYWORDS=VALUE
+    url: jdbc:h2:mem:aegis_alpha;MODE=MySQL;DATABASE_TO_UPPER=false;DB_CLOSE_DELAY=-1;NON_KEYWORDS=VALUE
     driver-class-name: org.h2.Driver
     username: sa
     password:
@@ -12,6 +12,6 @@ spring:
     host: 127.0.0.1
     port: 0
 
-marketmind:
+aegis:
   seed-enabled: false
   token-secret: test-secret

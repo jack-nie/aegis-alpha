@@ -934,6 +934,72 @@ function Header({ path, copilotOpen, setCopilotOpen, me, onLogout, onMenuOpen })
   );
 }
 
+const NODE_LABELS = {
+  start: "开始",
+  end: "结束",
+  fundamental_analysis: "基本面分析",
+  technical_analysis: "技术面分析",
+  valuation_analysis: "估值分析",
+  money_flow_analysis: "资金面分析",
+  sentiment_monitor: "市场情绪",
+  risk_assessment: "风险评估",
+  recommendation: "综合推荐",
+  industry_analysis: "行业分析",
+  news_analysis: "新闻分析",
+  peer_comparison: "同行比较",
+  catalyst_analysis: "催化剂分析",
+  thesis_builder: "投资论点",
+  risk_reward_analysis: "风险收益分析",
+  entry_strategy: "入场策略",
+};
+
+const NODE_ICONS = {
+  NODE_STARTED: "⏳",
+  NODE_COMPLETED: "✅",
+  NODE_FAILED: "❌",
+  NODE_RETRYING: "🔄",
+  RUN_COMPLETED: "🏁",
+};
+
+function ThinkingProcess({ events }) {
+  if (!events || events.length === 0) return null;
+  const nodeEvents = events.filter((e) => e.eventType !== "RUN_COMPLETED");
+  const hasCompleted = events.some((e) => e.eventType === "RUN_COMPLETED");
+  if (nodeEvents.length === 0 && !hasCompleted) return null;
+
+  return (
+    <div className="my-2 rounded-md border border-gray-100 bg-gray-50/50 px-3 py-2.5">
+      <div className="mb-1.5 flex items-center gap-1.5 text-[11px] font-medium text-gray-400">
+        <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-blue-400" />
+        分析过程
+      </div>
+      <div className="space-y-1">
+        {nodeEvents.map((evt, idx) => {
+          const label = NODE_LABELS[evt.nodeId] || evt.nodeName || evt.nodeId;
+          const icon = NODE_ICONS[evt.eventType] || "·";
+          const isRunning = evt.eventType === "NODE_STARTED";
+          const isFailed = evt.eventType === "NODE_FAILED";
+          return (
+            <div key={evt.eventId || idx} className="flex items-center gap-2 text-xs">
+              <span className="flex-shrink-0">{icon}</span>
+              <span className={`${isRunning ? "text-blue-600 font-medium" : isFailed ? "text-red-500" : "text-gray-600"}`}>
+                {label}
+                {isRunning && <span className="ml-1 inline-block h-1 w-1 animate-pulse rounded-full bg-blue-400" />}
+              </span>
+            </div>
+          );
+        })}
+        {hasCompleted && (
+          <div className="flex items-center gap-2 text-xs">
+            <span className="flex-shrink-0">🏁</span>
+            <span className="font-medium text-green-600">分析完成</span>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function AICopilot({ setCopilotOpen, api, promptRequest, onPromptHandled }) {
   const initialMessages = [
     {
@@ -945,9 +1011,10 @@ function AICopilot({ setCopilotOpen, api, promptRequest, onPromptHandled }) {
   const [messages, setMessages] = useState(initialMessages);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
+  const [thinkingEvents, setThinkingEvents] = useState([]);
   const messagesEndRef = useRef(null);
   const handledPromptIdRef = useRef(null);
-  useEffect(() => messagesEndRef.current?.scrollIntoView({ behavior: "smooth" }), [messages]);
+  useEffect(() => messagesEndRef.current?.scrollIntoView({ behavior: "smooth" }), [messages, thinkingEvents]);
 
   const sendMessage = useCallback(
     async (rawText) => {
@@ -960,13 +1027,33 @@ function AICopilot({ setCopilotOpen, api, promptRequest, onPromptHandled }) {
         let content = result?.content || result?.message || "后端没有返回内容。";
         if (result?.routedToWorkflow && result?.runId) {
           try {
-            // Poll until workflow completes (async dispatch may still be RUNNING)
+            // Poll until workflow completes, fetching events for thinking process display
             let run = await api(`/workflow/runs/${result.runId}`);
             const pollStart = Date.now();
+            setThinkingEvents([]);
             while (run?.status === "RUNNING" || run?.status === "QUEUED") {
               if (Date.now() - pollStart > 90000) break;
+              try {
+                const events = await api(`/workflow/runs/${result.runId}/events`);
+                const nodeEvents = (Array.isArray(events) ? events : []).filter(
+                  (e) => e.eventType && (e.eventType.startsWith("NODE_") || e.eventType === "RUN_COMPLETED"),
+                );
+                setThinkingEvents(nodeEvents);
+              } catch (_) {
+                /* ignore events fetch errors during polling */
+              }
               await new Promise((r) => setTimeout(r, 2000));
               run = await api(`/workflow/runs/${result.runId}`);
+            }
+            // Final events fetch
+            try {
+              const finalEvents = await api(`/workflow/runs/${result.runId}/events`);
+              const finalNodeEvents = (Array.isArray(finalEvents) ? finalEvents : []).filter(
+                (e) => e.eventType && (e.eventType.startsWith("NODE_") || e.eventType === "RUN_COMPLETED"),
+              );
+              setThinkingEvents(finalNodeEvents);
+            } catch (_) {
+              /* ignore */
             }
             const runResult = run?.resultJson ? JSON.parse(run.resultJson) : null;
             if (runResult) {
@@ -1025,11 +1112,13 @@ function AICopilot({ setCopilotOpen, api, promptRequest, onPromptHandled }) {
             console.warn("Failed to fetch workflow run result:", fetchErr);
           }
         }
+        setThinkingEvents([]);
         setMessages((prev) => [
           ...prev,
           { role: "assistant", content, ok: result?.ok, provider: result?.provider, reason: result?.reason },
         ]);
       } catch (error) {
+        setThinkingEvents([]);
         setMessages((prev) => [
           ...prev,
           {
@@ -1196,7 +1285,14 @@ function AICopilot({ setCopilotOpen, api, promptRequest, onPromptHandled }) {
             </div>
           </div>
         ))}
-        {loading && (
+        {loading && thinkingEvents.length > 0 && (
+          <div className="flex justify-start">
+            <div className="max-w-[88%]">
+              <ThinkingProcess events={thinkingEvents} />
+            </div>
+          </div>
+        )}
+        {loading && thinkingEvents.length === 0 && (
           <div className="flex justify-start">
             <div className="rounded-md bg-gray-50 px-3 py-2">
               <div className="flex items-center gap-2">
@@ -5977,7 +6073,7 @@ export default function App() {
   const mobileMenuRef = useFocusTrap(mobileMenuOpen, () => setMobileMenuOpen(false));
 
   useEffect(() => {
-    const saved = window.localStorage.getItem("marketmind_access_token");
+    const saved = window.localStorage.getItem("aegis_access_token");
     if (!saved) {
       setBooting(false);
       return;
@@ -5986,7 +6082,7 @@ export default function App() {
     request("/auth/me", {}, saved)
       .then(setMe)
       .catch(() => {
-        window.localStorage.removeItem("marketmind_access_token");
+        window.localStorage.removeItem("aegis_access_token");
         setToken("");
       })
       .finally(() => setBooting(false));
@@ -6013,12 +6109,12 @@ export default function App() {
   }, []);
   const clearCopilotPrompt = useCallback(() => setCopilotPrompt(null), []);
   const logout = () => {
-    window.localStorage.removeItem("marketmind_access_token");
+    window.localStorage.removeItem("aegis_access_token");
     setToken("");
     setMe(null);
   };
   const login = (accessToken, user) => {
-    window.localStorage.setItem("marketmind_access_token", accessToken);
+    window.localStorage.setItem("aegis_access_token", accessToken);
     setToken(accessToken);
     setMe(user);
   };
