@@ -4,15 +4,19 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 
-def test_resolve_model_default(mock_settings):
+def test_resolve_model_default():
+    from app.config import Settings
     from app.core.llm_client import LLMClient
-    client = LLMClient(mock_settings)
+    settings = Settings(MARKETMIND_LANGCHAIN_API_KEY="test-key", MARKETMIND_LANGCHAIN_BASE_URL="", MARKETMIND_LANGCHAIN_MODEL="gpt-4o-mini")
+    client = LLMClient(settings)
     assert client._resolve_model() == "gpt-4o-mini"
 
 
-def test_resolve_model_explicit(mock_settings):
+def test_resolve_model_explicit():
+    from app.config import Settings
     from app.core.llm_client import LLMClient
-    client = LLMClient(mock_settings)
+    settings = Settings(MARKETMIND_LANGCHAIN_API_KEY="test-key", MARKETMIND_LANGCHAIN_BASE_URL="")
+    client = LLMClient(settings)
     assert client._resolve_model("gpt-4") == "gpt-4"
 
 
@@ -62,7 +66,7 @@ def test_normalize_content_json(mock_settings):
 def test_normalize_content_markdown(mock_settings):
     from app.core.llm_client import LLMClient
     client = LLMClient(mock_settings)
-    md = "# Analysis Report\n\n## Section 1\n\nThis is a detailed analysis with **bold** text and a table:\n\n| Metric | Value |\n|---|---|\n| P/E | 15 |\n\nThe analysis continues here."
+    md = "# Analysis Report\n\n## Section 1\n\nThis is a detailed analysis with **bold** text and a table:\n\n| Metric | Value |\n|---|---|\n| P/E | 15 |\n\n" + "The analysis continues here with more details about the company performance. " * 20
     result = client._normalize_content(md)
     assert result.confidence == 0.75
     assert "Analysis Report" in result.content

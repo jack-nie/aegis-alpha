@@ -110,7 +110,7 @@ def test_fallback_result_aggregate(mock_node_executor):
     node = Node(id="agg", data=NodeData(handler="finance.stock_recommendation_aggregate", label="Aggregate"))
     result = mock_node_executor._fallback_result(
         node=node, handler="finance.stock_recommendation_aggregate",
-        subject="AAPL", state={}, started_at="2025-01-01T00:00:00Z", error="test error"
+        subject="AAPL", state={}, started_at="2025-01-01T00:00:00+00:00", error="test error"
     )
     assert result.ok is False
     assert result.status == "model_failed"
@@ -121,7 +121,7 @@ def test_fallback_result_regular(mock_node_executor):
     node = Node(id="test", data=NodeData(handler="finance.market_analysis", label="Test"))
     result = mock_node_executor._fallback_result(
         node=node, handler="finance.market_analysis",
-        subject="AAPL", state={}, started_at="2025-01-01T00:00:00Z", error="test error"
+        subject="AAPL", state={}, started_at="2025-01-01T00:00:00+00:00", error="test error"
     )
     assert result.ok is True
     assert result.status == "degraded"

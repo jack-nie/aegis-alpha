@@ -8,7 +8,7 @@ from typing import Any
 import httpx
 from langchain_core.tools import tool
 
-from .config import Settings
+from ..config import Settings
 
 logger = logging.getLogger(__name__)
 
