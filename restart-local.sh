@@ -23,9 +23,11 @@ for pidfile in /tmp/aegis-orchestrator.pid /tmp/aegis-backend.pid /tmp/aegis-fro
   fi
 done
 for port in 8787 5178 5174; do
-  pid=$(lsof -ti :$port 2>/dev/null || true)
-  if [ -n "$pid" ]; then
-    kill $pid 2>/dev/null && echo "  Killed process on port $port" || true
+  # Cross-platform: try lsof first (macOS/Linux), fall back to netstat (Windows/Git Bash)
+  pid=$(lsof -ti :$port 2>/dev/null || netstat -ano 2>/dev/null | grep ":$port " | grep LISTENING | awk '{print $5}' | head -1 || true)
+  if [ -n "$pid" ] && [ "$pid" != "0" ]; then
+    kill $pid 2>/dev/null || taskkill //PID $pid //F 2>/dev/null || true
+    echo "  Killed process on port $port (PID $pid)"
   fi
 done
 sleep 1
@@ -33,7 +35,7 @@ sleep 1
 # ── 2. Start orchestrator ──
 echo "[2/3] Starting orchestrator on port 8787..."
 cd "$ROOT/aegis-alpha-orchestrator"
-nohup node server.mjs > /tmp/aegis-orchestrator.log 2>&1 &
+nohup python -m uvicorn app.main:app --host 0.0.0.0 --port 8787 > /tmp/aegis-orchestrator.log 2>&1 &
 echo $! > /tmp/aegis-orchestrator.pid
 echo "  PID: $(cat /tmp/aegis-orchestrator.pid)"
 
