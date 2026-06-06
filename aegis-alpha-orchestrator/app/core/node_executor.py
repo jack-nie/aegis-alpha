@@ -113,6 +113,15 @@ class NodeExecutor:
         logger.error(f"Node {node.id} execution failed after {max_retries + 1} attempts: {last_error}")
         return self._fallback_result(node, handler, subject, state, started_at, str(last_error))
 
+    @staticmethod
+    def _normalize_signal(s) -> dict:
+        """Normalize signal to dict with 'name' field."""
+        if isinstance(s, dict):
+            if "name" not in s and "type" in s:
+                return {**s, "name": s["type"]}
+            return s
+        return {"name": str(s), "value": s, "weight": 0.5}
+
     def _resolve_handler(self, node: Node) -> str:
         """Resolve handler name from node data."""
         data = node.data
@@ -220,7 +229,7 @@ class NodeExecutor:
             node_name=data.label or data.title or node.id,
             subject=subject,
             summary=response.summary,
-            signals=[s if isinstance(s, dict) else {"name": str(s), "value": s, "weight": 0.5} for s in response.signals],
+            signals=[self._normalize_signal(s) for s in response.signals],
             sources=[s if isinstance(s, dict) else {"title": str(s), "url": "", "type": "llm"} for s in response.sources],
             confidence=response.confidence,
             data=response.data,

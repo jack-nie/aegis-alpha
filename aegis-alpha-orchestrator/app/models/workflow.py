@@ -39,6 +39,7 @@ class Edge(BaseModel):
 
     source: str
     target: str
+    condition: dict[str, Any] | None = None
 
     class Config:
         extra = "allow"
@@ -60,9 +61,18 @@ class AgentTemplate(BaseModel):
 class Signal(BaseModel):
     """Analysis signal."""
 
-    name: str
+    name: str = ""
     value: Any = None
     weight: float = 0.5
+
+    class Config:
+        extra = "allow"
+
+    def __init__(self, **data):
+        # Normalize: use 'type' as 'name' if 'name' missing
+        if not data.get("name") and data.get("type"):
+            data["name"] = data["type"]
+        super().__init__(**data)
 
 
 class Source(BaseModel):
