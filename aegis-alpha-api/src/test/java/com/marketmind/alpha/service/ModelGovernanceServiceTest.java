@@ -137,7 +137,7 @@ class ModelGovernanceServiceTest {
     }
 
     @Test
-    void materializeCallsNormalizesLangchainProvider() throws Exception {
+    void materializeCallsStoresRawProviderFromOutput() throws Exception {
         when(governanceMapper.countLlmCalls("run-1")).thenReturn(0);
         when(governanceMapper.countModelConfigs()).thenReturn(1);
 
@@ -159,10 +159,10 @@ class ModelGovernanceServiceTest {
 
         service.materializeCalls(run);
 
-        verify(governanceMapper).insertLlmCall(any(LlmCall.class));
-        java.util.List<LlmCall> captured = org.mockito.ArgumentCaptor.forClass(LlmCall.class).getAllValues();
-        LlmCall inserted = captured.get(0);
-        assertThat(inserted.getProvider()).isEqualTo("openai");
+        org.mockito.ArgumentCaptor<LlmCall> captor = org.mockito.ArgumentCaptor.forClass(LlmCall.class);
+        verify(governanceMapper).insertLlmCall(captor.capture());
+        LlmCall inserted = captor.getValue();
+        assertThat(inserted.getProvider()).isEqualTo("langchain-openai");
         assertThat(inserted.getModelName()).isEqualTo("gpt-4");
     }
 }
