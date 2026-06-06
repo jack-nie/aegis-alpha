@@ -191,6 +191,8 @@ class WorkflowEngine:
         async def node_fn(state: WorkflowState) -> dict:
             started_at = datetime.now(timezone.utc).isoformat()
             subject = state.get("subject", "Aegis Alpha workflow")
+            node_label = node.data.label or node.data.title or node.id
+            logger.info(f"[THINKING] Workflow node starting: id={node.id} handler={node.data.handler} label={node_label} subject={subject}")
 
             try:
                 result = await self._node_executor.execute(
@@ -199,7 +201,7 @@ class WorkflowEngine:
                     subject=subject,
                 )
             except Exception as e:
-                logger.error(f"Node {node.id} failed: {e}")
+                logger.error(f"[THINKING] Workflow node exception: id={node.id} handler={node.data.handler} label={node_label} error={e}")
                 result = NodeResult(
                     ok=False,
                     status="error",
@@ -222,6 +224,7 @@ class WorkflowEngine:
                 "completedAt": datetime.now(timezone.utc).isoformat(),
                 "durationMs": result.duration_ms,
             }
+            logger.info(f"[THINKING] Workflow node completed: id={node.id} handler={result.handler} label={node_label} status={result.status} ok={result.ok} duration={result.duration_ms}ms")
 
             state_update = {node.id: result.model_dump()}
             if result.handler:
@@ -245,6 +248,7 @@ class WorkflowEngine:
         thread_id: str | None = None,
     ) -> WorkflowResult:
         """Execute workflow non-streaming."""
+        logger.info(f"[THINKING] Workflow execution starting: subject={subject} nodes={[n.id for n in nodes]} require_approval={require_approval}")
         graph = self.build_graph(nodes, edges, require_approval=require_approval)
         tid = thread_id or str(uuid.uuid4())
         config = {"configurable": {"thread_id": tid}}
@@ -259,6 +263,8 @@ class WorkflowEngine:
 
         try:
             final_state = await graph.ainvoke(initial_state, config=config)
+            node_ids = [n.id for n in nodes]
+            logger.info(f"[THINKING] Workflow execution completed: subject={subject} nodes={node_ids} ok=True")
             return WorkflowResult(
                 ok=True,
                 final_state=final_state.get("final_state", {}),
@@ -267,7 +273,7 @@ class WorkflowEngine:
                 state=final_state.get("final_state", {}),
             )
         except Exception as e:
-            logger.error(f"Workflow execution failed: {e}")
+            logger.error(f"[THINKING] Workflow execution failed: subject={subject} error={e}")
             return WorkflowResult(ok=False, error=str(e), final_state=state)
 
     async def stream_workflow(
@@ -280,6 +286,7 @@ class WorkflowEngine:
         thread_id: str | None = None,
     ) -> AsyncIterator[SSEEvent]:
         """Execute workflow with SSE streaming."""
+        logger.info(f"[THINKING] Workflow streaming starting: subject={subject} nodes={[n.id for n in nodes]} require_approval={require_approval}")
         graph = self.build_graph(nodes, edges, require_approval=require_approval)
         tid = thread_id or str(uuid.uuid4())
         config = {"configurable": {"thread_id": tid}}
@@ -309,24 +316,29 @@ class WorkflowEngine:
                             },
                         )
                     else:
+                        node_id = trace_entry.get("nodeId", node_name)
+                        node_status = trace_entry.get("status", "")
+                        node_ok = trace_entry.get("ok", False)
+                        node_duration = trace_entry.get("durationMs", 0)
+                        logger.info(f"[THINKING] SSE node_update: id={node_id} status={node_status} ok={node_ok} duration={node_duration}ms")
                         yield SSEEvent(
                             event="node_update",
                             data={
-                                "nodeId": trace_entry.get("nodeId", node_name),
+                                "nodeId": node_id,
                                 "nodeName": trace_entry.get("nodeName", node_name),
                                 "handler": trace_entry.get("handler", ""),
-                                "status": trace_entry.get("status", ""),
-                                "ok": trace_entry.get("ok", False),
+                                "status": node_status,
+                                "ok": node_ok,
                                 "degraded": trace_entry.get("degraded", False),
                                 "startedAt": trace_entry.get("startedAt", ""),
                                 "completedAt": trace_entry.get("completedAt", ""),
-                                "durationMs": trace_entry.get("durationMs", 0),
+                                "durationMs": node_duration,
                             },
                         )
 
             yield SSEEvent(event="workflow_complete", data={"ok": True})
         except Exception as e:
-            logger.error(f"Workflow streaming failed: {e}")
+            logger.error(f"[THINKING] Workflow streaming failed: subject={subject} error={e}")
             yield SSEEvent(event="error", data={"ok": False, "error": str(e)})
 
     async def stream_workflow_tokens(
@@ -388,24 +400,29 @@ class WorkflowEngine:
                             },
                         )
                     else:
+                        node_id = trace_entry.get("nodeId", node_name)
+                        node_status = trace_entry.get("status", "")
+                        node_ok = trace_entry.get("ok", False)
+                        node_duration = trace_entry.get("durationMs", 0)
+                        logger.info(f"[THINKING] SSE token-stream node_update: id={node_id} status={node_status} ok={node_ok} duration={node_duration}ms")
                         yield SSEEvent(
                             event="node_update",
                             data={
-                                "nodeId": trace_entry.get("nodeId", node_name),
+                                "nodeId": node_id,
                                 "nodeName": trace_entry.get("nodeName", node_name),
                                 "handler": trace_entry.get("handler", ""),
-                                "status": trace_entry.get("status", ""),
-                                "ok": trace_entry.get("ok", False),
+                                "status": node_status,
+                                "ok": node_ok,
                                 "degraded": trace_entry.get("degraded", False),
                                 "startedAt": trace_entry.get("startedAt", ""),
                                 "completedAt": trace_entry.get("completedAt", ""),
-                                "durationMs": trace_entry.get("durationMs", 0),
+                                "durationMs": node_duration,
                             },
                         )
 
             yield SSEEvent(event="workflow_complete", data={"ok": True})
         except Exception as e:
-            logger.error(f"Workflow token streaming failed: {e}")
+            logger.error(f"[THINKING] Workflow token streaming failed: subject={subject} error={e}")
             yield SSEEvent(event="error", data={"ok": False, "error": str(e)})
 
     @staticmethod
