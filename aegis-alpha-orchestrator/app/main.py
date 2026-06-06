@@ -10,6 +10,8 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 from .config import settings
+from .dependencies import market_data, memory_store_manager
+from .core.tools import get_backend_client
 from .routers import health, workflow, intent
 
 # Configure logging
@@ -26,7 +28,13 @@ async def lifespan(app: FastAPI):
     logger.info(f"Starting Aegis Alpha Orchestrator on port {settings.port}")
     logger.info(f"Provider: {settings.provider}, Model: {settings.model}")
     logger.info(f"Mock mode: {settings.is_mock_mode}")
+    await market_data.start()
+    await memory_store_manager.initialize()
     yield
+    await market_data.close()
+    await get_backend_client(settings).close()
+    await memory_store_manager.cleanup()
+    await memory_store_manager.close()
     logger.info("Shutting down Aegis Alpha Orchestrator")
 
 

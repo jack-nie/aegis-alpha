@@ -6,7 +6,7 @@ Core: portfolio management, market data (Yahoo/Stooq/SEC/GDELT), LangGraph agent
 ## Tech Stack
 
 - **Backend**: Spring Boot 2.7.18 / Java 8 / MyBatis / MySQL 8.0 / Redis 7
-- **Orchestrator**: Node.js / Express 4.19 / @langchain/langgraph 0.4.x / @langchain/openai 0.6.x
+- **Orchestrator**: Python 3.11 / FastAPI / LangGraph 0.2.x / langchain-openai 0.2.x
 - **Frontend**: Next.js 15 App Router / React 19 / Tailwind CSS / @xyflow/react / JSX (not TypeScript)
 - **Infra**: Docker Compose / GitHub Actions CI
 
@@ -24,7 +24,7 @@ Do NOT introduce unless explicitly requested:
 
 ```
 aegis-alpha-api/          → Spring Boot 后端 (com.marketmind.alpha)
-aegis-alpha-orchestrator/ → LangGraph 执行引擎 (server.mjs 单文件)
+aegis-alpha-orchestrator/ → LangGraph 执行引擎 (Python FastAPI)
 aegis-alpha-web/          → Next.js 前端 (app/ 目录)
 docs/                     → 架构文档和实施计划
 scripts/                  → 冒烟测试脚本
@@ -85,7 +85,7 @@ Tier 2（按需加载）：
 ## Known Pitfalls
 
 - 项目从 MarketMind 重命名为 Aegis Alpha，但 Java 包名仍是 `com.marketmind.alpha`，环境变量仍是 `MARKETMIND_*`
-- orchestrator/server.mjs 是单文件 ~35K 行，修改前先定位到正确的 section
+- orchestrator 是 Python FastAPI 应用，核心逻辑在 app/core/ 目录
 - 前端是 catch-all routing (`[...path]/page.jsx`)，所有页面在 App.jsx 内切换
 - CI workflow 文件名仍是 `marketmind-ci.yml`，目录引用也是旧名
 - 自定义 Token 认证（HmacSHA256），不是标准 JWT — 修改 auth 前必须理解 TokenService

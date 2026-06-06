@@ -37,6 +37,10 @@ class Settings(BaseSettings):
     # Market Data
     market_data_timeout_ms: int = Field(default=8000, alias="MARKETMIND_MARKET_DATA_TIMEOUT_MS")
 
+    # Store / Memory
+    data_dir: str = Field(default="data", alias="MARKETMIND_DATA_DIR")
+    store_default_ttl_seconds: int = Field(default=3600, alias="MARKETMIND_STORE_TTL_SECONDS")
+
     # OpenAI fallback
     openai_api_key: str = Field(default="", alias="OPENAI_API_KEY")
     openai_base_url: str = Field(default="", alias="OPENAI_BASE_URL")
