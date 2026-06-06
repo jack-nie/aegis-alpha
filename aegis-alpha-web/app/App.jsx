@@ -961,41 +961,137 @@ const NODE_ICONS = {
   RUN_COMPLETED: "🏁",
 };
 
+const NODE_DETAIL_LABELS = {
+  fundamental_analysis: "分析财务报表、盈利能力、成长性等核心指标",
+  technical_analysis: "识别趋势、支撑阻力位、技术指标信号",
+  valuation_analysis: "评估PE/PB/EV等估值指标并判断高估/低估",
+  money_flow_analysis: "追踪主力资金流入流出、换手率和大单动向",
+  sentiment_monitor: "监测市场情绪指标、舆情和社交媒体热度",
+  risk_assessment: "量化下行风险、波动率、最大回撤等风险维度",
+  recommendation: "综合所有分析维度生成最终投资建议",
+  industry_analysis: "分析行业景气度、竞争格局和发展趋势",
+  news_analysis: "筛选和解读影响股价的重要新闻事件",
+  peer_comparison: "对比同行业公司的关键财务和估值指标",
+  catalyst_analysis: "识别可能驱动股价变化的催化剂事件",
+  thesis_builder: "构建多空投资论点和核心逻辑",
+  risk_reward_analysis: "评估潜在收益与风险的非对称性",
+  entry_strategy: "确定最优入场时机和仓位管理策略",
+};
+
+function extractNodeSummary(evt) {
+  try {
+    if (evt.payloadJson && typeof evt.payloadJson === "string") {
+      const data = JSON.parse(evt.payloadJson);
+      return data.summary || data.content || "";
+    }
+    if (evt.payloadJson && typeof evt.payloadJson === "object") {
+      return evt.payloadJson.summary || evt.payloadJson.content || "";
+    }
+  } catch (_e) {
+    return "";
+  }
+  return "";
+}
+
 function ThinkingProcess({ events }) {
   if (!events || events.length === 0) return null;
   const nodeEvents = events.filter((e) => e.eventType !== "RUN_COMPLETED");
   const hasCompleted = events.some((e) => e.eventType === "RUN_COMPLETED");
   if (nodeEvents.length === 0 && !hasCompleted) return null;
 
+  const formatTime = (ts) => {
+    if (!ts) return "";
+    try {
+      const d = new Date(ts);
+      return d.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+    } catch (_) {
+      return "";
+    }
+  };
+
   return (
-    <div className="my-2 rounded-md border border-gray-100 bg-gray-50/50 px-3 py-2.5">
-      <div className="mb-1.5 flex items-center gap-1.5 text-[11px] font-medium text-gray-400">
-        <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-blue-400" />
-        分析过程
+    <div className="my-2 overflow-hidden rounded-lg border border-blue-100 bg-gradient-to-br from-blue-50/60 to-white">
+      <div className="thinking-shimmer border-b border-blue-100 px-4 py-2.5">
+        <div className="flex items-center gap-2.5">
+          {hasCompleted ? (
+            <span className="flex h-5 w-5 items-center justify-center rounded-full bg-green-100 text-[11px]">✓</span>
+          ) : (
+            <span className="flex h-5 w-5 items-center justify-center">
+              <span className="thinking-dot inline-block h-2.5 w-2.5 rounded-full bg-blue-500" />
+            </span>
+          )}
+          <span className="text-xs font-semibold text-blue-800">{hasCompleted ? "分析完成" : "正在分析"}</span>
+          {!hasCompleted && (
+            <span className="flex items-center gap-0.5">
+              <span className="thinking-dot-delay-1 inline-block h-1.5 w-1.5 rounded-full bg-blue-400" />
+              <span className="thinking-dot-delay-2 inline-block h-1.5 w-1.5 rounded-full bg-blue-400" />
+              <span className="thinking-dot-delay-1 inline-block h-1.5 w-1.5 rounded-full bg-blue-400" />
+            </span>
+          )}
+        </div>
       </div>
-      <div className="space-y-1">
+      <div className="space-y-0 px-4 py-2">
         {nodeEvents.map((evt, idx) => {
           const label = NODE_LABELS[evt.nodeId] || evt.nodeName || evt.nodeId;
+          const detailLabel = NODE_DETAIL_LABELS[evt.nodeId] || "";
           const icon = NODE_ICONS[evt.eventType] || "·";
           const isRunning = evt.eventType === "NODE_STARTED";
           const isFailed = evt.eventType === "NODE_FAILED";
+          const isCompleted = evt.eventType === "NODE_COMPLETED";
+          const summary = isCompleted ? extractNodeSummary(evt) : "";
+          const timeStr = formatTime(evt.createdAt);
+
           return (
-            <div key={evt.eventId || idx} className="flex items-center gap-2 text-xs">
-              <span className="flex-shrink-0">{icon}</span>
-              <span className={`${isRunning ? "text-blue-600 font-medium" : isFailed ? "text-red-500" : "text-gray-600"}`}>
-                {label}
-                {isRunning && <span className="ml-1 inline-block h-1 w-1 animate-pulse rounded-full bg-blue-400" />}
-              </span>
+            <div
+              key={evt.eventId || idx}
+              className={`flex items-start gap-2.5 py-1.5 ${idx < nodeEvents.length - 1 ? "border-b border-gray-100/60" : ""}`}
+            >
+              <div className="mt-0.5 flex h-5 w-5 flex-shrink-0 items-center justify-center">
+                {isRunning ? (
+                  <span className="thinking-dot inline-block h-3 w-3 rounded-full bg-blue-500" />
+                ) : isFailed ? (
+                  <span className="text-[11px]">❌</span>
+                ) : (
+                  <span className="text-[11px]">{icon}</span>
+                )}
+              </div>
+              <div className="min-w-0 flex-1">
+                <div className="flex items-center gap-2">
+                  <span
+                    className={`text-[13px] ${isRunning ? "font-semibold text-blue-700" : isFailed ? "font-medium text-red-600" : "font-medium text-gray-700"}`}
+                  >
+                    {label}
+                  </span>
+                  {isRunning && (
+                    <span className="thinking-dot-delay-1 inline-block h-1.5 w-1.5 rounded-full bg-blue-400" />
+                  )}
+                  {isCompleted && (
+                    <span className="rounded-full bg-green-50 px-1.5 py-0.5 text-[10px] font-medium text-green-700">
+                      完成
+                    </span>
+                  )}
+                  {isFailed && (
+                    <span className="rounded-full bg-red-50 px-1.5 py-0.5 text-[10px] font-medium text-red-600">
+                      失败
+                    </span>
+                  )}
+                </div>
+                {isRunning && detailLabel && <p className="mt-0.5 truncate text-[11px] text-gray-400">{detailLabel}</p>}
+                {isCompleted && summary && <p className="mt-0.5 truncate text-[11px] text-gray-500">{summary}</p>}
+                {timeStr && <span className="text-[10px] text-gray-300">{timeStr}</span>}
+              </div>
             </div>
           );
         })}
-        {hasCompleted && (
-          <div className="flex items-center gap-2 text-xs">
-            <span className="flex-shrink-0">🏁</span>
-            <span className="font-medium text-green-600">分析完成</span>
-          </div>
-        )}
       </div>
+      {hasCompleted && (
+        <div className="border-t border-green-100 bg-green-50/40 px-4 py-2">
+          <div className="flex items-center gap-2">
+            <span className="text-[11px]">🏁</span>
+            <span className="text-xs font-medium text-green-700">全部分析节点已完成，正在生成报告...</span>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -1158,7 +1254,7 @@ function AICopilot({ setCopilotOpen, api, promptRequest, onPromptHandled }) {
   };
 
   return (
-    <div className="flex w-[36rem] flex-shrink-0 flex-col border-l border-gray-200 bg-white shadow-lg">
+    <div className="flex w-[48rem] flex-shrink-0 flex-col border-l border-gray-200 bg-white shadow-lg">
       <div className="flex h-14 items-center justify-between border-b border-gray-200 px-4">
         <div className="flex items-center gap-2">
           <Icon name="bolt" className="h-5 w-5 text-blue-600" />
@@ -1177,7 +1273,7 @@ function AICopilot({ setCopilotOpen, api, promptRequest, onPromptHandled }) {
         {messages.map((msg, idx) => (
           <div key={idx} className={`flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}>
             <div
-              className={`max-w-[88%] whitespace-pre-wrap rounded-md px-3 py-2 text-sm leading-snug ${msg.role === "user" ? "bg-blue-50 text-blue-900" : msg.ok === false ? "border border-red-200 bg-red-50 text-red-700" : "bg-gray-50 text-gray-800"}`}
+              className={`whitespace-pre-wrap rounded-md px-3 py-2 text-sm leading-snug ${msg.role === "user" ? "max-w-[75%] bg-blue-50 text-blue-900" : msg.ok === false ? "max-w-[95%] border border-red-200 bg-red-50 text-red-700" : "max-w-[95%] bg-gray-50 text-gray-800"}`}
             >
               <div className="chat-markdown text-sm leading-snug">
                 <ReactMarkdown
@@ -1285,22 +1381,17 @@ function AICopilot({ setCopilotOpen, api, promptRequest, onPromptHandled }) {
             </div>
           </div>
         ))}
-        {loading && thinkingEvents.length > 0 && (
-          <div className="flex justify-start">
-            <div className="max-w-[88%]">
-              <ThinkingProcess events={thinkingEvents} />
-            </div>
-          </div>
-        )}
+        {loading && thinkingEvents.length > 0 && <ThinkingProcess events={thinkingEvents} />}
         {loading && thinkingEvents.length === 0 && (
           <div className="flex justify-start">
-            <div className="rounded-md bg-gray-50 px-3 py-2">
-              <div className="flex items-center gap-2">
-                <div className="relative h-4 w-4">
-                  <div className="absolute inset-0 rounded-full border-2 border-gray-200" />
-                  <div className="absolute inset-0 animate-spin rounded-full border-2 border-transparent border-t-blue-500" />
-                </div>
-                <span className="text-sm text-gray-400">分析中...</span>
+            <div className="thinking-shimmer rounded-lg border border-blue-100 bg-gradient-to-br from-blue-50/60 to-white px-4 py-3">
+              <div className="flex items-center gap-3">
+                <span className="flex items-center gap-1">
+                  <span className="thinking-dot-delay-1 inline-block h-2 w-2 rounded-full bg-blue-500" />
+                  <span className="thinking-dot-delay-2 inline-block h-2 w-2 rounded-full bg-blue-400" />
+                  <span className="thinking-dot-delay-1 inline-block h-2 w-2 rounded-full bg-blue-400" />
+                </span>
+                <span className="text-sm font-medium text-blue-700">正在分析...</span>
               </div>
             </div>
           </div>

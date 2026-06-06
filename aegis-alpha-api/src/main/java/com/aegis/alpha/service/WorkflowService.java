@@ -636,7 +636,7 @@ public class WorkflowService {
                 nodeRun.setStartedAt(now());
                 nodeRun.setSortOrder(index * 100 + attempt);
                 mapper.insertNodeRun(nodeRun);
-                recordRunEvent(run, "NODE_STARTED", nodeRun, nodeRun.getNodeId(), "RUNNING", "Node started.", null, index * 100 + attempt * 10);
+                recordRunEvent(run, "NODE_STARTED", nodeRun, nodeRun.getNodeId(), "RUNNING", "Node " + nodeRun.getNodeId() + " started.", null, index * 100 + attempt * 10);
 
                 try {
                     long started = System.currentTimeMillis();
@@ -652,7 +652,7 @@ public class WorkflowService {
                     nodeRun.setCompletedAt(now());
                     mapper.updateNodeRun(nodeRun);
                     agentTraceService.recordNodeSpan(run, nodeRun, handler(node), inputSnapshot, output);
-                    recordRunEvent(run, "NODE_COMPLETED", nodeRun, nodeRun.getNodeId(), "COMPLETED", "Node completed.", output, index * 100 + attempt * 10 + 1);
+                    recordRunEvent(run, "NODE_COMPLETED", nodeRun, nodeRun.getNodeId(), "COMPLETED", "Node " + nodeRun.getNodeId() + " completed.", output, index * 100 + attempt * 10 + 1);
                     lastFailure = null;
                     break;
                 } catch (WorkflowStoppedException stopped) {
@@ -670,9 +670,9 @@ public class WorkflowService {
                     nodeRun.setCompletedAt(now());
                     mapper.updateNodeRun(nodeRun);
                     agentTraceService.recordNodeSpan(run, nodeRun, handler(node), inputSnapshot, output);
-                    recordRunEvent(run, "NODE_FAILED", nodeRun, nodeRun.getNodeId(), "FAILED", ex.getMessage(), output, index * 100 + attempt * 10 + 1);
+                    recordRunEvent(run, "NODE_FAILED", nodeRun, nodeRun.getNodeId(), "FAILED", "Node " + nodeRun.getNodeId() + " failed: " + ex.getMessage(), output, index * 100 + attempt * 10 + 1);
                     if (attempt < maxAttempts) {
-                        recordRunEvent(run, "NODE_RETRYING", nodeRun, nodeRun.getNodeId(), "RETRYING", "Retrying node after failure.", output, index * 100 + attempt * 10 + 2);
+                        recordRunEvent(run, "NODE_RETRYING", nodeRun, nodeRun.getNodeId(), "RETRYING", "Node " + nodeRun.getNodeId() + " retrying after failure.", output, index * 100 + attempt * 10 + 2);
                         sleepBackoff(backoffMs);
                     }
                 }

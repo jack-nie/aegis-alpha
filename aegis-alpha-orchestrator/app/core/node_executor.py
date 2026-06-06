@@ -67,8 +67,9 @@ class NodeExecutor:
         started_at = datetime.now(timezone.utc).isoformat()
         handler = self._resolve_handler(node)
         node_type = self._resolve_node_type(node)
+        node_label = node.data.label or node.data.title or node.id
+        logger.info(f"[THINKING] Node started: id={node.id} handler={handler} label={node_label} subject={subject}")
 
-        # Check provider support
         effective_provider = provider or self._config.provider
         if effective_provider not in ("openai", "deepseek"):
             return self._unsupported_provider_result(node, handler, subject, started_at)
@@ -78,11 +79,13 @@ class NodeExecutor:
         is_mock = self._config.is_mock_mode and not effective_api_key
 
         if is_mock or self._is_control_flow(handler, node_type):
-            return self._mock_result(node, handler, subject, state, started_at)
+            result = self._mock_result(node, handler, subject, state, started_at)
+            logger.info(f"[THINKING] Node mock/control: id={node.id} handler={handler} label={node_label} status={result.status}")
+            return result
 
-        # Hydrate market data
         market_context = await self._market_data.hydrate(handler, state, subject, node.model_dump())
         if market_context:
+            logger.info(f"[THINKING] Market data hydrated for node id={node.id} handler={handler} data_keys={list(market_context.keys())}")
             state = {**state, "marketDataContext": market_context}
 
         # Invoke LLM with retry
@@ -90,7 +93,7 @@ class NodeExecutor:
         last_error = None
         for attempt in range(max_retries + 1):
             try:
-                return await self._invoke_llm(
+                result = await self._invoke_llm(
                     node=node,
                     handler=handler,
                     state=state,
@@ -101,17 +104,20 @@ class NodeExecutor:
                     model=model,
                     started_at=started_at,
                 )
+                logger.info(f"[THINKING] Node invoke succeeded: id={node.id} handler={handler} attempt={attempt + 1}")
+                return result
             except Exception as e:
                 last_error = e
                 if not self._is_retryable(e):
+                    logger.warning(f"[THINKING] Node invoke failed (non-retryable): id={node.id} handler={handler} error={e}")
                     break
                 if attempt < max_retries:
                     delay = 2 ** attempt
-                    logger.warning(f"Node {node.id} LLM call failed (attempt {attempt + 1}/{max_retries + 1}), retrying in {delay}s: {e}")
+                    logger.warning(f"[THINKING] Node {node.id} LLM call failed (attempt {attempt + 1}/{max_retries + 1}), retrying in {delay}s: {e}")
                     await asyncio.sleep(delay)
 
-        logger.error(f"Node {node.id} execution failed after {max_retries + 1} attempts: {last_error}")
-        return self._fallback_result(node, handler, subject, state, started_at, str(last_error))
+        logger.error(f"[THINKING] Node execution failed after all retries: id={node.id} handler={handler} label={node_label} error={last_error}")
+        fallback = self._fallback_result(node, handler, subject, state, started_at, str(last_error))
 
     @staticmethod
     def _normalize_signal(s) -> dict:
@@ -220,6 +226,8 @@ class NodeExecutor:
         )
 
         duration_ms = int((datetime.now(timezone.utc) - datetime.fromisoformat(started_at)).total_seconds() * 1000)
+        logger.info(f"[THINKING] Node completed: id={node.id} handler={handler} label={node_label} duration={duration_ms}ms status=completed confidence={response.confidence}")
+        logger.info(f"[THINKING] Node output: id={node.id} summary={response.summary[:200] if response.summary else 'N/A'}")
 
         return NodeResult(
             ok=True,
