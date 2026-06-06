@@ -5,8 +5,8 @@ import pytest
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
-os.environ.setdefault("MARKETMIND_LANGCHAIN_MOCK", "true")
-os.environ.setdefault("MARKETMIND_LANGCHAIN_API_KEY", "test-key")
+os.environ.setdefault("AEGIS_ALPHA_LANGCHAIN_MOCK", "true")
+os.environ.setdefault("AEGIS_ALPHA_LANGCHAIN_API_KEY", "test-key")
 
 
 @pytest.fixture
@@ -20,14 +20,14 @@ def event_loop():
 def mock_settings():
     from app.config import Settings
     return Settings(
-        MARKETMIND_LANGGRAPH_PORT=8787,
-        MARKETMIND_LANGGRAPH_HOST="0.0.0.0",
-        MARKETMIND_LANGCHAIN_PROVIDER="openai",
-        MARKETMIND_LANGCHAIN_MODEL="gpt-4o-mini",
-        MARKETMIND_LANGCHAIN_API_KEY="test-key",
-        MARKETMIND_LANGCHAIN_MOCK=True,
-        MARKETMIND_DATA_DIR="/tmp/aegis-test-data",
-        MARKETMIND_STORE_TTL_SECONDS=3600,
+        AEGIS_ALPHA_LANGGRAPH_PORT=8787,
+        AEGIS_ALPHA_LANGGRAPH_HOST="0.0.0.0",
+        AEGIS_ALPHA_LANGCHAIN_PROVIDER="openai",
+        AEGIS_ALPHA_LANGCHAIN_MODEL="gpt-4o-mini",
+        AEGIS_ALPHA_LANGCHAIN_API_KEY="test-key",
+        AEGIS_ALPHA_LANGCHAIN_MOCK=True,
+        AEGIS_ALPHA_DATA_DIR="/tmp/aegis-test-data",
+        AEGIS_ALPHA_STORE_TTL_SECONDS=3600,
     )
 
 

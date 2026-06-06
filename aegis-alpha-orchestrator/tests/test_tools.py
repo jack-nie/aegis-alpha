@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, patch, MagicMock
 def test_create_tools_returns_list():
     from app.config import Settings
     from app.core.tools import create_tools
-    settings = Settings(MARKETMIND_LANGCHAIN_API_KEY="test")
+    settings = Settings(AEGIS_ALPHA_LANGCHAIN_API_KEY="test")
     tools = create_tools(settings)
     assert isinstance(tools, list)
     assert len(tools) == 6
@@ -16,7 +16,7 @@ def test_create_tools_returns_list():
 def test_tool_names():
     from app.config import Settings
     from app.core.tools import create_tools
-    settings = Settings(MARKETMIND_LANGCHAIN_API_KEY="test")
+    settings = Settings(AEGIS_ALPHA_LANGCHAIN_API_KEY="test")
     tools = create_tools(settings)
     tool_names = [t.name for t in tools]
     assert "get_stock_quote" in tool_names
@@ -30,7 +30,7 @@ def test_tool_names():
 def test_tools_have_descriptions():
     from app.config import Settings
     from app.core.tools import create_tools
-    settings = Settings(MARKETMIND_LANGCHAIN_API_KEY="test")
+    settings = Settings(AEGIS_ALPHA_LANGCHAIN_API_KEY="test")
     tools = create_tools(settings)
     for tool in tools:
         assert tool.description is not None
@@ -42,10 +42,10 @@ async def test_backend_client_get():
     from app.config import Settings
     from app.core.tools import ToolBackendClient
     settings = Settings(
-        MARKETMIND_LANGCHAIN_API_KEY="test",
-        MARKETMIND_LANGCHAIN_BASE_URL="",
-        MARKETMIND_BACKEND_URL="http://localhost:5178",
-        MARKETMIND_NODE_EXECUTION_TOKEN="test-token",
+        AEGIS_ALPHA_LANGCHAIN_API_KEY="test",
+        AEGIS_ALPHA_LANGCHAIN_BASE_URL="",
+        AEGIS_ALPHA_BACKEND_URL="http://localhost:5178",
+        AEGIS_ALPHA_NODE_EXECUTION_TOKEN="test-token",
     )
     client = ToolBackendClient(settings)
     mock_response = MagicMock()
@@ -65,8 +65,8 @@ async def test_backend_client_error():
     from app.config import Settings
     from app.core.tools import ToolBackendClient
     settings = Settings(
-        MARKETMIND_LANGCHAIN_API_KEY="test",
-        MARKETMIND_BACKEND_URL="http://localhost:5178",
+        AEGIS_ALPHA_LANGCHAIN_API_KEY="test",
+        AEGIS_ALPHA_BACKEND_URL="http://localhost:5178",
     )
     client = ToolBackendClient(settings)
     with patch("httpx.AsyncClient") as mock_cls:
@@ -87,7 +87,7 @@ def test_get_backend_client_singleton():
     from app.core.tools import get_backend_client, _backend_client
     import app.core.tools as tools_module
     tools_module._backend_client = None
-    settings = Settings(MARKETMIND_LANGCHAIN_API_KEY="test")
+    settings = Settings(AEGIS_ALPHA_LANGCHAIN_API_KEY="test")
     c1 = get_backend_client(settings)
     c2 = get_backend_client(settings)
     assert c1 is c2

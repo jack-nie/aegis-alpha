@@ -186,32 +186,32 @@ Write-Step "npm: $Npm"
 Write-Step "Node: $Node"
 
 Import-UserEnvironmentVariable "OPENAI_API_KEY"
-Import-UserEnvironmentVariable "MARKETMIND_LANGCHAIN_API_KEY"
-Import-UserEnvironmentVariable "MARKETMIND_LANGCHAIN_PROVIDER"
-Import-UserEnvironmentVariable "MARKETMIND_LANGCHAIN_MODEL"
+Import-UserEnvironmentVariable "AEGIS_ALPHA_LANGCHAIN_API_KEY"
+Import-UserEnvironmentVariable "AEGIS_ALPHA_LANGCHAIN_PROVIDER"
+Import-UserEnvironmentVariable "AEGIS_ALPHA_LANGCHAIN_MODEL"
 Import-UserEnvironmentVariable "OPENAI_BASE_URL"
-Import-UserEnvironmentVariable "MARKETMIND_LANGCHAIN_BASE_URL"
-Import-UserEnvironmentVariable "MARKETMIND_LANGCHAIN_TIMEOUT_MS"
-if ($env:OPENAI_API_KEY -and (-not $env:MARKETMIND_LANGCHAIN_API_KEY)) {
-    $env:MARKETMIND_LANGCHAIN_API_KEY = $env:OPENAI_API_KEY
+Import-UserEnvironmentVariable "AEGIS_ALPHA_LANGCHAIN_BASE_URL"
+Import-UserEnvironmentVariable "AEGIS_ALPHA_LANGCHAIN_TIMEOUT_MS"
+if ($env:OPENAI_API_KEY -and (-not $env:AEGIS_ALPHA_LANGCHAIN_API_KEY)) {
+    $env:AEGIS_ALPHA_LANGCHAIN_API_KEY = $env:OPENAI_API_KEY
 }
-if ($env:OPENAI_BASE_URL -and (-not $env:MARKETMIND_LANGCHAIN_BASE_URL)) {
-    $env:MARKETMIND_LANGCHAIN_BASE_URL = $env:OPENAI_BASE_URL
+if ($env:OPENAI_BASE_URL -and (-not $env:AEGIS_ALPHA_LANGCHAIN_BASE_URL)) {
+    $env:AEGIS_ALPHA_LANGCHAIN_BASE_URL = $env:OPENAI_BASE_URL
 }
-if (-not $env:MARKETMIND_LANGCHAIN_PROVIDER) {
-    $env:MARKETMIND_LANGCHAIN_PROVIDER = "openai"
+if (-not $env:AEGIS_ALPHA_LANGCHAIN_PROVIDER) {
+    $env:AEGIS_ALPHA_LANGCHAIN_PROVIDER = "openai"
 }
-if (-not $env:MARKETMIND_LANGCHAIN_MODEL) {
-    $env:MARKETMIND_LANGCHAIN_MODEL = "deepseek-v4-flash"
+if (-not $env:AEGIS_ALPHA_LANGCHAIN_MODEL) {
+    $env:AEGIS_ALPHA_LANGCHAIN_MODEL = "deepseek-v4-flash"
 }
-if (-not $env:MARKETMIND_LANGCHAIN_TIMEOUT_MS) {
-    $env:MARKETMIND_LANGCHAIN_TIMEOUT_MS = "25000"
+if (-not $env:AEGIS_ALPHA_LANGCHAIN_TIMEOUT_MS) {
+    $env:AEGIS_ALPHA_LANGCHAIN_TIMEOUT_MS = "25000"
 }
 
 if ($StartLangGraph) {
-    $env:MARKETMIND_LANGCHAIN_ENABLED = "true"
-    $env:MARKETMIND_LANGCHAIN_ENGINE_URL = "http://127.0.0.1:$LangGraphPort"
-    $env:MARKETMIND_LANGGRAPH_PORT = "$LangGraphPort"
+    $env:AEGIS_ALPHA_LANGCHAIN_ENABLED = "true"
+    $env:AEGIS_ALPHA_LANGCHAIN_ENGINE_URL = "http://127.0.0.1:$LangGraphPort"
+    $env:AEGIS_ALPHA_LANGGRAPH_PORT = "$LangGraphPort"
     $LangGraphNodeModules = Join-Path $LangGraphDir "node_modules"
     if ((-not $SkipInstall) -and (-not (Test-Path $LangGraphNodeModules))) {
         Write-Step "LangGraph node_modules is missing. Running npm install ..."

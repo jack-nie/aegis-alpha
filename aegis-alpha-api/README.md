@@ -17,8 +17,8 @@ Run once with an admin MySQL account:
 Then import schema and observed website data:
 
 ```powershell
-& "C:\Program Files\MySQL\MySQL Server 8.0\bin\mysql.exe" -umarketmind -pmarketmind_dev aegis_alpha < .\src\main\resources\db\mysql\schema.sql
-& "C:\Program Files\MySQL\MySQL Server 8.0\bin\mysql.exe" -umarketmind -pmarketmind_dev aegis_alpha < .\src\main\resources\db\mysql\import-existing-data.sql
+& "C:\Program Files\MySQL\MySQL Server 8.0\bin\mysql.exe" -uaegis -paegis_dev aegis_alpha < .\src\main\resources\db\mysql\schema.sql
+& "C:\Program Files\MySQL\MySQL Server 8.0\bin\mysql.exe" -uaegis -paegis_dev aegis_alpha < .\src\main\resources\db\mysql\import-existing-data.sql
 ```
 
 The application also contains `ExistingDataSeeder`, which imports the same observed data on startup when the DB is empty.
@@ -28,9 +28,9 @@ The application also contains `ExistingDataSeeder`, which imports the same obser
 Configure Redis through environment variables:
 
 ```powershell
-$env:MARKETMIND_REDIS_HOST = "127.0.0.1"
-$env:MARKETMIND_REDIS_PORT = "6379"
-$env:MARKETMIND_REDIS_PASSWORD = "1234"
+$env:AEGIS_ALPHA_REDIS_HOST = "127.0.0.1"
+$env:AEGIS_ALPHA_REDIS_PORT = "6379"
+$env:AEGIS_ALPHA_REDIS_PASSWORD = "1234"
 ```
 
 Dashboard cache uses Redis and falls back to DB if Redis is unavailable.
@@ -38,9 +38,9 @@ Dashboard cache uses Redis and falls back to DB if Redis is unavailable.
 ## Run
 
 ```powershell
-$env:MARKETMIND_DB_USER = "marketmind"
-$env:MARKETMIND_DB_PASSWORD = "marketmind_dev"
-$env:MARKETMIND_DB_URL = "jdbc:mysql://127.0.0.1:3306/aegis_alpha?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&useSSL=false&allowPublicKeyRetrieval=true"
+$env:AEGIS_ALPHA_DB_USER = "aegis"
+$env:AEGIS_ALPHA_DB_PASSWORD = "aegis_dev"
+$env:AEGIS_ALPHA_DB_URL = "jdbc:mysql://127.0.0.1:3306/aegis_alpha?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&useSSL=false&allowPublicKeyRetrieval=true"
 mvn spring-boot:run
 ```
 
