@@ -9,6 +9,7 @@ import org.junit.jupiter.api.Test;
 
 import java.math.BigDecimal;
 import java.util.*;
+import java.util.AbstractMap.SimpleEntry;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
@@ -28,6 +29,19 @@ class ModelGovernanceServiceTest {
         service = new ModelGovernanceService(governanceMapper, agentCallSpanMapper, objectMapper);
     }
 
+    @SafeVarargs
+    private static <K, V> Map<K, V> mapOf(Map.Entry<K, V>... entries) {
+        Map<K, V> map = new HashMap<>();
+        for (Map.Entry<K, V> entry : entries) {
+            map.put(entry.getKey(), entry.getValue());
+        }
+        return map;
+    }
+
+    private static <K, V> Map.Entry<K, V> entry(K key, V value) {
+        return new SimpleEntry<>(key, value);
+    }
+
     @Test
     void modelsSeedsDefaultWhenEmpty() {
         when(governanceMapper.countModelConfigs()).thenReturn(0);
@@ -41,7 +55,7 @@ class ModelGovernanceServiceTest {
     @Test
     void modelsDoesNotSeedWhenModelsExist() {
         when(governanceMapper.countModelConfigs()).thenReturn(1);
-        when(governanceMapper.findModelConfigs()).thenReturn(List.of(new ModelConfig()));
+        when(governanceMapper.findModelConfigs()).thenReturn(Arrays.asList(new ModelConfig()));
 
         service.models();
 
@@ -88,18 +102,18 @@ class ModelGovernanceServiceTest {
         span.setCompletedAt("2026-01-01 10:00:05");
         span.setSortOrder(1);
 
-        String outputJson = objectMapper.writeValueAsString(Map.of(
-                "provider", "openai",
-                "model", "deepseek-v4-flash",
-                "data", Map.of("usage", Map.of(
-                        "prompt_tokens", 100,
-                        "completion_tokens", 50,
-                        "total_tokens", 150
-                ))
+        String outputJson = objectMapper.writeValueAsString(mapOf(
+                entry("provider", "openai"),
+                entry("model", "deepseek-v4-flash"),
+                entry("data", mapOf(entry("usage", mapOf(
+                        entry("prompt_tokens", 100),
+                        entry("completion_tokens", 50),
+                        entry("total_tokens", 150)
+                ))))
         ));
         span.setOutputJson(outputJson);
 
-        when(agentCallSpanMapper.findByWorkflowRunId("run-1")).thenReturn(List.of(span));
+        when(agentCallSpanMapper.findByWorkflowRunId("run-1")).thenReturn(Arrays.asList(span));
         when(governanceMapper.findModelConfig("openai", "deepseek-v4-flash")).thenReturn(null);
 
         WorkflowRun run = new WorkflowRun();
@@ -126,7 +140,7 @@ class ModelGovernanceServiceTest {
         span.setStatus("COMPLETED");
         span.setOutputJson("{}");
 
-        when(agentCallSpanMapper.findByWorkflowRunId("run-1")).thenReturn(List.of(span));
+        when(agentCallSpanMapper.findByWorkflowRunId("run-1")).thenReturn(Arrays.asList(span));
 
         WorkflowRun run = new WorkflowRun();
         run.setRunId("run-1");
@@ -149,9 +163,9 @@ class ModelGovernanceServiceTest {
         span.setStatus("COMPLETED");
         span.setStartedAt("2026-01-01 10:00:00");
         span.setCompletedAt("2026-01-01 10:00:05");
-        span.setOutputJson(objectMapper.writeValueAsString(Map.of("provider", "langchain-openai")));
+        span.setOutputJson(objectMapper.writeValueAsString(mapOf(entry("provider", "langchain-openai"))));
 
-        when(agentCallSpanMapper.findByWorkflowRunId("run-1")).thenReturn(List.of(span));
+        when(agentCallSpanMapper.findByWorkflowRunId("run-1")).thenReturn(Arrays.asList(span));
         when(governanceMapper.findModelConfig("openai", "gpt-4")).thenReturn(null);
 
         WorkflowRun run = new WorkflowRun();

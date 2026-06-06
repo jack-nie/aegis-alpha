@@ -41,7 +41,7 @@ class DashboardServiceTest {
         ms.setName("Apple");
         ms.setSymbol("AAPL");
         ms.setChangePct(new BigDecimal("1.5"));
-        when(dashboardMapper.markets()).thenReturn(List.of(ms));
+        when(dashboardMapper.markets()).thenReturn(Arrays.asList(ms));
         when(portfolioMapper.count()).thenReturn(3);
         when(portfolioTradeMapper.count()).thenReturn(24);
 
@@ -94,7 +94,7 @@ class DashboardServiceTest {
         down.setSymbol("META");
         down.setChangePct(new BigDecimal("-0.5"));
 
-        when(dashboardMapper.markets()).thenReturn(List.of(up, down));
+        when(dashboardMapper.markets()).thenReturn(Arrays.asList(up, down));
         when(portfolioMapper.count()).thenReturn(0);
         when(portfolioTradeMapper.count()).thenReturn(0);
 

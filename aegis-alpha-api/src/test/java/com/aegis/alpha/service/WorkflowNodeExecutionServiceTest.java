@@ -6,6 +6,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.util.*;
+import java.util.AbstractMap.SimpleEntry;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.Mockito.*;
@@ -20,6 +21,19 @@ class WorkflowNodeExecutionServiceTest {
         marketDataService = mock(MarketDataService.class);
         portfolioService = mock(PortfolioService.class);
         service = new WorkflowNodeExecutionService("", marketDataService, portfolioService);
+    }
+
+    @SafeVarargs
+    private static <K, V> Map<K, V> mapOf(Map.Entry<K, V>... entries) {
+        Map<K, V> map = new HashMap<>();
+        for (Map.Entry<K, V> entry : entries) {
+            map.put(entry.getKey(), entry.getValue());
+        }
+        return map;
+    }
+
+    private static <K, V> Map.Entry<K, V> entry(K key, V value) {
+        return new SimpleEntry<>(key, value);
     }
 
     @Test
@@ -40,12 +54,12 @@ class WorkflowNodeExecutionServiceTest {
         Map<String, Object> quoteResult = new LinkedHashMap<>();
         quoteResult.put("provider", "yahoo-chart");
         quoteResult.put("symbol", "AAPL");
-        quoteResult.put("sources", List.of());
+        quoteResult.put("sources", Collections.emptyList());
         when(marketDataService.quote("AAPL")).thenReturn(quoteResult);
 
         Map<String, Object> request = new LinkedHashMap<>();
         request.put("functionName", "fdb.daily_ohlc");
-        request.put("params", Map.of("symbol", "AAPL"));
+        request.put("params", mapOf(entry("symbol", "AAPL")));
 
         Map<String, Object> result = service.execute(request);
 
@@ -58,8 +72,8 @@ class WorkflowNodeExecutionServiceTest {
     void executeFinancialHandler() {
         Map<String, Object> finResult = new LinkedHashMap<>();
         finResult.put("provider", "sec-companyfacts");
-        finResult.put("metrics", List.of());
-        finResult.put("sources", List.of());
+        finResult.put("metrics", Collections.emptyList());
+        finResult.put("sources", Collections.emptyList());
         when(marketDataService.financials("MSFT")).thenReturn(finResult);
 
         Map<String, Object> request = new LinkedHashMap<>();
@@ -76,13 +90,13 @@ class WorkflowNodeExecutionServiceTest {
     void executeNewsHandler() {
         Map<String, Object> newsResult = new LinkedHashMap<>();
         newsResult.put("provider", "yahoo-finance-rss");
-        newsResult.put("articles", List.of());
-        newsResult.put("sources", List.of());
+        newsResult.put("articles", Collections.emptyList());
+        newsResult.put("sources", Collections.emptyList());
         when(marketDataService.news("TSLA")).thenReturn(newsResult);
 
         Map<String, Object> request = new LinkedHashMap<>();
         request.put("functionName", "news.fetch_window");
-        request.put("params", Map.of("ticker", "TSLA"));
+        request.put("params", mapOf(entry("ticker", "TSLA")));
 
         Map<String, Object> result = service.execute(request);
 
@@ -93,9 +107,9 @@ class WorkflowNodeExecutionServiceTest {
     @Test
     void executeHydrateMarketDataHandler() {
         Map<String, Object> overview = new LinkedHashMap<>();
-        overview.put("quote", Map.of("symbol", "AAPL", "price", 200));
-        overview.put("financials", Map.of("symbol", "AAPL"));
-        overview.put("news", Map.of("symbol", "AAPL"));
+        overview.put("quote", mapOf(entry("symbol", "AAPL"), entry("price", 200)));
+        overview.put("financials", mapOf(entry("symbol", "AAPL")));
+        overview.put("news", mapOf(entry("symbol", "AAPL")));
         when(marketDataService.overview("NVDA")).thenReturn(overview);
 
         Map<String, Object> request = new LinkedHashMap<>();
@@ -112,7 +126,7 @@ class WorkflowNodeExecutionServiceTest {
     @Test
     void executePortfolioGetContextWithPortfolioId() {
         Map<String, Object> contract = new LinkedHashMap<>();
-        contract.put("summary", Map.of("nav", 250000));
+        contract.put("summary", mapOf(entry("nav", 250000)));
         contract.put("dataCompleteness", "DETAILS_SYNCED");
         contract.put("positionCount", 5);
         contract.put("tradeCount", 12);
@@ -187,7 +201,7 @@ class WorkflowNodeExecutionServiceTest {
     void symbolDefaultsToAAPL() {
         Map<String, Object> quoteResult = new LinkedHashMap<>();
         quoteResult.put("provider", "yahoo");
-        quoteResult.put("sources", List.of());
+        quoteResult.put("sources", Collections.emptyList());
         when(marketDataService.quote("AAPL")).thenReturn(quoteResult);
 
         Map<String, Object> request = new LinkedHashMap<>();
@@ -202,12 +216,12 @@ class WorkflowNodeExecutionServiceTest {
     void symbolExtractedFromParams() {
         Map<String, Object> quoteResult = new LinkedHashMap<>();
         quoteResult.put("provider", "yahoo");
-        quoteResult.put("sources", List.of());
+        quoteResult.put("sources", Collections.emptyList());
         when(marketDataService.quote("GOOGL")).thenReturn(quoteResult);
 
         Map<String, Object> request = new LinkedHashMap<>();
         request.put("functionName", "fdb.daily_ohlc");
-        request.put("params", Map.of("symbol", "GOOGL"));
+        request.put("params", mapOf(entry("symbol", "GOOGL")));
 
         Map<String, Object> result = service.execute(request);
 

@@ -6,6 +6,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.util.*;
+import java.util.AbstractMap.SimpleEntry;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.Mockito.*;
@@ -33,7 +34,7 @@ class IntentRouterServiceTest {
 
     @Test
     void classifyReturnsEmptyForNullMessage() {
-        when(workflowMapper.findDefinitions()).thenReturn(List.of(def("daily", "Daily", "daily,日报")));
+        when(workflowMapper.findDefinitions()).thenReturn(Arrays.asList(def("daily", "Daily", "daily,日报")));
 
         IntentRouterService.IntentResult result = service.classify(null);
 
@@ -43,7 +44,7 @@ class IntentRouterServiceTest {
 
     @Test
     void classifyReturnsEmptyForEmptyMessage() {
-        when(workflowMapper.findDefinitions()).thenReturn(List.of(def("daily", "Daily", "daily")));
+        when(workflowMapper.findDefinitions()).thenReturn(Arrays.asList(def("daily", "Daily", "daily")));
 
         IntentRouterService.IntentResult result = service.classify("  ");
 
@@ -61,7 +62,7 @@ class IntentRouterServiceTest {
 
     @Test
     void classifyByKeywordMatching() {
-        when(workflowMapper.findDefinitions()).thenReturn(List.of(
+        when(workflowMapper.findDefinitions()).thenReturn(Arrays.asList(
                 def("daily", "Daily Briefing", "daily,日报,行情"),
                 def("deep_dive", "Deep Dive", "deep dive,深度分析")
         ));
@@ -76,7 +77,7 @@ class IntentRouterServiceTest {
 
     @Test
     void classifyByKeywordPicksLongestMatch() {
-        when(workflowMapper.findDefinitions()).thenReturn(List.of(
+        when(workflowMapper.findDefinitions()).thenReturn(Arrays.asList(
                 def("daily", "Daily Briefing", "daily"),
                 def("daily_extended", "Daily Extended", "daily morning")
         ));
@@ -89,7 +90,7 @@ class IntentRouterServiceTest {
 
     @Test
     void classifyByLlmWhenAvailable() {
-        when(workflowMapper.findDefinitions()).thenReturn(List.of(
+        when(workflowMapper.findDefinitions()).thenReturn(Arrays.asList(
                 def("deep_dive", "Deep Dive", "deep dive")
         ));
 
@@ -109,7 +110,7 @@ class IntentRouterServiceTest {
 
     @Test
     void classifyLlmReturnsNullKeyFallsBackToKeywords() {
-        when(workflowMapper.findDefinitions()).thenReturn(List.of(
+        when(workflowMapper.findDefinitions()).thenReturn(Arrays.asList(
                 def("daily", "Daily", "daily")
         ));
 
@@ -125,7 +126,7 @@ class IntentRouterServiceTest {
 
     @Test
     void classifyLlmThrowsFallsBackToKeywords() {
-        when(workflowMapper.findDefinitions()).thenReturn(List.of(
+        when(workflowMapper.findDefinitions()).thenReturn(Arrays.asList(
                 def("daily", "Daily", "daily")
         ));
         when(langChainGateway.classifyIntent(any(), any())).thenThrow(new RuntimeException("timeout"));
@@ -138,7 +139,7 @@ class IntentRouterServiceTest {
 
     @Test
     void extractTickerFromMessage() {
-        when(workflowMapper.findDefinitions()).thenReturn(List.of(
+        when(workflowMapper.findDefinitions()).thenReturn(Arrays.asList(
                 def("deep_dive", "Deep Dive", "深度分析")
         ));
         when(langChainGateway.classifyIntent(any(), any())).thenThrow(new RuntimeException("unavailable"));
@@ -150,7 +151,7 @@ class IntentRouterServiceTest {
 
     @Test
     void extractTickerSkipsStopwords() {
-        when(workflowMapper.findDefinitions()).thenReturn(List.of(
+        when(workflowMapper.findDefinitions()).thenReturn(Arrays.asList(
                 def("daily", "Daily", "daily")
         ));
         when(langChainGateway.classifyIntent(any(), any())).thenThrow(new RuntimeException("unavailable"));
@@ -162,7 +163,7 @@ class IntentRouterServiceTest {
 
     @Test
     void classifyCachesDefinitions() {
-        when(workflowMapper.findDefinitions()).thenReturn(List.of(def("daily", "Daily", "daily")));
+        when(workflowMapper.findDefinitions()).thenReturn(Arrays.asList(def("daily", "Daily", "daily")));
 
         service.classify("daily");
         service.classify("daily again");
