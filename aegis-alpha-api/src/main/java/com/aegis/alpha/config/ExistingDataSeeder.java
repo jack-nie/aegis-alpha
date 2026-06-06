@@ -21,7 +21,7 @@ import java.util.UUID;
 
 @Component
 @Order(1)
-@ConditionalOnProperty(name = "aegis.seed-enabled", havingValue = "true", matchIfMissing = true)
+@ConditionalOnProperty(name = "marketmind.seed-enabled", havingValue = "true", matchIfMissing = true)
 public class ExistingDataSeeder implements CommandLineRunner {
     private final UserMapper userMapper;
     private final WorkflowMapper workflowMapper;
@@ -65,7 +65,7 @@ public class ExistingDataSeeder implements CommandLineRunner {
                     "深度分析,深度研究,个股分析,股票分析,分析个股,分析股票,deep dive,deep analysis",
                     "Perform comprehensive deep-dive analysis on a specific stock covering 15 dimensions: fundamental, technical, valuation, money flow, industry, sentiment, news, tech breakthrough, risk, peer comparison, catalyst, thesis, risk-reward, entry strategy, and final recommendation");
             workflow("exit_workflow", "Exit Workflow", 1, 9, 9,
-                    "止损,止盈,卖出,平仓,退�?exit,stop loss,take profit,close position",
+                    "止损,止盈,卖出,平仓,退出,exit,stop loss,take profit,close position",
                     "Analyze exit signals for a position including stop-loss review, take-profit review, signal decay, news risk scan, and exit decision");
             workflow("portfolio_workflow", "Portfolio Workflow", 1, 7, 7,
                     "投资组合,资产配置,组合分析,portfolio,asset allocation,portfolio workflow",
@@ -77,7 +77,7 @@ public class ExistingDataSeeder implements CommandLineRunner {
                     "板块,行业,行业分析,sector,industry analysis,sector analyst",
                     "Analyze an industry sector including macro environment, industry chain, policy impact, competitive map, top players, tech trends, valuation band, sector sentiment, capital flow, sector risk, catalyst calendar, rotation signal, and sector recommendation");
             workflow("stock_analysis", "Stock Analysis", 1, 9, 10,
-                    "股票分析,综合分析,帮我分析,分析一�?stock analysis,comprehensive analysis",
+                    "股票分析,综合分析,帮我分析,分析一下,stock analysis,comprehensive analysis",
                     "Comprehensive stock analysis covering fundamental, technical, valuation, money flow, sentiment, risk, and aggregate recommendation");
 
             WorkflowRun run = new WorkflowRun();
@@ -90,7 +90,7 @@ public class ExistingDataSeeder implements CommandLineRunner {
             workflowMapper.insertRun(run);
         }
         if (workflowMapper.findDefinition("stock_recommendation_research") == null) {
-            workflow("stock_recommendation_research", "股票推荐智能体编�?, 1, 10, 9,
+            workflow("stock_recommendation_research", "股票推荐智能体编排", 1, 10, 9,
                     "股票推荐,选股,推荐股票,recommendation,stock pick,stock screener",
                     "Orchestrate multi-agent stock recommendation research pipeline with market analysis, industry share, sentiment monitoring, tech breakthrough, industry news, web search, financial interpretation, and final stock recommendation aggregation");
         }

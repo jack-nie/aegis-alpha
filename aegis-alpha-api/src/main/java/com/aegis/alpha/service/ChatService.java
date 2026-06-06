@@ -26,7 +26,7 @@ public class ChatService {
 
     /* Flexible patterns: analysis + stock name + stock/sector keywords */
     private static final Pattern STOCK_ANALYSIS_PATTERN =
-            Pattern.compile("分析.{0,20}(?:股票|个股)|(?:股票|个股).{0,10}分析|分析一�?{0,20}");
+            Pattern.compile("分析.{0,20}(?:股票|个股)|(?:股票|个股).{0,10}分析|分析一下.{0,20}");
     private static final Pattern SECTOR_ANALYSIS_PATTERN =
             Pattern.compile("分析.{0,20}(?:板块|行业)|(?:板块|行业).{0,10}分析");
 
@@ -81,7 +81,7 @@ public class ChatService {
     }
 
     /* ================================================================ *
-     * Intent routing  �? only the 6 seeded keys are valid targets.
+     * Intent routing  –  only the 6 seeded keys are valid targets.
      * ================================================================ */
 
     String resolveWorkflowKey(Map<String, Object> body, String message) {
@@ -101,7 +101,7 @@ public class ChatService {
         /* deep dive */
         if (matchesAny(msg,
                 "深度分析", "深度研究", "深入研究", "个股分析", "股票分析", "分析个股", "分析股票", "deep dive", "deep analysis", "stock analysis", "analyze stock",
-                "帮我分析", "分析一�?)) {
+                "帮我分析", "分析一下")) {
             return "deep_dive";
         }
         /* deep dive - flexible regex: analysis + stock name + stock keywords */
@@ -110,7 +110,7 @@ public class ChatService {
         }
         /* exit workflow */
         if (matchesAny(msg,
-                "止损", "止盈", "卖出", "平仓", "退�?, "exit", "stop loss", "take profit", "close position")) {
+                "止损", "止盈", "卖出", "平仓", "退出", "exit", "stop loss", "take profit", "close position")) {
             return "exit_workflow";
         }
         /* portfolio workflow */

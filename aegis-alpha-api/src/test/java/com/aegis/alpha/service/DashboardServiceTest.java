@@ -60,8 +60,8 @@ class DashboardServiceTest {
         assertThat(breadth.get("down")).isEqualTo(0);
 
         Map<String, Object> counts = (Map<String, Object>) result.get("counts");
-        assertThat(counts).containsKey("浜ゆ�?);
-        assertThat(counts.get("浜ゆ�?)).isEqualTo(24);
+        assertThat(counts).containsKey("浜ゆ槗");
+        assertThat(counts.get("浜ゆ槗")).isEqualTo(24);
     }
 
     @SuppressWarnings("unchecked")

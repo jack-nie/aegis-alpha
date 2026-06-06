@@ -53,9 +53,9 @@ public class DashboardService {
         payload.put("marketBreadth", breadth);
 
         Map<String, Object> counts = new HashMap<String, Object>();
-        counts.put("缁勫�?, portfolioMapper.count());
-        counts.put("璧勪�?, 0);
-        counts.put("浜ゆ�?, portfolioTradeMapper.count());
+        counts.put("缁勫悎", portfolioMapper.count());
+        counts.put("璧勪骇", 0);
+        counts.put("浜ゆ槗", portfolioTradeMapper.count());
         counts.put("鏈熸潈缁勫悎", 0);
         payload.put("counts", counts);
 
