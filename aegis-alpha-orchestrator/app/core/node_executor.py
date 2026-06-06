@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from datetime import datetime, timezone
@@ -69,7 +70,7 @@ class NodeExecutor:
 
         # Check provider support
         effective_provider = provider or self._config.provider
-        if effective_provider != "openai":
+        if effective_provider not in ("openai", "deepseek"):
             return self._unsupported_provider_result(node, handler, subject, started_at)
 
         # Check mock mode or deterministic tool
@@ -84,22 +85,33 @@ class NodeExecutor:
         if market_context:
             state = {**state, "marketDataContext": market_context}
 
-        # Invoke LLM
-        try:
-            return await self._invoke_llm(
-                node=node,
-                handler=handler,
-                state=state,
-                subject=subject,
-                agent=agent,
-                api_key=effective_api_key,
-                base_url=base_url or self._config.effective_base_url,
-                model=model,
-                started_at=started_at,
-            )
-        except Exception as e:
-            logger.error(f"Node execution failed: {e}")
-            return self._fallback_result(node, handler, subject, state, started_at, str(e))
+        # Invoke LLM with retry
+        max_retries = 2
+        last_error = None
+        for attempt in range(max_retries + 1):
+            try:
+                return await self._invoke_llm(
+                    node=node,
+                    handler=handler,
+                    state=state,
+                    subject=subject,
+                    agent=agent,
+                    api_key=effective_api_key,
+                    base_url=base_url or self._config.effective_base_url,
+                    model=model,
+                    started_at=started_at,
+                )
+            except Exception as e:
+                last_error = e
+                if not self._is_retryable(e):
+                    break
+                if attempt < max_retries:
+                    delay = 2 ** attempt
+                    logger.warning(f"Node {node.id} LLM call failed (attempt {attempt + 1}/{max_retries + 1}), retrying in {delay}s: {e}")
+                    await asyncio.sleep(delay)
+
+        logger.error(f"Node {node.id} execution failed after {max_retries + 1} attempts: {last_error}")
+        return self._fallback_result(node, handler, subject, state, started_at, str(last_error))
 
     def _resolve_handler(self, node: Node) -> str:
         """Resolve handler name from node data."""
@@ -118,6 +130,15 @@ class NodeExecutor:
         if handler in FALLBACK_HANDLERS and handler not in HANDLERS:
             return True
         return False
+
+    @staticmethod
+    def _is_retryable(error: Exception) -> bool:
+        error_str = str(error).lower()
+        non_retryable = ["401", "403", "authentication", "unauthorized", "forbidden", "invalid api key"]
+        if any(term in error_str for term in non_retryable):
+            return False
+        retryable = ["timeout", "rate limit", "429", "500", "502", "503", "504", "connection", "temporary"]
+        return any(term in error_str for term in retryable)
 
     async def _invoke_llm(
         self,
@@ -155,7 +176,13 @@ class NodeExecutor:
         # Build context
         is_aggregate = handler == "finance.stock_recommendation_aggregate"
         max_context = 30000 if is_aggregate else 12000
-        context = json.dumps(state, ensure_ascii=False, default=str)[:max_context]
+        full_context = json.dumps(state, ensure_ascii=False, default=str)
+        if len(full_context) <= max_context:
+            context = full_context
+        else:
+            truncated = full_context[:max_context]
+            last_brace = truncated.rfind('}')
+            context = truncated[:last_brace + 1] if last_brace > 0 else truncated
 
         # Build system prompt
         if is_aggregate:
@@ -193,8 +220,8 @@ class NodeExecutor:
             node_name=data.label or data.title or node.id,
             subject=subject,
             summary=response.summary,
-            signals=[s if isinstance(s, dict) else s.__dict__ for s in response.signals],
-            sources=[s if isinstance(s, dict) else s.__dict__ for s in response.sources],
+            signals=[s if isinstance(s, dict) else {"name": str(s), "value": s, "weight": 0.5} for s in response.signals],
+            sources=[s if isinstance(s, dict) else {"title": str(s), "url": "", "type": "llm"} for s in response.sources],
             confidence=response.confidence,
             data=response.data,
             duration_ms=duration_ms,
@@ -306,7 +333,7 @@ class NodeExecutor:
             signals=[],
             sources=[],
             confidence=0.0,
-            data={"reason": "Only openai provider is supported"},
+            data={"reason": "Only openai and deepseek providers are supported"},
             duration_ms=duration_ms,
             degraded=True,
             provider=self._config.provider,
