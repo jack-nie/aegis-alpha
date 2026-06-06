@@ -16,8 +16,10 @@ def test_effective_api_key(mock_settings):
     assert mock_settings.effective_api_key == "test-key"
 
 
-def test_effective_base_url_no_override(mock_settings):
-    assert mock_settings.effective_base_url == ""
+def test_effective_base_url_no_override():
+    from app.config import Settings
+    s = Settings(MARKETMIND_LANGCHAIN_API_KEY="test", MARKETMIND_LANGCHAIN_BASE_URL="", OPENAI_BASE_URL="")
+    assert s.effective_base_url == ""
 
 
 def test_effective_api_key_fallback():

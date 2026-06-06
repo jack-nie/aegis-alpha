@@ -161,3 +161,20 @@ class PersistentStore(BaseStore):
             await self._db.close()
             self._db = None
             self._initialized = False
+
+    async def abatch(self, ops: list) -> list:
+        results = []
+        for op in ops:
+            if hasattr(op, 'namespace') and hasattr(op, 'key'):
+                if hasattr(op, 'value'):
+                    await self.aput(op.namespace, op.key, op.value)
+                    results.append(None)
+                else:
+                    item = await self.aget(op.namespace, op.key)
+                    results.append(item)
+            else:
+                results.append(None)
+        return results
+
+    def batch(self, ops: list) -> list:
+        raise NotImplementedError("Use abatch for async operations")

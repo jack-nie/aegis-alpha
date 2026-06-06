@@ -43,19 +43,21 @@ async def test_backend_client_get():
     from app.core.tools import ToolBackendClient
     settings = Settings(
         MARKETMIND_LANGCHAIN_API_KEY="test",
+        MARKETMIND_LANGCHAIN_BASE_URL="",
         MARKETMIND_BACKEND_URL="http://localhost:5178",
         MARKETMIND_NODE_EXECUTION_TOKEN="test-token",
     )
     client = ToolBackendClient(settings)
-    with patch.object(client, "_client") as mock_client:
-        mock_response = MagicMock()
-        mock_response.status_code = 200
-        mock_response.json.return_value = {"symbol": "AAPL", "price": 150.0}
-        mock_client_obj = AsyncMock()
-        mock_client_obj.get = AsyncMock(return_value=mock_response)
-        client._client = mock_client_obj
-        result = await client.get("/api/market-data/quote", {"symbol": "AAPL"})
-        assert result["symbol"] == "AAPL"
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.json.return_value = {"symbol": "AAPL", "price": 150.0}
+    mock_http_client = AsyncMock()
+    mock_http_client.get = AsyncMock(return_value=mock_response)
+    mock_http_client.is_closed = False
+    client._client = mock_http_client
+    client._initialized = True
+    result = await client.get("/api/market-data/quote", {"symbol": "AAPL"})
+    assert result["symbol"] == "AAPL"
 
 
 @pytest.mark.asyncio

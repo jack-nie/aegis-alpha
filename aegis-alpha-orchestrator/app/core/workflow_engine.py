@@ -8,9 +8,10 @@ import uuid
 from collections import defaultdict, OrderedDict
 from datetime import datetime, timezone
 from typing import Annotated, Any, AsyncIterator
+from typing_extensions import TypedDict
 
 from langgraph.checkpoint.memory import MemorySaver
-from langgraph.graph import StateGraph, START, END, annotation
+from langgraph.graph import StateGraph, START, END
 from langgraph.prebuilt import ToolNode
 from langgraph.store.base import BaseStore
 
@@ -19,7 +20,7 @@ try:
     HAS_SQLITE_CHECKPOINTER = True
 except ImportError:
     HAS_SQLITE_CHECKPOINTER = False
-from langgraph.types import interrupt, Command
+from langgraph.types import interrupt
 
 from ..models.workflow import Node, Edge, TraceEntry
 from ..models.responses import NodeResult, WorkflowResult, SSEEvent
@@ -45,8 +46,7 @@ def concat_lists(current: list, update: list) -> list:
     return current + update
 
 
-@annotation
-class WorkflowState:
+class WorkflowState(TypedDict):
     final_state: Annotated[dict[str, Any], deep_merge]
     trace: Annotated[list[dict], concat_lists]
     node_outputs: Annotated[dict[str, Any], deep_merge]
