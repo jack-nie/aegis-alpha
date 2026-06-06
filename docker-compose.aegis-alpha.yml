@@ -47,7 +47,7 @@ services:
     ports:
       - "8787:8787"
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8787/health >/dev/null"]
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8787/health')\""]
       interval: 10s
       timeout: 5s
       retries: 12
