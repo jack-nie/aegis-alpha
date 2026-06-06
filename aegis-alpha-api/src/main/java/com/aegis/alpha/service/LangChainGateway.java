@@ -2,6 +2,8 @@ package com.aegis.alpha.service;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.aegis.alpha.domain.AgentTemplate;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpEntity;
@@ -16,6 +18,7 @@ import java.util.Map;
 
 @Service
 public class LangChainGateway {
+    private static final Logger log = LoggerFactory.getLogger(LangChainGateway.class);
     private final RestTemplate restTemplate;
     private final ObjectMapper objectMapper;
     private final boolean enabled;
@@ -44,6 +47,8 @@ public class LangChainGateway {
         this.defaultModel = defaultModel;
         this.apiKey = apiKey;
         this.baseUrl = baseUrl;
+        log.info("[LangChainGateway] enabled={}, engineUrl={}, provider={}, model={}, connectTimeoutMs={}, readTimeoutMs={}",
+                enabled, engineUrl, provider, defaultModel, connectTimeoutMs, readTimeoutMs);
     }
 
     public LangChainGateway(ObjectMapper objectMapper,
@@ -65,6 +70,8 @@ public class LangChainGateway {
             try {
                 return callLangGraph(agent, state, node, subject, "/execute-node");
             } catch (Exception ex) {
+                String handler = handler(node);
+                log.warn("[LangChainGateway] Orchestrator call failed for handler={}, subject={}, error={}", handler, subject, ex.getMessage());
                 return localStructuredNode(agent, state, node, subject, "LangGraph call failed: " + ex.getMessage());
             }
         }
