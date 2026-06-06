@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from typing import Any
+from typing import Any, AsyncIterator
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
@@ -51,11 +51,15 @@ class LLMResponse:
         }
 
 
+_LLM_CLIENT_CACHE_MAX = 10
+
+
 class LLMClient:
     """LLM API client supporting OpenAI-compatible endpoints."""
 
     def __init__(self, config: Settings):
         self._config = config
+        self._client_cache: dict[str, ChatOpenAI] = {}
 
     def _resolve_model(self, requested: str | None = None) -> str:
         """Resolve model name with DeepSeek compatibility."""
@@ -73,7 +77,11 @@ class LLMClient:
     def _build_client(
         self, model: str, temperature: float = 0.2, timeout_ms: int = 25000
     ) -> ChatOpenAI:
-        """Build ChatOpenAI client instance."""
+        """Build ChatOpenAI client instance with caching."""
+        cache_key = f"{model}|{temperature}|{timeout_ms}"
+        if cache_key in self._client_cache:
+            return self._client_cache[cache_key]
+
         kwargs: dict[str, Any] = {
             "api_key": self._config.effective_api_key,
             "model": model,
@@ -84,7 +92,13 @@ class LLMClient:
         base_url = self._config.effective_base_url
         if base_url:
             kwargs["openai_api_base"] = base_url
-        return ChatOpenAI(**kwargs)
+        client = ChatOpenAI(**kwargs)
+
+        if len(self._client_cache) >= _LLM_CLIENT_CACHE_MAX:
+            oldest_key = next(iter(self._client_cache))
+            del self._client_cache[oldest_key]
+        self._client_cache[cache_key] = client
+        return client
 
     async def invoke(
         self,
@@ -94,6 +108,7 @@ class LLMClient:
         model: str | None = None,
         temperature: float = 0.2,
         timeout_ms: int | None = None,
+        tools: list | None = None,
     ) -> LLMResponse:
         """Invoke LLM with system prompt and user message."""
         resolved_model = self._resolve_model(model)
@@ -101,7 +116,9 @@ class LLMClient:
 
         client = self._build_client(resolved_model, temperature, effective_timeout)
 
-        # Build message content
+        if tools:
+            client = client.bind_tools(tools)
+
         user_content = prompt
         if context:
             user_content = f"{prompt}\n\nWorkflow context:\n{context}"
@@ -118,6 +135,36 @@ class LLMClient:
             return self._normalize_content(content, usage)
         except Exception as e:
             logger.error(f"LLM invocation failed: {e}")
+            raise
+
+    async def invoke_stream(
+        self,
+        system: str,
+        prompt: str,
+        context: str = "",
+        model: str | None = None,
+        temperature: float = 0.2,
+        timeout_ms: int | None = None,
+    ) -> AsyncIterator[str]:
+        resolved_model = self._resolve_model(model)
+        effective_timeout = timeout_ms or self._config.timeout_ms
+        client = self._build_client(resolved_model, temperature, effective_timeout)
+
+        user_content = prompt
+        if context:
+            user_content = f"{prompt}\n\nWorkflow context:\n{context}"
+
+        messages = [
+            SystemMessage(content=system),
+            HumanMessage(content=user_content),
+        ]
+
+        try:
+            async for chunk in client.astream(messages):
+                if hasattr(chunk, "content") and chunk.content:
+                    yield chunk.content
+        except Exception as e:
+            logger.error(f"LLM streaming failed: {e}")
             raise
 
     async def classify_intent(

@@ -20,6 +20,18 @@ class MarketDataService:
 
     def __init__(self, config: Settings):
         self._config = config
+        self._client: httpx.AsyncClient | None = None
+
+    async def start(self) -> None:
+        """Initialize the shared HTTP client."""
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.AsyncClient(timeout=self._config.market_data_timeout_ms / 1000)
+
+    async def close(self) -> None:
+        """Close the shared HTTP client."""
+        if self._client is not None and not self._client.is_closed:
+            await self._client.aclose()
+            self._client = None
 
     def should_hydrate(self, handler: str) -> bool:
         """Check if handler needs market data hydration."""
@@ -41,27 +53,26 @@ class MarketDataService:
             return None
 
         backend_url = self._config.effective_backend_url
-        timeout_ms = self._config.market_data_timeout_ms
 
         try:
-            async with httpx.AsyncClient(timeout=timeout_ms / 1000) as client:
-                response = await client.get(
-                    f"{backend_url}/api/market-data/quote",
-                    params={"symbol": ticker},
-                    headers={
-                        "Authorization": f"Bearer {self._config.node_execution_token}",
-                        "X-Node-Id": node.get("id", "unknown"),
-                    },
+            await self.start()
+            response = await self._client.get(
+                f"{backend_url}/api/market-data/quote",
+                params={"symbol": ticker},
+                headers={
+                    "Authorization": f"Bearer {self._config.node_execution_token}",
+                    "X-Node-Id": node.get("id", "unknown"),
+                },
+            )
+            if response.status_code == 200:
+                data = response.json()
+                logger.info(f"Hydrated market data for {ticker}")
+                return data
+            else:
+                logger.warning(
+                    f"Market data fetch failed: {response.status_code}"
                 )
-                if response.status_code == 200:
-                    data = response.json()
-                    logger.info(f"Hydrated market data for {ticker}")
-                    return data
-                else:
-                    logger.warning(
-                        f"Market data fetch failed: {response.status_code}"
-                    )
-                    return {"ok": False, "status": "unavailable", "error": f"HTTP {response.status_code}"}
+                return {"ok": False, "status": "unavailable", "error": f"HTTP {response.status_code}"}
         except Exception as e:
             logger.error(f"Market data hydration error: {e}")
             return {"ok": False, "status": "unavailable", "error": str(e)}

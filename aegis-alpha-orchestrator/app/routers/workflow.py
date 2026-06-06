@@ -5,19 +5,9 @@ from fastapi.responses import StreamingResponse
 
 from ..models.requests import WorkflowRequest, NodeRequest
 from ..models.responses import WorkflowResult, NodeResult
-from ..core.workflow_engine import WorkflowEngine
-from ..core.node_executor import NodeExecutor
-from ..core.llm_client import LLMClient
-from ..core.market_data import MarketDataService
-from ..config import settings
+from ..dependencies import workflow_engine, node_executor
 
 router = APIRouter(tags=["workflow"])
-
-# Dependencies
-_llm_client = LLMClient(settings)
-_market_data = MarketDataService(settings)
-_node_executor = NodeExecutor(settings, _llm_client, _market_data)
-_workflow_engine = WorkflowEngine(_node_executor)
 
 
 @router.post("/stream-workflow")
@@ -26,11 +16,39 @@ async def stream_workflow(request: Request, body: WorkflowRequest):
     import json
 
     async def event_generator():
-        async for event in _workflow_engine.stream_workflow(
+        async for event in workflow_engine.stream_workflow(
             nodes=body.nodes,
             edges=body.edges,
             state=body.state,
             subject=body.subject,
+            require_approval=body.require_approval,
+            thread_id=body.thread_id,
+        ):
+            yield f"event: {event.event}\ndata: {json.dumps(event.data)}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@router.post("/stream-workflow-tokens")
+async def stream_workflow_tokens(request: Request, body: WorkflowRequest):
+    import json
+
+    async def event_generator():
+        async for event in workflow_engine.stream_workflow_tokens(
+            nodes=body.nodes,
+            edges=body.edges,
+            state=body.state,
+            subject=body.subject,
+            require_approval=body.require_approval,
+            thread_id=body.thread_id,
         ):
             yield f"event: {event.event}\ndata: {json.dumps(event.data)}\n\n"
 
@@ -49,11 +67,13 @@ async def stream_workflow(request: Request, body: WorkflowRequest):
 async def execute_workflow(request: Request, body: WorkflowRequest) -> WorkflowResult:
     """Non-streaming workflow execution."""
     try:
-        result = await _workflow_engine.execute_workflow(
+        result = await workflow_engine.execute_workflow(
             nodes=body.nodes,
             edges=body.edges,
             state=body.state,
             subject=body.subject,
+            require_approval=body.require_approval,
+            thread_id=body.thread_id,
         )
         return result
     except Exception as e:
@@ -68,7 +88,7 @@ async def execute_workflow(request: Request, body: WorkflowRequest) -> WorkflowR
 async def execute_node(body: NodeRequest) -> NodeResult:
     """Execute a single workflow node."""
     try:
-        return await _node_executor.execute(
+        return await node_executor.execute(
             node=body.node,
             state=body.state,
             subject=body.subject or "",
@@ -93,7 +113,7 @@ async def execute_node(body: NodeRequest) -> NodeResult:
 async def execute_agent(body: NodeRequest) -> NodeResult:
     """Execute a single agent node."""
     try:
-        result = await _node_executor.execute(
+        result = await node_executor.execute(
             node=body.node,
             state=body.state,
             subject=body.subject or "",
