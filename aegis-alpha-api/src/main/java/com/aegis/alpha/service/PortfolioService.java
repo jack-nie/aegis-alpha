@@ -167,15 +167,15 @@ public class PortfolioService {
 
     private String sourceStatus(String dataCompleteness) {
         if ("NO_PORTFOLIO".equals(dataCompleteness)) {
-            return "组合不存�?;
+            return "组合不存在";
         }
         if ("SEEDED_SUMMARY_ONLY".equals(dataCompleteness)) {
             return "摘要已导入，交易与持仓明细待同步";
         }
         if ("NO_OPEN_POSITIONS".equals(dataCompleteness)) {
-            return "交易明细已同步，当前没有未平仓仓�?;
+            return "交易明细已同步，当前没有未平仓仓位";
         }
-        return "明细已同�?;
+        return "明细已同步";
     }
 
     private int number(Integer value) {

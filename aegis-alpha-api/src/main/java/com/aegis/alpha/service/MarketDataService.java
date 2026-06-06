@@ -779,9 +779,9 @@ public class MarketDataService {
         CHINESE_STOCK_NAMES.put("中国平安", "601318.SH");
         CHINESE_STOCK_NAMES.put("招商银行", "600036.SH");
         CHINESE_STOCK_NAMES.put("宁德时代", "300750.SZ");
-        CHINESE_STOCK_NAMES.put("比亚�?, "002594.SZ");
+        CHINESE_STOCK_NAMES.put("比亚迪", "002594.SZ");
         CHINESE_STOCK_NAMES.put("隆基绿能", "601012.SH");
-        CHINESE_STOCK_NAMES.put("五粮�?, "000858.SZ");
+        CHINESE_STOCK_NAMES.put("五粮液", "000858.SZ");
         CHINESE_STOCK_NAMES.put("美的集团", "000333.SZ");
         CHINESE_STOCK_NAMES.put("中信证券", "600030.SH");
         CHINESE_STOCK_NAMES.put("立讯精密", "002475.SZ");
@@ -793,7 +793,7 @@ public class MarketDataService {
         CHINESE_STOCK_NAMES.put("三一重工", "600031.SH");
         CHINESE_STOCK_NAMES.put("紫金矿业", "601899.SH");
         CHINESE_STOCK_NAMES.put("中国中免", "601888.SH");
-        CHINESE_STOCK_NAMES.put("片仔�?, "600436.SH");
+        CHINESE_STOCK_NAMES.put("片仔癌", "600436.SH");
         CHINESE_STOCK_NAMES.put("生益科技", "600183.SH");
     }
 

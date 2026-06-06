@@ -115,7 +115,7 @@ public class AuditService {
     private String resolveClientIp(HttpServletRequest request) {
         String xff = request.getHeader("X-Forwarded-For");
         if (xff != null && !xff.trim().isEmpty()) {
-            // X-Forwarded-For: client, proxy1, proxy2 â€?take the first one
+            // X-Forwarded-For: client, proxy1, proxy2 â€” take the first one
             String first = xff.split(",")[0].trim();
             if (!first.isEmpty()) {
                 return first;

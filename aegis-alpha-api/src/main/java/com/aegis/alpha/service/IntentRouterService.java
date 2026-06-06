@@ -16,7 +16,7 @@ import java.util.regex.Pattern;
 public class IntentRouterService {
     private static final long CACHE_TTL_MS = 5 * 60 * 1000;
     private static final Pattern STOCK_ANALYSIS_PATTERN =
-            Pattern.compile("分析.{0,20}(?:股票|个股)|(?:股票|个股).{0,10}分析|分析一�?{0,20}");
+            Pattern.compile("分析.{0,20}(?:股票|个股)|(?:股票|个股).{0,10}分析|分析一下.{0,20}");
     private static final Pattern SECTOR_ANALYSIS_PATTERN =
             Pattern.compile("分析.{0,20}(?:板块|行业)|(?:板块|行业).{0,10}分析");
     private static final Pattern TICKER_PATTERN = Pattern.compile("\\b[A-Z]{1,5}(?:[._-][A-Z])?\\b");
