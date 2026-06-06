@@ -105,7 +105,7 @@ class PortfolioServiceTest {
         trade.setQuantity(new BigDecimal("100"));
         trade.setNetAmount(new BigDecimal("15000"));
         trade.setGrossAmount(new BigDecimal("15000"));
-        when(tradeService.findAll("p-1", null)).thenReturn(List.of(trade));
+        when(tradeService.findAll("p-1", null)).thenReturn(Arrays.asList(trade));
 
         Map<String, Object> contract = service.summaryContract("p-1");
 
@@ -137,7 +137,7 @@ class PortfolioServiceTest {
         sell.setNetAmount(new BigDecimal("4500"));
         sell.setGrossAmount(new BigDecimal("4500"));
 
-        when(tradeService.findAll("p-1", null)).thenReturn(List.of(buy, sell));
+        when(tradeService.findAll("p-1", null)).thenReturn(Arrays.asList(buy, sell));
 
         Map<String, Object> contract = service.positionsContract("p-1");
 

@@ -8,6 +8,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.util.*;
+import java.util.AbstractMap.SimpleEntry;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
@@ -25,6 +26,19 @@ class EvidenceServiceTest {
         workflowMapper = mock(WorkflowMapper.class);
         objectMapper = new ObjectMapper();
         service = new EvidenceService(governanceMapper, workflowMapper, objectMapper);
+    }
+
+    @SafeVarargs
+    private static <K, V> Map<K, V> mapOf(Map.Entry<K, V>... entries) {
+        Map<K, V> map = new HashMap<>();
+        for (Map.Entry<K, V> entry : entries) {
+            map.put(entry.getKey(), entry.getValue());
+        }
+        return map;
+    }
+
+    private static <K, V> Map.Entry<K, V> entry(K key, V value) {
+        return new SimpleEntry<>(key, value);
     }
 
     @Test
@@ -60,15 +74,15 @@ class EvidenceServiceTest {
         nodeRun.setNodeRunId("nr-1");
         nodeRun.setNodeName("news_agent");
         nodeRun.setCompletedAt("2026-01-01 12:00:00");
-        String outputJson = objectMapper.writeValueAsString(Map.of(
-                "sources", List.of(
-                        Map.of("sourceType", "sec-filing", "title", "10-K Annual Report", "url", "https://sec.gov/10k"),
-                        Map.of("sourceType", "news", "title", "Market Update", "url", "https://news.example.com")
-                )
+        String outputJson = objectMapper.writeValueAsString(mapOf(
+                entry("sources", Arrays.asList(
+                        mapOf(entry("sourceType", "sec-filing"), entry("title", "10-K Annual Report"), entry("url", "https://sec.gov/10k")),
+                        mapOf(entry("sourceType", "news"), entry("title", "Market Update"), entry("url", "https://news.example.com"))
+                ))
         ));
         nodeRun.setOutputJson(outputJson);
 
-        when(workflowMapper.findNodeRuns("run-1")).thenReturn(List.of(nodeRun));
+        when(workflowMapper.findNodeRuns("run-1")).thenReturn(Arrays.asList(nodeRun));
 
         WorkflowRun run = new WorkflowRun();
         run.setRunId("run-1");
@@ -86,13 +100,13 @@ class EvidenceServiceTest {
         nodeRun.setNodeRunId("nr-1");
         nodeRun.setNodeName("sec_agent");
         nodeRun.setCompletedAt("2026-01-01 12:00:00");
-        String outputJson = objectMapper.writeValueAsString(Map.of(
-                "sources", List.of(
-                        Map.of("sourceType", "sec-filing", "title", "10-K Report")
-                )
+        String outputJson = objectMapper.writeValueAsString(mapOf(
+                entry("sources", Arrays.asList(
+                        mapOf(entry("sourceType", "sec-filing"), entry("title", "10-K Report"))
+                ))
         ));
         nodeRun.setOutputJson(outputJson);
-        when(workflowMapper.findNodeRuns("run-1")).thenReturn(List.of(nodeRun));
+        when(workflowMapper.findNodeRuns("run-1")).thenReturn(Arrays.asList(nodeRun));
 
         WorkflowRun run = new WorkflowRun();
         run.setRunId("run-1");
@@ -110,13 +124,13 @@ class EvidenceServiceTest {
         nodeRun.setNodeRunId("nr-2");
         nodeRun.setNodeName("news_agent");
         nodeRun.setCompletedAt("2026-01-01 12:00:00");
-        String outputJson = objectMapper.writeValueAsString(Map.of(
-                "sources", List.of(
-                        Map.of("sourceType", "rss", "title", "Yahoo Finance News")
-                )
+        String outputJson = objectMapper.writeValueAsString(mapOf(
+                entry("sources", Arrays.asList(
+                        mapOf(entry("sourceType", "rss"), entry("title", "Yahoo Finance News"))
+                ))
         ));
         nodeRun.setOutputJson(outputJson);
-        when(workflowMapper.findNodeRuns("run-2")).thenReturn(List.of(nodeRun));
+        when(workflowMapper.findNodeRuns("run-2")).thenReturn(Arrays.asList(nodeRun));
 
         WorkflowRun run = new WorkflowRun();
         run.setRunId("run-2");
@@ -134,13 +148,13 @@ class EvidenceServiceTest {
         nodeRun.setNodeRunId("nr-3");
         nodeRun.setNodeName("custom_agent");
         nodeRun.setCompletedAt("2026-01-01 12:00:00");
-        String outputJson = objectMapper.writeValueAsString(Map.of(
-                "sources", List.of(
-                        Map.of("sourceType", "internal", "title", "Custom Data")
-                )
+        String outputJson = objectMapper.writeValueAsString(mapOf(
+                entry("sources", Arrays.asList(
+                        mapOf(entry("sourceType", "internal"), entry("title", "Custom Data"))
+                ))
         ));
         nodeRun.setOutputJson(outputJson);
-        when(workflowMapper.findNodeRuns("run-3")).thenReturn(List.of(nodeRun));
+        when(workflowMapper.findNodeRuns("run-3")).thenReturn(Arrays.asList(nodeRun));
 
         WorkflowRun run = new WorkflowRun();
         run.setRunId("run-3");

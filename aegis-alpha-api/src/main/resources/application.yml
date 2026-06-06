@@ -16,8 +16,8 @@ spring:
       force: true
   datasource:
     url: ${AEGIS_ALPHA_DB_URL:jdbc:mysql://127.0.0.1:3306/aegis_alpha?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&useSSL=false&allowPublicKeyRetrieval=true}
-    username: ${AEGIS_ALPHA_DB_USER:aegis}
-    password: ${AEGIS_ALPHA_DB_PASSWORD:aegis_dev}
+    username: ${AEGIS_ALPHA_DB_USER:marketmind}
+    password: ${AEGIS_ALPHA_DB_PASSWORD:marketmind_dev}
     driver-class-name: com.mysql.cj.jdbc.Driver
   sql:
     init:

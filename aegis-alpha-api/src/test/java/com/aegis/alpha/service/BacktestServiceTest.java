@@ -126,9 +126,12 @@ class BacktestServiceTest {
         workflowRun.setRunId("run-4");
         workflowRun.setWorkflowKey("deep_dive");
         workflowRun.setStatus("COMPLETED");
-        workflowRun.setResultJson(objectMapper.writeValueAsString(Map.of(
-                "stock_recommendation", Map.of("summary", "Strong BUY signal", "confidence", 0.9)
-        )));
+        Map<String, Object> recMap = new HashMap<>();
+        recMap.put("summary", "Strong BUY signal");
+        recMap.put("confidence", 0.9);
+        Map<String, Object> resultMap = new HashMap<>();
+        resultMap.put("stock_recommendation", recMap);
+        workflowRun.setResultJson(objectMapper.writeValueAsString(resultMap));
 
         when(mapper.findByWorkflowRunId("run-4")).thenReturn(null);
         when(recommendationService.createFromWorkflowRun(any(), any(), any())).thenReturn(null);

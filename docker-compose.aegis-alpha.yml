@@ -4,7 +4,7 @@ services:
     restart: unless-stopped
     environment:
       MYSQL_DATABASE: ${MYSQL_DATABASE:-aegis_alpha}
-      MYSQL_USER: ${MYSQL_USER:-aegis}
+      MYSQL_USER: ${MYSQL_USER:-marketmind}
       MYSQL_PASSWORD: ${MYSQL_PASSWORD:?Set MYSQL_PASSWORD in .env}
       MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?Set MYSQL_ROOT_PASSWORD in .env}
     ports:
@@ -66,7 +66,7 @@ services:
     environment:
       AEGIS_ALPHA_PORT: ${AEGIS_ALPHA_PORT:-5178}
       AEGIS_ALPHA_DB_URL: ${AEGIS_ALPHA_DB_URL:-jdbc:mysql://mysql:3306/aegis_alpha?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&useSSL=false&allowPublicKeyRetrieval=true}
-      AEGIS_ALPHA_DB_USER: ${AEGIS_ALPHA_DB_USER:-aegis}
+      AEGIS_ALPHA_DB_USER: ${AEGIS_ALPHA_DB_USER:-marketmind}
       AEGIS_ALPHA_DB_PASSWORD: ${AEGIS_ALPHA_DB_PASSWORD:?Set AEGIS_ALPHA_DB_PASSWORD in .env}
       AEGIS_ALPHA_SQL_INIT: ${AEGIS_ALPHA_SQL_INIT:-always}
       AEGIS_ALPHA_REDIS_HOST: ${AEGIS_ALPHA_REDIS_HOST:-redis}

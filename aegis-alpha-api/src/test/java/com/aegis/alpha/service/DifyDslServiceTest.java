@@ -7,6 +7,9 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -25,6 +28,19 @@ class DifyDslServiceTest {
     @BeforeEach
     void setUp() {
         service = new DifyDslService(workflowService, "http://127.0.0.1:5178", "test-token");
+    }
+
+    @SafeVarargs
+    private static <K, V> Map<K, V> mapOf(Map.Entry<K, V>... entries) {
+        Map<K, V> map = new LinkedHashMap<>();
+        for (Map.Entry<K, V> entry : entries) {
+            map.put(entry.getKey(), entry.getValue());
+        }
+        return map;
+    }
+
+    private static <K, V> Map.Entry<K, V> entry(K key, V value) {
+        return new java.util.AbstractMap.SimpleEntry<>(key, value);
     }
 
     @Test
@@ -61,10 +77,10 @@ class DifyDslServiceTest {
         Map<String, Object> startNode = new LinkedHashMap<>();
         startNode.put("id", "start-1");
         startNode.put("type", "start");
-        startNode.put("position", Map.of("x", 100, "y", 200));
-        startNode.put("data", Map.of("title", "Start", "desc", "Entry point"));
-        layout.put("nodes", List.of(startNode));
-        layout.put("edges", List.of());
+        startNode.put("position", mapOf(entry("x", 100), entry("y", 200)));
+        startNode.put("data", mapOf(entry("title", "Start"), entry("desc", "Entry point")));
+        layout.put("nodes", Arrays.asList(startNode));
+        layout.put("edges", Collections.emptyList());
 
         Map<String, Object> result = service.toDifyDsl("test-wf", layout);
 
@@ -98,10 +114,10 @@ class DifyDslServiceTest {
         Map<String, Object> endNode = new LinkedHashMap<>();
         endNode.put("id", "end-1");
         endNode.put("type", "end");
-        endNode.put("position", Map.of("x", 300, "y", 200));
-        endNode.put("data", Map.of("title", "End", "desc", "Exit point"));
-        layout.put("nodes", List.of(endNode));
-        layout.put("edges", List.of());
+        endNode.put("position", mapOf(entry("x", 300), entry("y", 200)));
+        endNode.put("data", mapOf(entry("title", "End"), entry("desc", "Exit point")));
+        layout.put("nodes", Arrays.asList(endNode));
+        layout.put("edges", Collections.emptyList());
 
         Map<String, Object> result = service.toDifyDsl("test-wf", layout);
 
@@ -127,10 +143,10 @@ class DifyDslServiceTest {
         Map<String, Object> node = new LinkedHashMap<>();
         node.put("id", "node-1");
         node.put("type", "function");
-        node.put("position", Map.of("x", 200, "y", 300));
-        node.put("data", Map.of("title", "Fetch Data", "desc", "Calls API", "functionName", "fdb.daily_ohlc"));
-        layout.put("nodes", List.of(node));
-        layout.put("edges", List.of());
+        node.put("position", mapOf(entry("x", 200), entry("y", 300)));
+        node.put("data", mapOf(entry("title", "Fetch Data"), entry("desc", "Calls API"), entry("functionName", "fdb.daily_ohlc")));
+        layout.put("nodes", Arrays.asList(node));
+        layout.put("edges", Collections.emptyList());
 
         Map<String, Object> result = service.toDifyDsl("my-wf", layout);
 
@@ -159,8 +175,8 @@ class DifyDslServiceTest {
         edge.put("id", "e1");
         edge.put("source", "start-1");
         edge.put("target", "end-1");
-        layout.put("nodes", List.of());
-        layout.put("edges", List.of(edge));
+        layout.put("nodes", Collections.emptyList());
+        layout.put("edges", Arrays.asList(edge));
 
         Map<String, Object> result = service.toDifyDsl("test-wf", layout);
 
@@ -181,8 +197,8 @@ class DifyDslServiceTest {
     @Test
     void exportDelegatesToWorkflowService() {
         Map<String, Object> layout = new LinkedHashMap<>();
-        layout.put("nodes", List.of());
-        layout.put("edges", List.of());
+        layout.put("nodes", Collections.emptyList());
+        layout.put("edges", Collections.emptyList());
         when(workflowService.layout("my-wf")).thenReturn(layout);
 
         Map<String, Object> result = service.export("my-wf");
@@ -196,8 +212,8 @@ class DifyDslServiceTest {
     @Test
     void exportIncludesYamlInResult() {
         Map<String, Object> layout = new LinkedHashMap<>();
-        layout.put("nodes", List.of());
-        layout.put("edges", List.of());
+        layout.put("nodes", Collections.emptyList());
+        layout.put("edges", Collections.emptyList());
         when(workflowService.layout("wf-1")).thenReturn(layout);
 
         Map<String, Object> result = service.export("wf-1");
