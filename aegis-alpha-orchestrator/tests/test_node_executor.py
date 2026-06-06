@@ -90,7 +90,7 @@ async def test_execute_start_node(mock_node_executor):
 async def test_execute_mock_mode(mock_settings, mock_llm_client, mock_market_data):
     from app.core.node_executor import NodeExecutor
     from app.config import Settings
-    settings = Settings(MARKETMIND_LANGCHAIN_API_KEY="", MARKETMIND_LANGCHAIN_MOCK=True)
+    settings = Settings(AEGIS_ALPHA_LANGCHAIN_API_KEY="", AEGIS_ALPHA_LANGCHAIN_MOCK=True)
     executor = NodeExecutor(settings, mock_llm_client, mock_market_data)
     node = Node(id="test", data=NodeData(handler="finance.market_analysis", label="Test"))
     result = await executor.execute(node=node, state={}, subject="AAPL")

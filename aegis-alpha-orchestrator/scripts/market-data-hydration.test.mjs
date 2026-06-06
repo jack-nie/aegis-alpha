@@ -12,10 +12,10 @@ try {
     cwd: new URL("..", import.meta.url),
     env: {
       ...process.env,
-      MARKETMIND_LANGGRAPH_PORT: String(langgraphPort),
-      MARKETMIND_BACKEND_URL: backend.url,
-      MARKETMIND_NODE_EXECUTION_TOKEN: "test-node-token",
-      MARKETMIND_LANGCHAIN_MOCK: "false",
+      AEGIS_ALPHA_LANGGRAPH_PORT: String(langgraphPort),
+      AEGIS_ALPHA_BACKEND_URL: backend.url,
+      AEGIS_ALPHA_NODE_EXECUTION_TOKEN: "test-node-token",
+      AEGIS_ALPHA_LANGCHAIN_MOCK: "false",
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -132,7 +132,7 @@ async function startBackendStub() {
       res.end(JSON.stringify({ error: "not found" }));
       return;
     }
-    assert(req.headers["x-marketmind-workflow-token"] === "test-node-token", "missing workflow token header");
+    assert(req.headers["x-aegis-workflow-token"] === "test-node-token", "missing workflow token header");
     let raw = "";
     req.on("data", (chunk) => {
       raw += chunk;

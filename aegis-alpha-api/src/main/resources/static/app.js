@@ -1,5 +1,5 @@
 const API_BASE = "/_backend";
-const TOKEN_KEY = "marketmind_access_token";
+const TOKEN_KEY = "aegis_access_token";
 
 const appState = {
   route: "home",

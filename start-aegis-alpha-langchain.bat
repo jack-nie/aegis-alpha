@@ -6,8 +6,8 @@ cd /d "%~dp0"
 echo [Aegis Alpha] Starting frontend, backend, and LangGraph/LangChain engine...
 echo [Aegis Alpha] Current directory: %CD%
 echo.
-echo [Aegis Alpha] Note: without MARKETMIND_LANGCHAIN_PROVIDER=openai and
-echo [Aegis Alpha] MARKETMIND_LANGCHAIN_API_KEY, the LangGraph engine returns local test output.
+echo [Aegis Alpha] Note: without AEGIS_ALPHA_LANGCHAIN_PROVIDER=openai and
+echo [Aegis Alpha] AEGIS_ALPHA_LANGCHAIN_API_KEY, the LangGraph engine returns local test output.
 echo.
 
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0start-aegis-alpha.ps1" -StartLangGraph %*
