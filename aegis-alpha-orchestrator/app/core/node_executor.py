@@ -6,7 +6,7 @@ import asyncio
 import json
 import logging
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, AsyncIterator
 
 from ..config import Settings
 from ..models.workflow import Node, AgentTemplate
@@ -327,6 +327,74 @@ class NodeExecutor:
             provider=self._config.provider,
             model=self._config.model,
         )
+
+    async def invoke_stream(
+        self,
+        node: Node,
+        state: dict[str, Any],
+        subject: str = "",
+        agent: AgentTemplate | None = None,
+        api_key: str | None = None,
+        base_url: str | None = None,
+        provider: str | None = None,
+        model: str | None = None,
+    ) -> AsyncIterator[str]:
+        """Stream LLM response token by token for aggregate nodes."""
+        effective_api_key = api_key or self._config.effective_api_key
+        effective_provider = provider or self._config.provider
+        if effective_provider not in ("openai", "deepseek"):
+            yield self._mock_result(node, self._resolve_handler(node), subject, state, datetime.now(timezone.utc).isoformat()).content or ""
+            return
+
+        data = node.data
+        handler = self._resolve_handler(node)
+        is_aggregate = handler == "finance.stock_recommendation_aggregate"
+        if not is_aggregate:
+            result = await self.execute(node, state, subject, agent, api_key, base_url, provider, model)
+            yield result.content or result.summary or ""
+            return
+
+        agent_name = (
+            (agent.name if agent else None)
+            or data.label
+            or data.title
+            or "Aegis Alpha Agent"
+        )
+        prompt = (
+            data.prompt
+            or (agent.prompt if agent else None)
+            or PromptManager.get_prompt(handler)
+        ).format(
+            subject=subject,
+            agent_name=agent_name,
+        )
+
+        max_context = 30000
+        full_context = json.dumps(state, ensure_ascii=False, default=str)
+        if len(full_context) <= max_context:
+            context = full_context
+        else:
+            truncated = full_context[:max_context]
+            last_brace = truncated.rfind('}')
+            context = truncated[:last_brace + 1] if last_brace > 0 else truncated
+
+        system = (
+            f"You are {agent_name}. Generate a comprehensive investment research report. "
+            "Use markdown formatting with clear sections. "
+            "Include actual data values from the context. "
+            "Do NOT say 'data insufficient' or 'unable to analyze'."
+        )
+
+        effective_model = model or self._config.model
+        effective_base = base_url or self._config.effective_base_url
+        effective_key = api_key or self._config.effective_api_key
+        timeout_ms = max(self._config.timeout_ms, 60000)
+
+        async for token in self._llm_client.invoke_stream(
+            system=system, prompt=prompt, context=context,
+            model=effective_model, temperature=0.2, timeout_ms=timeout_ms,
+        ):
+            yield token
 
     def _unsupported_provider_result(
         self,

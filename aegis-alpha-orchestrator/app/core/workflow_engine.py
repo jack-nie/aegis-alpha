@@ -20,7 +20,7 @@ try:
     HAS_SQLITE_CHECKPOINTER = True
 except ImportError:
     HAS_SQLITE_CHECKPOINTER = False
-from langgraph.types import interrupt
+from langgraph.types import interrupt, Command
 
 from ..models.workflow import Node, Edge, TraceEntry
 from ..models.responses import NodeResult, WorkflowResult, SSEEvent
@@ -109,6 +109,7 @@ class WorkflowEngine:
         node_ids = {n.id for n in nodes}
         incoming: dict[str, list[str]] = defaultdict(list)
         outgoing: dict[str, list[str]] = defaultdict(list)
+        agent_nodes: list[str] = []
 
         for edge in edges:
             if edge.source in node_ids and edge.target in node_ids:
@@ -117,6 +118,8 @@ class WorkflowEngine:
 
         for node in nodes:
             graph.add_node(node.id, self._make_node_fn(node))
+            if node.data.handler == "general.agent" and self._tool_node:
+                agent_nodes.append(node.id)
 
         if self._tool_node:
             graph.add_node("tools", self._tool_node)
@@ -145,8 +148,39 @@ class WorkflowEngine:
             if not incoming[node.id]:
                 graph.add_edge(START, node.id)
 
+        if agent_nodes and self._tool_node:
+            for agent_id in agent_nodes:
+                def route_to_tools(state: WorkflowState, _agent_id: str = agent_id) -> str:
+                    messages = state.get("messages", [])
+                    last_msg = messages[-1] if messages else None
+                    if last_msg and hasattr(last_msg, "tool_calls") and last_msg.tool_calls:
+                        return "tools"
+                    return _agent_id + "__next"
+                next_nodes = [e.target for e in edges if e.source == _agent_id and e.target in node_ids]
+                if not next_nodes:
+                    next_nodes = [END]
+                routing_map = {"tools": "tools"}
+                for n in next_nodes:
+                    routing_map[n] = n
+                if len(next_nodes) == 1:
+                    graph.add_conditional_edges(
+                        _agent_id,
+                        route_to_tools,
+                        routing_map,
+                    )
+                else:
+                    routing_map[_agent_id + "__next"] = next_nodes[0]
+                    graph.add_conditional_edges(
+                        _agent_id,
+                        route_to_tools,
+                        routing_map,
+                    )
+            graph.add_edge("tools", agent_nodes[0])
+
         for edge in edges:
             if edge.source not in node_ids or edge.target not in node_ids:
+                continue
+            if edge.source in agent_nodes and self._tool_node:
                 continue
 
             target = edge.target
@@ -158,13 +192,21 @@ class WorkflowEngine:
                 def condition_fn(state, cond=condition, tgt=target):
                     field = cond.get("field", "")
                     expected = cond.get("value", "")
+                    else_target = cond.get("else", cond.get("default_target", ""))
                     actual = state.get("final_state", {}).get(field, "")
-                    return tgt if str(actual) == str(expected) else "default"
+                    if str(actual) == str(expected):
+                        return tgt
+                    return else_target if else_target else tgt
+
+                routing = {target: target}
+                else_target = condition.get("else", condition.get("default_target", ""))
+                if else_target and else_target in node_ids and else_target != target:
+                    routing[else_target] = else_target
 
                 graph.add_conditional_edges(
                     edge.source,
                     condition_fn,
-                    {target: target, "default": target},
+                    routing,
                 )
             else:
                 graph.add_edge(edge.source, target)
@@ -173,7 +215,7 @@ class WorkflowEngine:
             graph.add_edge("approval_gate", aggregate_node.id)
 
         for node in nodes:
-            if not outgoing[node.id]:
+            if not outgoing[node.id] and node.id not in agent_nodes:
                 graph.add_edge(node.id, END)
 
         compile_kwargs: dict[str, Any] = {}
@@ -187,12 +229,54 @@ class WorkflowEngine:
 
     def _make_node_fn(self, node: Node):
         """Create async function for a graph node."""
+        handler = node.data.handler or node.data.function_name or "logic"
+        is_agent_with_tools = handler == "general.agent" and bool(self._tools)
 
-        async def node_fn(state: WorkflowState) -> dict:
+        async def node_fn(state: WorkflowState, *, store: BaseStore | None = None) -> dict:
             started_at = datetime.now(timezone.utc).isoformat()
             subject = state.get("subject", "Aegis Alpha workflow")
             node_label = node.data.label or node.data.title or node.id
-            logger.info(f"[THINKING] Workflow node starting: id={node.id} handler={node.data.handler} label={node_label} subject={subject}")
+
+            if store and handler != "start" and handler != "end":
+                try:
+                    ticker = state.get("final_state", {}).get("ticker", "") or state.get("final_state", {}).get("symbol", "")
+                    cache_key = f"{handler}:v2"
+                    if ticker:
+                        cached = await store.aget(("ticker", ticker), cache_key)
+                        if cached and isinstance(cached, dict) and cached.get("value"):
+                            ttl_remaining = cached.get("_ttl_remaining") or cached.get("ttl_remaining")
+                            if ttl_remaining is None or ttl_remaining > 60:
+                                logger.info(f"[THINKING] Cache hit for ticker={ticker} handler={handler}, skipping LLM")
+                                cached_data = cached.get("value", cached)
+                                if isinstance(cached_data, dict):
+                                    result = NodeResult(**{k: v for k, v in cached_data.items() if k in NodeResult.model_fields})
+                                else:
+                                    result = NodeResult(
+                                        ok=True, status="cached", handler=handler,
+                                        node_id=node.id, node_name=node_label,
+                                        subject=subject, summary=str(cached_data)[:200],
+                                        confidence=0.8, provider="cache", model="cache",
+                                    )
+                                trace_entry = {
+                                    "nodeId": result.node_id, "nodeName": result.node_name,
+                                    "handler": result.handler, "status": result.status,
+                                    "ok": result.ok, "degraded": True,
+                                    "startedAt": started_at,
+                                    "completedAt": datetime.now(timezone.utc).isoformat(),
+                                    "durationMs": 0,
+                                }
+                                state_update = {node.id: result.model_dump()}
+                                if result.handler:
+                                    state_update[result.handler] = result.model_dump()
+                                return {
+                                    "final_state": state_update,
+                                    "trace": [trace_entry],
+                                    "node_outputs": {node.id: result.model_dump()},
+                                }
+                except Exception as cache_err:
+                    logger.warning(f"[THINKING] Store read error for node {node.id}: {cache_err}")
+
+            logger.info(f"[THINKING] Workflow node starting: id={node.id} handler={handler} label={node_label} subject={subject}")
 
             try:
                 result = await self._node_executor.execute(
@@ -201,16 +285,11 @@ class WorkflowEngine:
                     subject=subject,
                 )
             except Exception as e:
-                logger.error(f"[THINKING] Workflow node exception: id={node.id} handler={node.data.handler} label={node_label} error={e}")
+                logger.error(f"[THINKING] Workflow node exception: id={node.id} handler={handler} label={node_label} error={e}")
                 result = NodeResult(
-                    ok=False,
-                    status="error",
-                    handler="logic",
-                    node_id=node.id,
-                    node_name=node.id,
-                    subject=subject,
-                    summary=str(e),
-                    duration_ms=0,
+                    ok=False, status="error", handler="logic",
+                    node_id=node.id, node_name=node_label,
+                    subject=subject, summary=str(e), duration_ms=0,
                 )
 
             trace_entry = {
@@ -225,6 +304,20 @@ class WorkflowEngine:
                 "durationMs": result.duration_ms,
             }
             logger.info(f"[THINKING] Workflow node completed: id={node.id} handler={result.handler} label={node_label} status={result.status} ok={result.ok} duration={result.duration_ms}ms")
+
+            if store and handler != "start" and handler != "end":
+                try:
+                    ticker = state.get("final_state", {}).get("ticker", "") or state.get("final_state", {}).get("symbol", "")
+                    cache_key = f"{handler}:v2"
+                    if ticker and result.ok:
+                        await store.aput(
+                            ("ticker", ticker), cache_key,
+                            result.model_dump(),
+                            ttl_seconds=1800,
+                        )
+                        logger.info(f"[THINKING] Cached result for ticker={ticker} handler={handler}")
+                except Exception as cache_err:
+                    logger.warning(f"[THINKING] Store write error for node {node.id}: {cache_err}")
 
             state_update = {node.id: result.model_dump()}
             if result.handler:
@@ -425,10 +518,41 @@ class WorkflowEngine:
             logger.error(f"[THINKING] Workflow token streaming failed: subject={subject} error={e}")
             yield SSEEvent(event="error", data={"ok": False, "error": str(e)})
 
+    async def resume_workflow(
+        self,
+        thread_id: str,
+        resume_value: dict[str, Any] | None = None,
+        nodes: list[Node] | None = None,
+        edges: list[Edge] | None = None,
+    ) -> WorkflowResult:
+        """Resume an interrupted workflow using Command(resume=...)."""
+        if nodes is None or edges is None:
+            return WorkflowResult(ok=False, error="Cannot resume: original workflow layout not available. Provide nodes and edges.")
+
+        graph = self.build_graph(nodes, edges, require_approval=False)
+        config = {"configurable": {"thread_id": thread_id}}
+
+        try:
+            from langgraph.types import Command as LgCommand
+            final_state = await graph.ainvoke(
+                LgCommand(resume=resume_value or {"approved": True}),
+                config=config,
+            )
+            return WorkflowResult(
+                ok=True,
+                final_state=final_state.get("final_state", {}),
+                trace=[TraceEntry(**t) for t in final_state.get("trace", [])],
+                node_outputs=final_state.get("node_outputs", {}),
+                state=final_state.get("final_state", {}),
+            )
+        except Exception as e:
+            logger.error(f"[THINKING] Workflow resume failed: thread_id={thread_id} error={e}")
+            return WorkflowResult(ok=False, error=str(e), final_state={})
+
     @staticmethod
     def topological_sort(nodes: list[Node], edges: list[Edge]) -> list[Node]:
         """Sort nodes in topological order using Kahn's algorithm."""
-        node_map = {n.id: n for n in nodes}
+        node_map = {n.id for n in nodes}
         in_degree: dict[str, int] = {n.id: 0 for n in nodes}
         adjacency: dict[str, list[str]] = defaultdict(list)
 

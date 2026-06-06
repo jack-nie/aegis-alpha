@@ -2,12 +2,39 @@
 
 from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
+from typing import Any
 
 from ..models.requests import WorkflowRequest, NodeRequest
 from ..models.responses import WorkflowResult, NodeResult
 from ..dependencies import workflow_engine, node_executor
 
 router = APIRouter(tags=["workflow"])
+
+
+class ResumeRequest(BaseModel):
+    thread_id: str = Field(..., alias="threadId")
+    resume_value: dict[str, Any] | None = Field(default=None, alias="resumeValue")
+
+    class Config:
+        populate_by_name = True
+
+
+@router.post("/resume-workflow")
+async def resume_workflow(body: ResumeRequest):
+    """Resume a workflow that was interrupted by an approval gate."""
+    try:
+        result = await workflow_engine.resume_workflow(
+            thread_id=body.thread_id,
+            resume_value=body.resume_value or {"approved": True},
+        )
+        return result
+    except Exception as e:
+        return WorkflowResult(
+            ok=False,
+            error=str(e),
+            final_state={},
+        )
 
 
 @router.post("/stream-workflow")
