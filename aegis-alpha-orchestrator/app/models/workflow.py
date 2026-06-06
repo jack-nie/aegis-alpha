@@ -16,8 +16,8 @@ class NodeData(BaseModel):
     node_type: str = Field(default="", alias="nodeType")
     type: str = ""
     prompt: str = ""
-    agent_id: str = Field(default="", alias="agentId")
-    agent_name: str = Field(default="", alias="agentName")
+    agent_id: str | None = Field(default="", alias="agentId")
+    agent_name: str | None = Field(default="", alias="agentName")
 
     class Config:
         extra = "allow"
