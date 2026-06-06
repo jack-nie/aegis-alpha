@@ -12,15 +12,16 @@ class NodeData(BaseModel):
     label: str = ""
     title: str = ""
     handler: str = ""
-    function_name: str = ""
-    node_type: str = ""
+    function_name: str = Field(default="", alias="functionName")
+    node_type: str = Field(default="", alias="nodeType")
     type: str = ""
     prompt: str = ""
-    agent_id: str = ""
-    agent_name: str = ""
+    agent_id: str = Field(default="", alias="agentId")
+    agent_name: str = Field(default="", alias="agentName")
 
     class Config:
         extra = "allow"
+        populate_by_name = True
 
 
 class Node(BaseModel):

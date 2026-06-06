@@ -121,7 +121,9 @@ function renderHome() {
 
 function renderPortfolio(portfolios = []) {
   const rows = portfolios.length
-    ? portfolios.map((portfolio) => `
+    ? portfolios
+        .map(
+          (portfolio) => `
         <tr>
           <td>${escapeHtml(portfolio.name)}</td>
           <td>${formatMoney(portfolio.nav)}</td>
@@ -129,7 +131,9 @@ function renderPortfolio(portfolios = []) {
           <td>${portfolio.assets}</td>
           <td>${escapeHtml(portfolio.updatedAt)}</td>
         </tr>
-      `).join("")
+      `,
+        )
+        .join("")
     : `<tr><td colspan="5" class="muted">还没有组合，请先创建并开始记录资产与交易。</td></tr>`;
 
   return `
@@ -161,9 +165,10 @@ function renderWorkflow(workflows = []) {
         </div>
       </div>
       <div class="grid">
-        ${workflows.map((workflow) => {
-          const key = workflow.workflowKey || workflow.key;
-          return `
+        ${workflows
+          .map((workflow) => {
+            const key = workflow.workflowKey || workflow.key;
+            return `
           <article class="card workflow-card">
             <span class="node-icon">⌘</span>
             <h3>${escapeHtml(workflow.name)}</h3>
@@ -173,7 +178,9 @@ function renderWorkflow(workflows = []) {
               <span>打开流程图</span><span>→</span>
             </button>
           </article>
-        `}).join("")}
+        `;
+          })
+          .join("")}
       </div>
     </section>
   `;
@@ -181,7 +188,9 @@ function renderWorkflow(workflows = []) {
 
 function renderBacktest(runs = []) {
   const rows = runs.length
-    ? runs.map((run) => `
+    ? runs
+        .map(
+          (run) => `
         <tr>
           <td>${escapeHtml(run.runName)}</td>
           <td>${escapeHtml(run.strategy)}</td>
@@ -190,7 +199,9 @@ function renderBacktest(runs = []) {
           <td>${run.sharpe.toFixed(2)}</td>
           <td>${escapeHtml(run.startedAt)}</td>
         </tr>
-      `).join("")
+      `,
+        )
+        .join("")
     : `<tr><td colspan="6" class="muted">暂无回测历史。</td></tr>`;
   return `
     <section>
@@ -275,7 +286,12 @@ function renderData(data) {
       </article>
 
       <section class="grid metrics section">
-        ${Object.entries(data.counts).map(([label, value]) => `<div class="metric"><small>${escapeHtml(label)}</small><strong>${value}</strong></div>`).join("")}
+        ${Object.entries(data.counts)
+          .map(
+            ([label, value]) =>
+              `<div class="metric"><small>${escapeHtml(label)}</small><strong>${value}</strong></div>`,
+          )
+          .join("")}
       </section>
 
       <article class="card section">
@@ -291,12 +307,16 @@ function renderData(data) {
           <p>上涨 ${data.marketBreadth.up} / 下跌 ${data.marketBreadth.down}（上涨占比 ${data.marketBreadth.upRatio}%）</p>
         </div>
         <div class="list">
-          ${data.markets.map((market) => `
+          ${data.markets
+            .map(
+              (market) => `
             <div class="market-row">
               <span>${escapeHtml(market.name)} <span class="muted">(${escapeHtml(market.symbol)})</span></span>
               <span class="${market.changePct < 0 ? "negative" : "positive"}">${formatPct(market.changePct)}</span>
             </div>
-          `).join("")}
+          `,
+            )
+            .join("")}
         </div>
       </article>
 
@@ -344,17 +364,28 @@ function table(headers, rows, signed = false) {
     <table>
       <thead><tr>${headers.map((h) => `<th>${escapeHtml(h)}</th>`).join("")}</tr></thead>
       <tbody>
-        ${rows.map((row) => `
+        ${rows
+          .map(
+            (row) => `
           <tr>
-            ${row.map((cell, index) => {
-              const value = String(cell);
-              const klass = signed && index > 0
-                ? value.startsWith("-") ? "negative" : value.startsWith("+") ? "positive" : "muted"
-                : "";
-              return `<td class="${klass}">${escapeHtml(value)}</td>`;
-            }).join("")}
+            ${row
+              .map((cell, index) => {
+                const value = String(cell);
+                const klass =
+                  signed && index > 0
+                    ? value.startsWith("-")
+                      ? "negative"
+                      : value.startsWith("+")
+                        ? "positive"
+                        : "muted"
+                    : "";
+                return `<td class="${klass}">${escapeHtml(value)}</td>`;
+              })
+              .join("")}
           </tr>
-        `).join("")}
+        `,
+          )
+          .join("")}
       </tbody>
     </table>
   `;
