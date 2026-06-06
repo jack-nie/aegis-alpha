@@ -21,7 +21,7 @@ import java.util.UUID;
 
 @Component
 @Order(1)
-@ConditionalOnProperty(name = "marketmind.seed-enabled", havingValue = "true", matchIfMissing = true)
+@ConditionalOnProperty(name = "aegis.seed-enabled", havingValue = "true", matchIfMissing = true)
 public class ExistingDataSeeder implements CommandLineRunner {
     private final UserMapper userMapper;
     private final WorkflowMapper workflowMapper;
