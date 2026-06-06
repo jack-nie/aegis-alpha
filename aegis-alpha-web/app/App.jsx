@@ -1,6 +1,7 @@
 "use client";
 
 import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Background,
@@ -1056,6 +1057,10 @@ function AICopilot({ setCopilotOpen, api, promptRequest, onPromptHandled }) {
     if (!input.trim() || loading) return;
     const text = input.trim();
     setInput("");
+    requestAnimationFrame(() => {
+      const ta = document.querySelector(".copilot-input");
+      if (ta) ta.style.height = "auto";
+    });
     sendMessage(text);
   };
   const handleSuggestion = (text) => {
@@ -1064,7 +1069,7 @@ function AICopilot({ setCopilotOpen, api, promptRequest, onPromptHandled }) {
   };
 
   return (
-    <div className="flex w-96 flex-shrink-0 flex-col border-l border-gray-200 bg-white shadow-lg">
+    <div className="flex w-[36rem] flex-shrink-0 flex-col border-l border-gray-200 bg-white shadow-lg">
       <div className="flex h-14 items-center justify-between border-b border-gray-200 px-4">
         <div className="flex items-center gap-2">
           <Icon name="bolt" className="h-5 w-5 text-blue-600" />
@@ -1087,6 +1092,7 @@ function AICopilot({ setCopilotOpen, api, promptRequest, onPromptHandled }) {
             >
               <div className="chat-markdown text-sm leading-relaxed">
                 <ReactMarkdown
+                  remarkPlugins={[remarkGfm]}
                   components={{
                     h1: ({ children }) => (
                       <h1 className="mb-2 mt-4 border-b border-gray-200 pb-1 text-lg font-bold text-gray-900">
@@ -1094,49 +1100,78 @@ function AICopilot({ setCopilotOpen, api, promptRequest, onPromptHandled }) {
                       </h1>
                     ),
                     h2: ({ children }) => (
-                      <h2 className="mb-1.5 mt-3 flex items-center gap-1 text-base font-bold text-gray-800">
-                        {children}
-                      </h2>
+                      <h2 className="mb-1.5 mt-3 text-base font-bold text-gray-800">{children}</h2>
                     ),
                     h3: ({ children }) => <h3 className="mb-1 mt-2 text-sm font-semibold text-gray-700">{children}</h3>,
                     p: ({ children }) => <p className="my-1 text-gray-700">{children}</p>,
-                    ul: ({ children }) => <ul className="my-1 ml-4 list-disc space-y-0.5">{children}</ul>,
+                    ul: ({ children, ordered }) => (
+                      <ul className={`my-1 ml-4 space-y-0.5 ${ordered ? "list-decimal" : "list-disc"}`}>{children}</ul>
+                    ),
                     ol: ({ children }) => <ol className="my-1 ml-4 list-decimal space-y-0.5">{children}</ol>,
-                    li: ({ children }) => <li className="text-gray-700">{children}</li>,
+                    li: ({ children, checked }) => {
+                      if (checked !== null && checked !== undefined) {
+                        return (
+                          <li className="flex items-start gap-2 text-gray-700">
+                            <input
+                              type="checkbox"
+                              checked={checked}
+                              readOnly
+                              className="mt-1 h-3.5 w-3.5 flex-shrink-0 rounded border-gray-300"
+                            />
+                            <span className={checked ? "text-gray-400 line-through" : ""}>{children}</span>
+                          </li>
+                        );
+                      }
+                      return <li className="text-gray-700">{children}</li>;
+                    },
                     strong: ({ children }) => <strong className="font-semibold text-gray-900">{children}</strong>,
+                    em: ({ children }) => <em className="italic text-gray-600">{children}</em>,
                     blockquote: ({ children }) => (
                       <blockquote className="my-2 rounded-lg border-l-4 border-blue-400 bg-blue-50 px-3 py-2 text-xs text-blue-800">
                         {children}
                       </blockquote>
                     ),
                     table: ({ children }) => (
-                      <div className="my-2 overflow-x-auto rounded-lg border border-gray-200">
+                      <div className="my-3 overflow-x-auto rounded-xl border border-gray-200 shadow-sm">
                         <table className="w-full text-xs">{children}</table>
                       </div>
                     ),
-                    thead: ({ children }) => <thead className="bg-gray-50">{children}</thead>,
+                    thead: ({ children }) => <thead className="bg-gradient-to-r from-gray-50 to-gray-100">{children}</thead>,
                     th: ({ children }) => (
-                      <th className="border-b border-gray-200 px-3 py-1.5 text-left font-semibold text-gray-700">
+                      <th className="border-b-2 border-gray-200 px-3 py-2 text-left text-xs font-bold uppercase tracking-wider text-gray-600">
                         {children}
                       </th>
                     ),
                     td: ({ children }) => (
-                      <td className="border-b border-gray-100 px-3 py-1.5 text-gray-600">{children}</td>
+                      <td className="border-b border-gray-100 px-3 py-2 text-gray-600">{children}</td>
                     ),
-                    tr: ({ children }) => {
-                      return <tr className="even:bg-gray-50/50">{children}</tr>;
-                    },
-                    code: ({ inline, children }) => {
+                    tr: ({ children, isHeader }) => (
+                      <tr className={`${isHeader ? "" : "even:bg-blue-50/30 hover:bg-gray-50/60"} transition-colors`}>
+                        {children}
+                      </tr>
+                    ),
+                    code: ({ inline, className, children }) => {
+                      const match = /language-(\w+)/.exec(className || "");
+                      const lang = match ? match[1] : "";
                       if (inline)
                         return (
-                          <code className="rounded bg-slate-100 px-1 py-0.5 font-mono text-xs text-blue-700">
+                          <code className="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-xs text-blue-700">
                             {children}
                           </code>
                         );
                       return (
-                        <code className="block overflow-x-auto rounded-lg bg-slate-900 p-3 font-mono text-xs text-slate-100">
-                          {children}
-                        </code>
+                        <div className="my-2 rounded-xl border border-slate-700 shadow-sm">
+                          {lang && (
+                            <div className="flex items-center justify-between border-b border-slate-700 bg-slate-800 px-3 py-1.5">
+                              <span className="font-mono text-[10px] font-medium uppercase tracking-wider text-slate-400">
+                                {lang}
+                              </span>
+                            </div>
+                          )}
+                          <pre className="overflow-x-auto bg-slate-900 p-3">
+                            <code className="font-mono text-xs leading-relaxed text-slate-100">{children}</code>
+                          </pre>
+                        </div>
                       );
                     },
                     hr: () => <hr className="my-3 border-gray-200" />,
@@ -1145,10 +1180,13 @@ function AICopilot({ setCopilotOpen, api, promptRequest, onPromptHandled }) {
                         href={href}
                         target="_blank"
                         rel="noopener noreferrer"
-                        className="text-blue-600 underline hover:text-blue-800"
+                        className="text-blue-600 underline decoration-blue-300 underline-offset-2 hover:text-blue-800 hover:decoration-blue-500"
                       >
                         {children}
                       </a>
+                    ),
+                    img: ({ src, alt }) => (
+                      <img src={src} alt={alt} className="my-2 max-w-full rounded-lg border border-gray-200 shadow-sm" />
                     ),
                   }}
                 >
@@ -1197,18 +1235,22 @@ function AICopilot({ setCopilotOpen, api, promptRequest, onPromptHandled }) {
       </div>
       <div className="border-t border-gray-200 bg-white p-4">
         <div className="flex gap-2">
-          <input
-            type="text"
+          <textarea
             value={input}
-            onChange={(e) => setInput(e.target.value)}
+            onChange={(e) => {
+              setInput(e.target.value);
+              e.target.style.height = "auto";
+              e.target.style.height = Math.min(e.target.scrollHeight, 120) + "px";
+            }}
             onKeyDown={(e) => {
               if (e.key === "Enter" && !e.shiftKey) {
                 e.preventDefault();
                 handleSend();
               }
             }}
-            placeholder="输入你的问题..."
-            className="flex-1 rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500"
+            placeholder="输入你的问题... (Shift+Enter 换行)"
+            rows={1}
+            className="copilot-input flex-1 resize-none rounded-lg border border-gray-300 px-3 py-2 text-sm leading-relaxed focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500"
           />
           <button
             type="button"
