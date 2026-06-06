@@ -18,19 +18,19 @@ def test_effective_api_key(mock_settings):
 
 def test_effective_base_url_no_override():
     from app.config import Settings
-    s = Settings(MARKETMIND_LANGCHAIN_API_KEY="test", MARKETMIND_LANGCHAIN_BASE_URL="", OPENAI_BASE_URL="")
+    s = Settings(AEGIS_ALPHA_LANGCHAIN_API_KEY="test", AEGIS_ALPHA_LANGCHAIN_BASE_URL="", OPENAI_BASE_URL="")
     assert s.effective_base_url == ""
 
 
 def test_effective_api_key_fallback():
     from app.config import Settings
-    s = Settings(MARKETMIND_LANGCHAIN_API_KEY="", OPENAI_API_KEY="openai-fallback")
+    s = Settings(AEGIS_ALPHA_LANGCHAIN_API_KEY="", OPENAI_API_KEY="openai-fallback")
     assert s.effective_api_key == "openai-fallback"
 
 
 def test_is_mock_mode_no_api_key():
     from app.config import Settings
-    s = Settings(MARKETMIND_LANGCHAIN_API_KEY="", OPENAI_API_KEY="")
+    s = Settings(AEGIS_ALPHA_LANGCHAIN_API_KEY="", OPENAI_API_KEY="")
     assert s.is_mock_mode is True
 
 
@@ -48,14 +48,14 @@ def test_store_ttl_config(mock_settings):
 
 def test_effective_backend_url():
     from app.config import Settings
-    s = Settings(MARKETMIND_BACKEND_URL="http://localhost:5178")
+    s = Settings(AEGIS_ALPHA_BACKEND_URL="http://localhost:5178")
     assert s.effective_backend_url == "http://localhost:5178"
 
 
 def test_effective_backend_url_with_callback():
     from app.config import Settings
     s = Settings(
-        MARKETMIND_BACKEND_URL="http://localhost:5178",
-        MARKETMIND_NODE_CALLBACK_BASE_URL="http://backend:5178",
+        AEGIS_ALPHA_BACKEND_URL="http://localhost:5178",
+        AEGIS_ALPHA_NODE_CALLBACK_BASE_URL="http://backend:5178",
     )
     assert s.effective_backend_url == "http://backend:5178"

@@ -3,7 +3,7 @@ import { spawn } from "node:child_process";
 import { once } from "node:events";
 
 let serverProcess = null;
-const externalBaseUrl = process.env.MARKETMIND_LANGGRAPH_URL;
+const externalBaseUrl = process.env.AEGIS_ALPHA_LANGGRAPH_URL;
 const port = externalBaseUrl ? Number(new URL(externalBaseUrl).port || 80) : await getFreePort();
 const baseUrl = externalBaseUrl || `http://127.0.0.1:${port}`;
 
@@ -12,8 +12,8 @@ if (!externalBaseUrl) {
     cwd: new URL("..", import.meta.url),
     env: {
       ...process.env,
-      MARKETMIND_LANGGRAPH_PORT: String(port),
-      MARKETMIND_LANGCHAIN_MOCK: "",
+      AEGIS_ALPHA_LANGGRAPH_PORT: String(port),
+      AEGIS_ALPHA_LANGCHAIN_MOCK: "",
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -179,7 +179,7 @@ const copilotResult = await request("/execute-node", {
     apiKey: "",
     subject: "copilot chat",
     node: {
-      id: "marketmind-copilot",
+      id: "aegis-copilot",
       data: {
         label: "Aegis Alpha Copilot",
         handler: "general.agent",
@@ -203,7 +203,7 @@ const copilotFallback = await request("/execute-node", {
     model: "deepseek-v4-flash",
     subject: "copilot chat",
     node: {
-      id: "marketmind-copilot",
+      id: "aegis-copilot",
       data: {
         label: "Aegis Alpha Copilot",
         handler: "general.agent",

@@ -6,7 +6,7 @@ import asyncio
 import json
 import logging
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, AsyncIterator
 
 from ..config import Settings
 from ..models.workflow import Node, AgentTemplate
@@ -67,8 +67,9 @@ class NodeExecutor:
         started_at = datetime.now(timezone.utc).isoformat()
         handler = self._resolve_handler(node)
         node_type = self._resolve_node_type(node)
+        node_label = node.data.label or node.data.title or node.id
+        logger.info(f"[THINKING] Node started: id={node.id} handler={handler} label={node_label} subject={subject}")
 
-        # Check provider support
         effective_provider = provider or self._config.provider
         if effective_provider not in ("openai", "deepseek"):
             return self._unsupported_provider_result(node, handler, subject, started_at)
@@ -78,11 +79,13 @@ class NodeExecutor:
         is_mock = self._config.is_mock_mode and not effective_api_key
 
         if is_mock or self._is_control_flow(handler, node_type):
-            return self._mock_result(node, handler, subject, state, started_at)
+            result = self._mock_result(node, handler, subject, state, started_at)
+            logger.info(f"[THINKING] Node mock/control: id={node.id} handler={handler} label={node_label} status={result.status}")
+            return result
 
-        # Hydrate market data
         market_context = await self._market_data.hydrate(handler, state, subject, node.model_dump())
         if market_context:
+            logger.info(f"[THINKING] Market data hydrated for node id={node.id} handler={handler} data_keys={list(market_context.keys())}")
             state = {**state, "marketDataContext": market_context}
 
         # Invoke LLM with retry
@@ -90,7 +93,7 @@ class NodeExecutor:
         last_error = None
         for attempt in range(max_retries + 1):
             try:
-                return await self._invoke_llm(
+                result = await self._invoke_llm(
                     node=node,
                     handler=handler,
                     state=state,
@@ -101,17 +104,20 @@ class NodeExecutor:
                     model=model,
                     started_at=started_at,
                 )
+                logger.info(f"[THINKING] Node invoke succeeded: id={node.id} handler={handler} attempt={attempt + 1}")
+                return result
             except Exception as e:
                 last_error = e
                 if not self._is_retryable(e):
+                    logger.warning(f"[THINKING] Node invoke failed (non-retryable): id={node.id} handler={handler} error={e}")
                     break
                 if attempt < max_retries:
                     delay = 2 ** attempt
-                    logger.warning(f"Node {node.id} LLM call failed (attempt {attempt + 1}/{max_retries + 1}), retrying in {delay}s: {e}")
+                    logger.warning(f"[THINKING] Node {node.id} LLM call failed (attempt {attempt + 1}/{max_retries + 1}), retrying in {delay}s: {e}")
                     await asyncio.sleep(delay)
 
-        logger.error(f"Node {node.id} execution failed after {max_retries + 1} attempts: {last_error}")
-        return self._fallback_result(node, handler, subject, state, started_at, str(last_error))
+        logger.error(f"[THINKING] Node execution failed after all retries: id={node.id} handler={handler} label={node_label} error={last_error}")
+        fallback = self._fallback_result(node, handler, subject, state, started_at, str(last_error))
 
     @staticmethod
     def _normalize_signal(s) -> dict:
@@ -220,6 +226,8 @@ class NodeExecutor:
         )
 
         duration_ms = int((datetime.now(timezone.utc) - datetime.fromisoformat(started_at)).total_seconds() * 1000)
+        logger.info(f"[THINKING] Node completed: id={node.id} handler={handler} label={node_label} duration={duration_ms}ms status=completed confidence={response.confidence}")
+        logger.info(f"[THINKING] Node output: id={node.id} summary={response.summary[:200] if response.summary else 'N/A'}")
 
         return NodeResult(
             ok=True,
@@ -319,6 +327,74 @@ class NodeExecutor:
             provider=self._config.provider,
             model=self._config.model,
         )
+
+    async def invoke_stream(
+        self,
+        node: Node,
+        state: dict[str, Any],
+        subject: str = "",
+        agent: AgentTemplate | None = None,
+        api_key: str | None = None,
+        base_url: str | None = None,
+        provider: str | None = None,
+        model: str | None = None,
+    ) -> AsyncIterator[str]:
+        """Stream LLM response token by token for aggregate nodes."""
+        effective_api_key = api_key or self._config.effective_api_key
+        effective_provider = provider or self._config.provider
+        if effective_provider not in ("openai", "deepseek"):
+            yield self._mock_result(node, self._resolve_handler(node), subject, state, datetime.now(timezone.utc).isoformat()).content or ""
+            return
+
+        data = node.data
+        handler = self._resolve_handler(node)
+        is_aggregate = handler == "finance.stock_recommendation_aggregate"
+        if not is_aggregate:
+            result = await self.execute(node, state, subject, agent, api_key, base_url, provider, model)
+            yield result.content or result.summary or ""
+            return
+
+        agent_name = (
+            (agent.name if agent else None)
+            or data.label
+            or data.title
+            or "Aegis Alpha Agent"
+        )
+        prompt = (
+            data.prompt
+            or (agent.prompt if agent else None)
+            or PromptManager.get_prompt(handler)
+        ).format(
+            subject=subject,
+            agent_name=agent_name,
+        )
+
+        max_context = 30000
+        full_context = json.dumps(state, ensure_ascii=False, default=str)
+        if len(full_context) <= max_context:
+            context = full_context
+        else:
+            truncated = full_context[:max_context]
+            last_brace = truncated.rfind('}')
+            context = truncated[:last_brace + 1] if last_brace > 0 else truncated
+
+        system = (
+            f"You are {agent_name}. Generate a comprehensive investment research report. "
+            "Use markdown formatting with clear sections. "
+            "Include actual data values from the context. "
+            "Do NOT say 'data insufficient' or 'unable to analyze'."
+        )
+
+        effective_model = model or self._config.model
+        effective_base = base_url or self._config.effective_base_url
+        effective_key = api_key or self._config.effective_api_key
+        timeout_ms = max(self._config.timeout_ms, 60000)
+
+        async for token in self._llm_client.invoke_stream(
+            system=system, prompt=prompt, context=context,
+            model=effective_model, temperature=0.2, timeout_ms=timeout_ms,
+        ):
+            yield token
 
     def _unsupported_provider_result(
         self,

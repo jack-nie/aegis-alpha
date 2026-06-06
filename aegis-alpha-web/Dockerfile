@@ -7,15 +7,15 @@ RUN npm ci
 
 FROM node:22-alpine AS build
 WORKDIR /app
-ARG MARKETMIND_BACKEND_INTERNAL_URL=http://backend:5178
-ENV MARKETMIND_BACKEND_INTERNAL_URL=${MARKETMIND_BACKEND_INTERNAL_URL}
+ARG AEGIS_ALPHA_BACKEND_INTERNAL_URL=http://backend:5178
+ENV AEGIS_ALPHA_BACKEND_INTERNAL_URL=${AEGIS_ALPHA_BACKEND_INTERNAL_URL}
 
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 
 # Container-only adaptation: the current source rewrite points at 127.0.0.1.
 # Build the image with the service DNS name used by docker-compose.
-RUN node -e "const fs=require('fs'); const p='next.config.mjs'; const s=fs.readFileSync(p,'utf8'); fs.writeFileSync(p, s.replace('http://127.0.0.1:5178', process.env.MARKETMIND_BACKEND_INTERNAL_URL));"
+RUN node -e "const fs=require('fs'); const p='next.config.mjs'; const s=fs.readFileSync(p,'utf8'); fs.writeFileSync(p, s.replace('http://127.0.0.1:5178', process.env.AEGIS_ALPHA_BACKEND_INTERNAL_URL));"
 RUN npm run build
 
 FROM node:22-alpine AS runtime

@@ -11,9 +11,9 @@ async def memory_mgr():
     from app.core.memory_store import MemoryStoreManager
     with tempfile.TemporaryDirectory() as tmpdir:
         settings = Settings(
-            MARKETMIND_LANGCHAIN_API_KEY="test",
-            MARKETMIND_DATA_DIR=tmpdir,
-            MARKETMIND_STORE_TTL_SECONDS=3600,
+            AEGIS_ALPHA_LANGCHAIN_API_KEY="test",
+            AEGIS_ALPHA_DATA_DIR=tmpdir,
+            AEGIS_ALPHA_STORE_TTL_SECONDS=3600,
         )
         mgr = MemoryStoreManager(settings)
         await mgr.initialize()

@@ -9,14 +9,34 @@ from typing import Any, AsyncIterator
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
+from pydantic import BaseModel, Field
 
 from ..config import Settings
 
 logger = logging.getLogger(__name__)
 
-# DeepSeek model constants
 DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-flash"
 SUPPORTED_DEEPSEEK_MODELS = {"deepseek-v4-pro", "deepseek-v4-flash"}
+
+
+class SignalModel(BaseModel):
+    name: str = Field(default="", description="Signal name")
+    value: str = Field(default="", description="Signal value")
+    weight: float = Field(default=0.5, description="Signal weight 0-1")
+
+
+class SourceModel(BaseModel):
+    title: str = Field(default="", description="Source title")
+    url: str = Field(default="", description="Source URL")
+    type: str = Field(default="llm", description="Source type")
+
+
+class AnalystResult(BaseModel):
+    summary: str = Field(default="", description="Analysis summary")
+    signals: list[SignalModel] = Field(default_factory=list, description="Trading signals")
+    sources: list[SourceModel] = Field(default_factory=list, description="Data sources")
+    confidence: float = Field(default=0.5, ge=0.0, le=1.0, description="Confidence score 0-1")
+    data: dict[str, Any] = Field(default_factory=dict, description="Structured analysis data")
 
 
 class LLMResponse:
@@ -129,9 +149,40 @@ class LLMClient:
         ]
 
         try:
+            use_structured = tools is None and not is_aggregate_handler(system)
+            if use_structured:
+                try:
+                    structured_llm = client.with_structured_output(AnalystResult)
+                    response = await structured_llm.ainvoke(messages)
+                    if isinstance(response, AnalystResult):
+                        return LLMResponse(
+                            summary=response.summary,
+                            signals=[s.model_dump() for s in response.signals],
+                            sources=[s.model_dump() for s in response.sources],
+                            confidence=self._clamp_confidence(response.confidence),
+                            data=response.data,
+                            content=response.summary,
+                        )
+                except Exception as struct_err:
+                    logger.warning(f"Structured output failed, falling back to text parsing: {struct_err}")
+
             response = await client.ainvoke(messages)
             content = response.content if hasattr(response, "content") else str(response)
             usage = getattr(response, "usage_metadata", None)
+
+            if tools and hasattr(response, "tool_calls") and response.tool_calls:
+                tool_messages = []
+                for tc in response.tool_calls:
+                    tool_messages.append({
+                        "role": "assistant",
+                        "tool_calls": [tc],
+                    })
+                return LLMResponse(
+                    summary=f"Called tool: {tc.get('name', 'unknown')}",
+                    content=str(response.content) if response.content else "",
+                    data={"tool_calls": tool_messages},
+                )
+
             return self._normalize_content(content, usage)
         except Exception as e:
             logger.error(f"LLM invocation failed: {e}")
@@ -274,3 +325,10 @@ class LLMClient:
             return max(0.0, min(1.0, float(value)))
         except (TypeError, ValueError):
             return 0.5
+
+    @staticmethod
+    def _is_aggregate_handler(system_prompt: str) -> bool:
+        """Check if the system prompt is for an aggregate/recommendation handler."""
+        aggregate_keywords = ["stock_recommendation_aggregate", "comprehensive investment research report", "aggregate"]
+        lower = (system_prompt or "").lower()
+        return any(kw in lower for kw in aggregate_keywords)

@@ -8,7 +8,7 @@ Aegis Alpha Platform is an enterprise-style investment research and agent workfl
 - `aegis-alpha-web` - Next.js web application.
 - `aegis-alpha-orchestrator` - Node/LangGraph execution engine.
 
-The runtime still accepts existing `MARKETMIND_*` environment variables for compatibility with earlier local configuration.
+The runtime still accepts existing `AEGIS_ALPHA_*` environment variables for compatibility with earlier local configuration.
 
 ## Local Start
 
