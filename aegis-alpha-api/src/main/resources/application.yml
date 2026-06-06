@@ -44,6 +44,8 @@ aegis:
     model: ${AEGIS_ALPHA_LANGCHAIN_MODEL:deepseek-v4-flash}
     api-key: ${AEGIS_ALPHA_LANGCHAIN_API_KEY:${OPENAI_API_KEY:}}
     base-url: ${AEGIS_ALPHA_LANGCHAIN_BASE_URL:${OPENAI_BASE_URL:}}
+    connect-timeout-ms: ${AEGIS_ALPHA_LANGCHAIN_CONNECT_TIMEOUT_MS:5000}
+    read-timeout-ms: ${AEGIS_ALPHA_LANGCHAIN_READ_TIMEOUT_MS:90000}
   dify:
     enabled: ${AEGIS_ALPHA_DIFY_ENABLED:false}
     base-url: ${AEGIS_ALPHA_DIFY_BASE_URL:https://api.dify.ai/v1}
