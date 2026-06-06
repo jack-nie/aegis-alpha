@@ -19,5 +19,10 @@ patch_*.py
 apply_fix.py
 _p.py
 
+# Python
+.venv/
+__pycache__/
+*.pyc
+
 # Local config
 application-local.yml

@@ -1,0 +1,229 @@
+"""LLM API client with OpenAI-compatible interface."""
+
+from __future__ import annotations
+
+import json
+import logging
+import re
+from typing import Any
+
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_openai import ChatOpenAI
+
+from ..config import Settings
+
+logger = logging.getLogger(__name__)
+
+# DeepSeek model constants
+DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-flash"
+SUPPORTED_DEEPSEEK_MODELS = {"deepseek-v4-pro", "deepseek-v4-flash"}
+
+
+class LLMResponse:
+    """Normalized LLM response."""
+
+    def __init__(
+        self,
+        summary: str = "",
+        signals: list[dict] | None = None,
+        sources: list[dict] | None = None,
+        confidence: float = 0.5,
+        data: dict | None = None,
+        content: str = "",
+        raw: Any = None,
+    ):
+        self.summary = summary
+        self.signals = signals or []
+        self.sources = sources or []
+        self.confidence = confidence
+        self.data = data or {}
+        self.content = content or summary
+        self.raw = raw
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "summary": self.summary,
+            "signals": self.signals,
+            "sources": self.sources,
+            "confidence": self.confidence,
+            "data": self.data,
+            "content": self.content,
+        }
+
+
+class LLMClient:
+    """LLM API client supporting OpenAI-compatible endpoints."""
+
+    def __init__(self, config: Settings):
+        self._config = config
+
+    def _resolve_model(self, requested: str | None = None) -> str:
+        """Resolve model name with DeepSeek compatibility."""
+        requested = requested or self._config.model
+        base_url = self._config.effective_base_url
+
+        if self._uses_deepseek_endpoint(base_url) and requested not in SUPPORTED_DEEPSEEK_MODELS:
+            return DEFAULT_DEEPSEEK_MODEL
+        return requested
+
+    def _uses_deepseek_endpoint(self, base_url: str) -> bool:
+        """Check if using DeepSeek-compatible endpoint."""
+        return "deepseek" in (base_url or "").lower()
+
+    def _build_client(
+        self, model: str, temperature: float = 0.2, timeout_ms: int = 25000
+    ) -> ChatOpenAI:
+        """Build ChatOpenAI client instance."""
+        kwargs: dict[str, Any] = {
+            "api_key": self._config.effective_api_key,
+            "model": model,
+            "temperature": temperature,
+            "timeout": timeout_ms / 1000,
+            "max_retries": 0,
+        }
+        base_url = self._config.effective_base_url
+        if base_url:
+            kwargs["openai_api_base"] = base_url
+        return ChatOpenAI(**kwargs)
+
+    async def invoke(
+        self,
+        system: str,
+        prompt: str,
+        context: str = "",
+        model: str | None = None,
+        temperature: float = 0.2,
+        timeout_ms: int | None = None,
+    ) -> LLMResponse:
+        """Invoke LLM with system prompt and user message."""
+        resolved_model = self._resolve_model(model)
+        effective_timeout = timeout_ms or self._config.timeout_ms
+
+        client = self._build_client(resolved_model, temperature, effective_timeout)
+
+        # Build message content
+        user_content = prompt
+        if context:
+            user_content = f"{prompt}\n\nWorkflow context:\n{context}"
+
+        messages = [
+            SystemMessage(content=system),
+            HumanMessage(content=user_content),
+        ]
+
+        try:
+            response = await client.ainvoke(messages)
+            content = response.content if hasattr(response, "content") else str(response)
+            usage = getattr(response, "usage_metadata", None)
+            return self._normalize_content(content, usage)
+        except Exception as e:
+            logger.error(f"LLM invocation failed: {e}")
+            raise
+
+    async def classify_intent(
+        self, message: str, tools: list[dict[str, Any]]
+    ) -> dict[str, Any] | None:
+        """Classify intent using function calling."""
+        resolved_model = self._resolve_model()
+        client = self._build_client(resolved_model, temperature=0, timeout_ms=5000)
+
+        messages = [
+            SystemMessage(
+                content=(
+                    "You are an intent classifier. Based on the user message, call exactly ONE "
+                    "function that best matches the user's intent. If no function matches, do not "
+                    "call any function. Always respond with a function call or empty response."
+                )
+            ),
+            HumanMessage(content=message),
+        ]
+
+        try:
+            response = await client.ainvoke(
+                messages, tools=tools, tool_choice="auto"
+            )
+            tool_calls = getattr(response, "additional_kwargs", {}).get("tool_calls", [])
+            if tool_calls:
+                call = tool_calls[0]
+                fn = call.get("function", {})
+                args = json.loads(fn.get("arguments", "{}"))
+                return {
+                    "function": fn.get("name", ""),
+                    "ticker": args.get("ticker", ""),
+                }
+            return None
+        except Exception as e:
+            logger.error(f"Intent classification failed: {e}")
+            return None
+
+    def _normalize_content(self, content: str, usage: Any = None) -> LLMResponse:
+        """Normalize LLM response content to structured format."""
+        if not content:
+            return LLMResponse(summary="No response from LLM")
+
+        # Strip markdown code fences
+        cleaned = content.strip()
+        if cleaned.startswith("```"):
+            lines = cleaned.split("\n")
+            lines = lines[1:]  # Remove opening fence
+            if lines and lines[-1].strip() == "```":
+                lines = lines[:-1]
+            cleaned = "\n".join(lines).strip()
+
+        # Try direct JSON parse
+        try:
+            data = json.loads(cleaned)
+            return self._dict_to_response(data, content)
+        except json.JSONDecodeError:
+            pass
+
+        # Check if it's a markdown report
+        if self._is_markdown_report(cleaned):
+            return LLMResponse(
+                summary=cleaned[:2000],
+                content=cleaned,
+                confidence=0.75,
+            )
+
+        # Try extracting embedded JSON
+        match = re.search(r'\{[\s\S]*"summary"[\s\S]*\}', cleaned)
+        if match:
+            try:
+                data = json.loads(match.group())
+                return self._dict_to_response(data, content)
+            except json.JSONDecodeError:
+                pass
+
+        # Fallback to plain text
+        return LLMResponse(
+            summary=cleaned[:2000],
+            content=cleaned,
+            confidence=0.5,
+        )
+
+    def _is_markdown_report(self, text: str) -> bool:
+        """Check if text is a markdown report."""
+        if len(text) < 200:
+            return False
+        markers = ["# ", "## ", "**", "| "]
+        return any(marker in text for marker in markers)
+
+    def _dict_to_response(self, data: dict, raw_content: str) -> LLMResponse:
+        """Convert dict to LLMResponse."""
+        return LLMResponse(
+            summary=data.get("summary", ""),
+            signals=data.get("signals", []),
+            sources=data.get("sources", []),
+            confidence=self._clamp_confidence(data.get("confidence", 0.5)),
+            data=data.get("data", {}),
+            content=data.get("content", data.get("summary", "")),
+            raw=raw_content,
+        )
+
+    @staticmethod
+    def _clamp_confidence(value: float) -> float:
+        """Clamp confidence to [0, 1]."""
+        try:
+            return max(0.0, min(1.0, float(value)))
+        except (TypeError, ValueError):
+            return 0.5
