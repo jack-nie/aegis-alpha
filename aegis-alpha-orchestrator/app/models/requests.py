@@ -16,11 +16,14 @@ class WorkflowRequest(BaseModel):
     state: dict[str, Any] = Field(default_factory=dict)
     subject: str = "Aegis Alpha workflow"
     require_approval: bool = False
-    thread_id: str | None = None
-    api_key: str | None = None
-    base_url: str | None = None
+    thread_id: str | None = Field(default=None, alias="threadId")
+    api_key: str | None = Field(default=None, alias="apiKey")
+    base_url: str | None = Field(default=None, alias="baseUrl")
     provider: str | None = None
     model: str | None = None
+
+    class Config:
+        populate_by_name = True
 
 
 class NodeRequest(BaseModel):
@@ -30,10 +33,13 @@ class NodeRequest(BaseModel):
     state: dict[str, Any] = Field(default_factory=dict)
     agent: AgentTemplate | None = None
     subject: str | None = None
-    api_key: str | None = None
-    base_url: str | None = None
+    api_key: str | None = Field(default=None, alias="apiKey")
+    base_url: str | None = Field(default=None, alias="baseUrl")
     provider: str | None = None
     model: str | None = None
+
+    class Config:
+        populate_by_name = True
 
 
 class IntentRequest(BaseModel):
@@ -41,6 +47,9 @@ class IntentRequest(BaseModel):
 
     message: str = ""
     workflows: list[dict[str, Any]] = Field(default_factory=list)
-    api_key: str | None = None
-    base_url: str | None = None
+    api_key: str | None = Field(default=None, alias="apiKey")
+    base_url: str | None = Field(default=None, alias="baseUrl")
     model: str | None = None
+
+    class Config:
+        populate_by_name = True
