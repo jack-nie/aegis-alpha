@@ -11,6 +11,7 @@ Core: portfolio management, market data (Yahoo/Stooq/SEC/GDELT), LangGraph agent
 - **Infra**: Docker Compose / GitHub Actions CI
 
 Do NOT introduce unless explicitly requested:
+
 - Spring Security (项目用自定义 HmacSHA256 Token，不用 Spring Security)
 - TypeScript（前端是 JSX，不接受 TS）
 - Redux / MobX（前端状态用 React 原生 state + props）
@@ -44,11 +45,13 @@ scripts/                  → 冒烟测试脚本
 ## Hooks & Quality Gates
 
 以下规则由 `.claude/settings.json` Hook 强制执行，不是提醒：
+
 - 每次编辑 JS/JSX/MJS 文件后自动格式化（PreToolUse hook → prettier）
 - 每次编辑后自动 lint 检查（PostToolUse hook → eslint）
 - 格式化失败时警告但不阻断（on_failure: warn）
 
 相关命令：
+
 - `npm run format` — 手动格式化全部 JS/JSX 文件
 - `npm run format:check` — 检查格式是否合规
 - `npm run lint` — 手动 lint 检查
@@ -58,10 +61,11 @@ scripts/                  → 冒烟测试脚本
 
 Tier 1（每次加载）：本文件 — 项目是什么 + 怎么工作
 Tier 2（按需加载）：
-  - `docs/superpowers/specs/` — 架构规格
-  - `docs/superpowers/plans/` — 实施计划
-  - `docs/dify-integration-design.md` — Dify 集成设计
-Tier 3（忽略）：`logs/`、根目录的 fix_*.py / patch_*.py — 临时调试脚本
+
+- `docs/superpowers/specs/` — 架构规格
+- `docs/superpowers/plans/` — 实施计划
+- `docs/dify-integration-design.md` — Dify 集成设计
+  Tier 3（忽略）：`logs/`、根目录的 fix*\*.py / patch*\*.py — 临时调试脚本
 
 ## Memory
 

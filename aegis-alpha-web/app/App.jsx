@@ -1084,30 +1084,32 @@ function AICopilot({ setCopilotOpen, api, promptRequest, onPromptHandled }) {
           <Icon name="close" />
         </button>
       </div>
-      <div className="flex-1 space-y-3 overflow-y-auto bg-white p-4">
+      <div className="flex-1 space-y-2 overflow-y-auto bg-white p-3">
         {messages.map((msg, idx) => (
           <div key={idx} className={`flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}>
             <div
-              className={`max-w-[88%] whitespace-pre-wrap rounded-md px-3.5 py-2.5 text-sm leading-relaxed ${msg.role === "user" ? "bg-blue-50 text-blue-900" : msg.ok === false ? "border border-red-200 bg-red-50 text-red-700" : "bg-gray-50 text-gray-800"}`}
+              className={`max-w-[88%] whitespace-pre-wrap rounded-md px-3 py-2 text-sm leading-snug ${msg.role === "user" ? "bg-blue-50 text-blue-900" : msg.ok === false ? "border border-red-200 bg-red-50 text-red-700" : "bg-gray-50 text-gray-800"}`}
             >
-              <div className="chat-markdown text-sm leading-relaxed">
+              <div className="chat-markdown text-sm leading-snug">
                 <ReactMarkdown
                   remarkPlugins={[remarkGfm]}
                   components={{
                     h1: ({ children }) => (
-                      <h1 className="mb-2 mt-4 border-b border-gray-200 pb-1 text-lg font-bold text-gray-900">
+                      <h1 className="mb-1.5 mt-3 border-b border-gray-200 pb-1 text-lg font-bold text-gray-900">
                         {children}
                       </h1>
                     ),
-                    h2: ({ children }) => (
-                      <h2 className="mb-1.5 mt-3 text-base font-bold text-gray-800">{children}</h2>
+                    h2: ({ children }) => <h2 className="mb-1 mt-2 text-base font-bold text-gray-800">{children}</h2>,
+                    h3: ({ children }) => (
+                      <h3 className="mb-0.5 mt-1.5 text-sm font-semibold text-gray-700">{children}</h3>
                     ),
-                    h3: ({ children }) => <h3 className="mb-1 mt-2 text-sm font-semibold text-gray-700">{children}</h3>,
-                    p: ({ children }) => <p className="my-1 text-gray-700">{children}</p>,
+                    p: ({ children }) => <p className="my-0.5 text-gray-700">{children}</p>,
                     ul: ({ children, ordered }) => (
-                      <ul className={`my-1 ml-4 space-y-0.5 ${ordered ? "list-decimal" : "list-disc"}`}>{children}</ul>
+                      <ul className={`my-0.5 ml-4 space-y-0.5 ${ordered ? "list-decimal" : "list-disc"}`}>
+                        {children}
+                      </ul>
                     ),
-                    ol: ({ children }) => <ol className="my-1 ml-4 list-decimal space-y-0.5">{children}</ol>,
+                    ol: ({ children }) => <ol className="my-0.5 ml-4 list-decimal space-y-0.5">{children}</ol>,
                     li: ({ children, checked }) => {
                       if (checked !== null && checked !== undefined) {
                         return (
@@ -1127,12 +1129,12 @@ function AICopilot({ setCopilotOpen, api, promptRequest, onPromptHandled }) {
                     strong: ({ children }) => <strong className="font-semibold text-gray-900">{children}</strong>,
                     em: ({ children }) => <em className="italic text-gray-600">{children}</em>,
                     blockquote: ({ children }) => (
-                      <blockquote className="my-2 border-l-3 border-blue-300 pl-3 text-xs text-gray-500 italic">
+                      <blockquote className="border-l-3 my-1 border-blue-300 pl-3 text-xs italic text-gray-500">
                         {children}
                       </blockquote>
                     ),
                     table: ({ children }) => (
-                      <div className="my-3 overflow-x-auto rounded-md border border-gray-100">
+                      <div className="my-1.5 overflow-x-auto rounded-md border border-gray-100">
                         <table className="w-full text-xs">{children}</table>
                       </div>
                     ),
@@ -1156,19 +1158,19 @@ function AICopilot({ setCopilotOpen, api, promptRequest, onPromptHandled }) {
                           </code>
                         );
                       return (
-                        <div className="my-2 overflow-hidden rounded-md bg-gray-50">
+                        <div className="my-1 overflow-hidden rounded-md bg-gray-50">
                           {lang && (
                             <div className="border-b border-gray-100 px-3 py-1 text-[10px] font-medium uppercase tracking-wider text-gray-400">
                               {lang}
                             </div>
                           )}
-                          <pre className="overflow-x-auto p-3">
+                          <pre className="overflow-x-auto p-2">
                             <code className="font-mono text-[11px] leading-relaxed text-gray-700">{children}</code>
                           </pre>
                         </div>
                       );
                     },
-                    hr: () => <hr className="my-2 border-gray-100" />,
+                    hr: () => <hr className="my-1 border-gray-100" />,
                     a: ({ href, children }) => (
                       <a
                         href={href}
@@ -1179,16 +1181,14 @@ function AICopilot({ setCopilotOpen, api, promptRequest, onPromptHandled }) {
                         {children}
                       </a>
                     ),
-                    img: ({ src, alt }) => (
-                      <img src={src} alt={alt} className="my-2 max-w-full rounded-md" />
-                    ),
+                    img: ({ src, alt }) => <img src={src} alt={alt} className="my-1 max-w-full rounded-md" />,
                   }}
                 >
                   {String(msg.content)}
                 </ReactMarkdown>
               </div>
               {msg.role === "assistant" && msg.provider && (
-                <div className={`mt-2 text-[11px] ${msg.ok === false ? "text-red-500" : "text-gray-400"}`}>
+                <div className={`mt-1 text-[11px] ${msg.ok === false ? "text-red-500" : "text-gray-400"}`}>
                   {msg.ok === false ? "ERROR" : "INFO"} · {msg.provider}
                 </div>
               )}
@@ -1198,8 +1198,8 @@ function AICopilot({ setCopilotOpen, api, promptRequest, onPromptHandled }) {
         ))}
         {loading && (
           <div className="flex justify-start">
-            <div className="rounded-md bg-gray-50 px-4 py-2.5">
-              <div className="flex items-center gap-2.5">
+            <div className="rounded-md bg-gray-50 px-3 py-2">
+              <div className="flex items-center gap-2">
                 <div className="relative h-4 w-4">
                   <div className="absolute inset-0 rounded-full border-2 border-gray-200" />
                   <div className="absolute inset-0 animate-spin rounded-full border-2 border-transparent border-t-blue-500" />
@@ -1211,14 +1211,14 @@ function AICopilot({ setCopilotOpen, api, promptRequest, onPromptHandled }) {
         )}
         <div ref={messagesEndRef} />
         {messages.length === 1 && (
-          <div className="mt-6">
-            <p className="mb-3 text-center text-xs text-gray-400">试试这些问题</p>
-            <div className="space-y-2">
+          <div className="mt-4">
+            <p className="mb-2 text-center text-xs text-gray-400">试试这些问题</p>
+            <div className="space-y-1.5">
               {suggestions.map((s) => (
                 <button
                   key={s}
                   onClick={() => handleSuggestion(s)}
-                  className="w-full rounded-lg border border-gray-200 bg-white px-4 py-2.5 text-left text-sm text-gray-600 shadow-sm transition-colors hover:border-blue-300 hover:text-blue-600"
+                  className="w-full rounded-lg border border-gray-200 bg-white px-3 py-2 text-left text-sm text-gray-600 shadow-sm transition-colors hover:border-blue-300 hover:text-blue-600"
                 >
                   {s}
                 </button>
@@ -1227,7 +1227,7 @@ function AICopilot({ setCopilotOpen, api, promptRequest, onPromptHandled }) {
           </div>
         )}
       </div>
-      <div className="border-t border-gray-200 bg-white p-4">
+      <div className="border-t border-gray-200 bg-white p-3">
         <div className="flex gap-2">
           <textarea
             value={input}

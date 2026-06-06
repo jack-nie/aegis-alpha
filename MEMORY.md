@@ -15,7 +15,7 @@ Claude 每次新任务开始前应读取此文件。
 - 修改 auth 模块前必须先理解 TokenService 的 Base64+HMAC 签名机制
 - orchestrator 的 mock 模式是重要的离线测试手段，新功能必须兼容
 - MyBatis mapper XML 和接口必须同步修改
-- 环境变量使用 MARKETMIND_* 前缀（历史原因）
+- 环境变量使用 MARKETMIND\_\* 前缀（历史原因）
 
 ## Tooling
 
@@ -27,4 +27,4 @@ Claude 每次新任务开始前应读取此文件。
 ## Active Issues
 
 - CI workflow 引用旧目录名，可能需要更新
-- 根目录存在多个临时 fix_*.py 脚本，应定期清理
+- 根目录存在多个临时 fix\_\*.py 脚本，应定期清理

@@ -790,27 +790,28 @@ public class WorkflowService {
     private Map<String, Object> executeNode(Map<String, Object> node, Map<String, Object> state, WorkflowRun run) {
         String type = nodeType(node);
         String handler = handler(node);
-        if ("agent".equals(type) || isExternalResearchHandler(handler)) {
-            AgentTemplate agent = resolveAgent(node);
-            return langChainGateway.executeNode(agent, state, node, run.getSubject());
+        if (isControlFlowNode(type, handler)) {
+            Map<String, Object> result = new LinkedHashMap<>();
+            result.put("type", type);
+            result.put("handler", handler);
+            result.put("summary", simulatedNodeMessage(type, handler, run.getSubject()));
+            result.put("message", result.get("summary"));
+            result.put("ok", true);
+            return result;
         }
-        Map<String, Object> result = new LinkedHashMap<>();
-        result.put("type", type);
-        result.put("handler", handler);
-        result.put("summary", simulatedNodeMessage(type, handler, run.getSubject()));
-        result.put("message", result.get("summary"));
-        result.put("ok", true);
-        return result;
+        AgentTemplate agent = resolveAgent(node);
+        return langChainGateway.executeNode(agent, state, node, run.getSubject());
     }
 
-    private boolean isExternalResearchHandler(String handler) {
-        return handler != null && (handler.startsWith("finance.")
-                || "general.web_search".equals(handler)
-                || "general.fetch_news".equals(handler)
-                || "general.get_market_share".equals(handler)
-                || "general.get_sector_news".equals(handler)
-                || "general.get_tech_breakthroughs".equals(handler)
-                || "general.stock_screener_agent".equals(handler));
+    private boolean isControlFlowNode(String type, String handler) {
+        if ("start".equals(type) || "end".equals(type) || "condition".equals(type)) {
+            return true;
+        }
+        if (handler == null) {
+            return true;
+        }
+        // Only truly deterministic control-flow handlers skip LLM
+        return handler.equals("workflow.end") || handler.equals("scheduler.manual") || handler.equals("scheduler.daily");
     }
 
     private AgentTemplate resolveAgent(Map<String, Object> node) {

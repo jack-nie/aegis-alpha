@@ -76,7 +76,7 @@ class NodeExecutor:
         effective_api_key = api_key or self._config.effective_api_key
         is_mock = self._config.is_mock_mode and not effective_api_key
 
-        if is_mock or self._is_deterministic_tool(handler, node_type):
+        if is_mock or self._is_control_flow(handler, node_type):
             return self._mock_result(node, handler, subject, state, started_at)
 
         # Hydrate market data
@@ -111,13 +111,13 @@ class NodeExecutor:
         data = node.data
         return (data.node_type or data.type or "").strip()
 
-    def _is_deterministic_tool(self, handler: str, node_type: str) -> bool:
-        """Check if node is a deterministic tool (no LLM needed)."""
-        return (
-            handler in HANDLERS
-            and node_type != "agent"
-            and handler != "finance.stock_recommendation_aggregate"
-        )
+    def _is_control_flow(self, handler: str, node_type: str) -> bool:
+        """Check if node is a control flow node (start/end/condition) that needs no LLM."""
+        if node_type in {"start", "end", "condition"}:
+            return True
+        if handler in FALLBACK_HANDLERS and handler not in HANDLERS:
+            return True
+        return False
 
     async def _invoke_llm(
         self,

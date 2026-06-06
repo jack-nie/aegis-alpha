@@ -51,14 +51,14 @@ curl http://127.0.0.1:8787/health
 
 ## API Endpoints
 
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | `/health` | Health check |
-| POST | `/stream-workflow` | SSE streaming workflow execution |
-| POST | `/execute-workflow` | Non-streaming workflow execution |
-| POST | `/execute-node` | Execute single workflow node |
-| POST | `/execute-agent` | Execute single agent node |
-| POST | `/classify-intent` | Intent classification via LLM |
+| Method | Path                | Description                      |
+| ------ | ------------------- | -------------------------------- |
+| GET    | `/health`           | Health check                     |
+| POST   | `/stream-workflow`  | SSE streaming workflow execution |
+| POST   | `/execute-workflow` | Non-streaming workflow execution |
+| POST   | `/execute-node`     | Execute single workflow node     |
+| POST   | `/execute-agent`    | Execute single agent node        |
+| POST   | `/classify-intent`  | Intent classification via LLM    |
 
 ## OOP Design Principles
 
@@ -71,18 +71,23 @@ curl http://127.0.0.1:8787/health
 ## Key Classes
 
 ### `Settings` (config.py)
+
 Application configuration loaded from environment variables. Uses `pydantic-settings` for validation.
 
 ### `WorkflowEngine` (core/workflow_engine.py)
+
 Orchestrates LangGraph StateGraph execution. Builds graph from nodes/edges, handles streaming.
 
 ### `NodeExecutor` (core/node_executor.py)
+
 Executes individual workflow nodes. Handles mock mode, market data hydration, LLM invocation.
 
 ### `LLMClient` (core/llm_client.py)
+
 OpenAI-compatible LLM client. Supports DeepSeek and other providers.
 
 ### `PromptManager` (prompts/finance_prompts.py)
+
 Manages 18 financial analysis prompt templates.
 
 ## Environment Variables
