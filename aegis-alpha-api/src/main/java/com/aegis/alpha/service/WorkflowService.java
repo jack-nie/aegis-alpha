@@ -307,7 +307,18 @@ public class WorkflowService {
         WorkflowVersion version = mapper.findLatestVersion(workflowKey);
         Map<String, Object> runLayout = layoutForRun(workflowKey, version);
         try {
-            execute(run, inputs, runLayout);
+            boolean langGraphDone = false;
+            if (langChainGateway.isEnabled()) {
+                try {
+                    langGraphDone = executeViaLangGraph(run, inputs, runLayout);
+                } catch (Exception lgEx) {
+                    recordRunEvent(run, "RUN_DISPATCHED", null, null, "RUNNING",
+                            "LangGraph full-workflow execution failed, falling back to local: " + lgEx.getMessage(), null, 1);
+                }
+            }
+            if (!langGraphDone) {
+                execute(run, inputs, runLayout);
+            }
             backtestService.createFromWorkflowRun(mapper.findRun(run.getRunId()), inputs);
         } catch (WorkflowStoppedException stopped) {
             // run already updated by execute()
@@ -319,6 +330,84 @@ public class WorkflowService {
             mapper.updateRun(run);
             recordRunEvent(run, "RUN_FAILED", null, null, "FAILED", ex.getMessage(), null, 1000000);
         }
+    }
+
+    @SuppressWarnings("unchecked")
+    private boolean executeViaLangGraph(WorkflowRun run, Map<String, Object> inputs, Map<String, Object> layout) {
+        Map<String, Object> result = langChainGateway.executeWorkflow(layout, run.getSubject(), inputs);
+        if (result == null) {
+            return false;
+        }
+        Map<String, Object> finalState = result.get("final_state") instanceof Map
+                ? (Map<String, Object>) result.get("final_state")
+                : new LinkedHashMap<>();
+        if (Boolean.FALSE.equals(result.get("ok"))) {
+            String error = result.get("error") != null ? String.valueOf(result.get("error")) : "LangGraph workflow execution failed";
+            throw new RuntimeException(error);
+        }
+
+        List<Map<String, Object>> nodes = castList(layout.get("nodes"));
+        int nodeCount = nodes.size();
+        List<Object> traceList = result.get("trace") instanceof List ? (List<Object>) result.get("trace") : new ArrayList<>();
+        Map<String, Object> nodeOutputs = result.get("node_outputs") instanceof Map
+                ? (Map<String, Object>) result.get("node_outputs")
+                : new LinkedHashMap<>();
+
+        for (Object traceObj : traceList) {
+            if (!(traceObj instanceof Map)) continue;
+            Map<String, Object> traceEntry = (Map<String, Object>) traceObj;
+            String nodeId = String.valueOf(traceEntry.getOrDefault("nodeId", ""));
+            String nodeName = String.valueOf(traceEntry.getOrDefault("nodeName", nodeId));
+            String handler = String.valueOf(traceEntry.getOrDefault("handler", ""));
+            String status = String.valueOf(traceEntry.getOrDefault("status", "completed"));
+            boolean ok = Boolean.TRUE.equals(traceEntry.get("ok"));
+            long durationMs = traceEntry.get("durationMs") instanceof Number
+                    ? ((Number) traceEntry.get("durationMs")).longValue() : 0L;
+
+            WorkflowNodeRun nodeRun = new WorkflowNodeRun();
+            nodeRun.setNodeRunId(UUID.randomUUID().toString());
+            nodeRun.setRunId(run.getRunId());
+            nodeRun.setNodeId(nodeId);
+            nodeRun.setNodeName(nodeName);
+            nodeRun.setNodeType(handler.contains(".") ? "agent" : "logic");
+            nodeRun.setAgentId(null);
+            nodeRun.setStatus(ok ? "COMPLETED" : "FAILED");
+            nodeRun.setAttempt(1);
+            nodeRun.setMaxAttempts(1);
+            nodeRun.setStartedAt(run.getStartedAt());
+            nodeRun.setCompletedAt(now());
+            nodeRun.setSortOrder(100);
+            Object nodeOutput = nodeOutputs.get(nodeId);
+            if (nodeOutput instanceof Map) {
+                Map<String, Object> outMap = (Map<String, Object>) nodeOutput;
+                nodeRun.setInputJson(toJson(inputs));
+                nodeRun.setOutputJson(toJson(outMap));
+                String evtType = ok ? "NODE_COMPLETED" : "NODE_FAILED";
+                recordRunEvent(run, evtType, nodeRun, nodeId, ok ? "COMPLETED" : "FAILED",
+                        "Node " + nodeId + " " + status + " via LangGraph.", outMap, 100);
+            } else {
+                nodeRun.setInputJson(toJson(inputs));
+                String evtType = ok ? "NODE_COMPLETED" : "NODE_FAILED";
+                recordRunEvent(run, evtType, nodeRun, nodeId, ok ? "COMPLETED" : "FAILED",
+                        "Node " + nodeId + " " + status + " via LangGraph.", null, 100);
+            }
+            mapper.insertNodeRun(nodeRun);
+        }
+
+        Map<String, Object> mergedState = new LinkedHashMap<>(inputs);
+        mergedState.putAll(finalState);
+        run.setStatus("COMPLETED");
+        run.setCompletedAt(now());
+        run.setResultJson(toJson(mergedState));
+        run.setNodeCount(nodeCount);
+        run.setControlStatus("COMPLETED");
+        run.setPauseRequested(0);
+        run.setCancelRequested(0);
+        mapper.updateRun(run);
+        recordRunEvent(run, "RUN_COMPLETED", null, null, "COMPLETED",
+                "Workflow run completed via LangGraph.", mergedState, 1000000);
+        cacheService.put("aegis:workflow:run:" + run.getRunId(), run, Duration.ofHours(2));
+        return true;
     }
     public WorkflowRun start(String workflowKey, String subject) {
         return start(workflowKey, subject, new LinkedHashMap<String, Object>(), null);
@@ -357,7 +446,18 @@ public class WorkflowService {
         recordRunEvent(run, "RUN_CREATED", null, null, "RUNNING", "Workflow run created.", null, 0);
 
         try {
-            execute(run, safeInputs, runLayout);
+            boolean langGraphDone = false;
+            if (langChainGateway.isEnabled()) {
+                try {
+                    langGraphDone = executeViaLangGraph(run, safeInputs, runLayout);
+                } catch (Exception lgEx) {
+                    recordRunEvent(run, "RUN_DISPATCHED", null, null, "RUNNING",
+                            "LangGraph full-workflow execution failed, falling back to local: " + lgEx.getMessage(), null, 1);
+                }
+            }
+            if (!langGraphDone) {
+                execute(run, safeInputs, runLayout);
+            }
             WorkflowRun completed = mapper.findRun(run.getRunId());
             backtestService.createFromWorkflowRun(completed, inputs);
             return completed;

@@ -12,6 +12,7 @@ import org.springframework.stereotype.Service;
 import org.springframework.web.client.RestTemplate;
 
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 
 @Service
@@ -124,6 +125,53 @@ public class LangChainGateway {
 
     public String streamWorkflowUrl() {
         return trimSlash(engineUrl) + "/stream-workflow";
+    }
+
+    public String executeWorkflowUrl() {
+        return trimSlash(engineUrl) + "/execute-workflow";
+    }
+
+    public boolean isEnabled() {
+        return enabled;
+    }
+
+    @SuppressWarnings("unchecked")
+    public Map<String, Object> executeWorkflow(Map<String, Object> layout, String subject, Map<String, Object> inputs) {
+        if (!enabled) {
+            return null;
+        }
+        try {
+            Map<String, Object> body = new LinkedHashMap<>();
+            if (apiKey != null && !apiKey.trim().isEmpty()) {
+                body.put("apiKey", apiKey);
+            }
+            if (baseUrl != null && !baseUrl.trim().isEmpty()) {
+                body.put("baseUrl", baseUrl);
+            }
+            body.put("provider", provider);
+            body.put("model", defaultModel);
+            body.put("nodes", layout.get("nodes"));
+            body.put("edges", layout.get("edges"));
+            Map<String, Object> state = new LinkedHashMap<>(inputs);
+            state.put("subject", subject);
+            body.put("state", state);
+            body.put("subject", subject);
+
+            RestTemplate longTimeoutRestTemplate = restTemplate(5000, 300000);
+            HttpHeaders headers = new HttpHeaders();
+            headers.setContentType(MediaType.APPLICATION_JSON);
+            HttpEntity<Map<String, Object>> request = new HttpEntity<>(body, headers);
+            Object response = longTimeoutRestTemplate.postForObject(executeWorkflowUrl(), request, Object.class);
+            if (response instanceof Map) {
+                return (Map<String, Object>) response;
+            }
+            Map<String, Object> wrapped = new LinkedHashMap<>();
+            wrapped.put("content", response);
+            wrapped.put("provider", provider);
+            return wrapped;
+        } catch (Exception ex) {
+            return null;
+        }
     }
 
     public String buildStreamBody(Map<String, Object> layout, String subject, Map<String, Object> inputs) {
