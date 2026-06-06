@@ -1084,11 +1084,11 @@ function AICopilot({ setCopilotOpen, api, promptRequest, onPromptHandled }) {
           <Icon name="close" />
         </button>
       </div>
-      <div className="flex-1 space-y-4 overflow-y-auto bg-gray-50 p-4">
+      <div className="flex-1 space-y-3 overflow-y-auto bg-white p-4">
         {messages.map((msg, idx) => (
           <div key={idx} className={`flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}>
             <div
-              className={`max-w-[85%] whitespace-pre-wrap rounded-lg px-4 py-2.5 text-sm leading-relaxed ${msg.role === "user" ? "rounded-br-none border border-gray-200 bg-white text-gray-800 shadow-sm" : msg.ok === false ? "rounded-bl-none border border-red-200 bg-red-50 text-red-700 shadow-sm" : "rounded-bl-none border border-gray-200 bg-white text-gray-700 shadow-sm"}`}
+              className={`max-w-[88%] whitespace-pre-wrap rounded-md px-3.5 py-2.5 text-sm leading-relaxed ${msg.role === "user" ? "bg-blue-50 text-blue-900" : msg.ok === false ? "border border-red-200 bg-red-50 text-red-700" : "bg-gray-50 text-gray-800"}`}
             >
               <div className="chat-markdown text-sm leading-relaxed">
                 <ReactMarkdown
@@ -1127,66 +1127,60 @@ function AICopilot({ setCopilotOpen, api, promptRequest, onPromptHandled }) {
                     strong: ({ children }) => <strong className="font-semibold text-gray-900">{children}</strong>,
                     em: ({ children }) => <em className="italic text-gray-600">{children}</em>,
                     blockquote: ({ children }) => (
-                      <blockquote className="my-2 rounded-lg border-l-4 border-blue-400 bg-blue-50 px-3 py-2 text-xs text-blue-800">
+                      <blockquote className="my-2 border-l-3 border-blue-300 pl-3 text-xs text-gray-500 italic">
                         {children}
                       </blockquote>
                     ),
                     table: ({ children }) => (
-                      <div className="my-3 overflow-x-auto rounded-xl border border-gray-200 shadow-sm">
+                      <div className="my-3 overflow-x-auto rounded-md border border-gray-100">
                         <table className="w-full text-xs">{children}</table>
                       </div>
                     ),
-                    thead: ({ children }) => <thead className="bg-gradient-to-r from-gray-50 to-gray-100">{children}</thead>,
+                    thead: ({ children }) => <thead className="bg-gray-50">{children}</thead>,
                     th: ({ children }) => (
-                      <th className="border-b-2 border-gray-200 px-3 py-2 text-left text-xs font-bold uppercase tracking-wider text-gray-600">
+                      <th className="border-b border-gray-100 px-2.5 py-1.5 text-left text-[11px] font-semibold text-gray-500">
                         {children}
                       </th>
                     ),
                     td: ({ children }) => (
-                      <td className="border-b border-gray-100 px-3 py-2 text-gray-600">{children}</td>
+                      <td className="border-b border-gray-50 px-2.5 py-1.5 text-gray-700">{children}</td>
                     ),
-                    tr: ({ children, isHeader }) => (
-                      <tr className={`${isHeader ? "" : "even:bg-blue-50/30 hover:bg-gray-50/60"} transition-colors`}>
-                        {children}
-                      </tr>
-                    ),
+                    tr: ({ children }) => <tr>{children}</tr>,
                     code: ({ inline, className, children }) => {
                       const match = /language-(\w+)/.exec(className || "");
                       const lang = match ? match[1] : "";
                       if (inline)
                         return (
-                          <code className="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-xs text-blue-700">
+                          <code className="rounded bg-gray-100 px-1.5 py-0.5 font-mono text-[11px] text-gray-700">
                             {children}
                           </code>
                         );
                       return (
-                        <div className="my-2 rounded-xl border border-slate-700 shadow-sm">
+                        <div className="my-2 overflow-hidden rounded-md bg-gray-50">
                           {lang && (
-                            <div className="flex items-center justify-between border-b border-slate-700 bg-slate-800 px-3 py-1.5">
-                              <span className="font-mono text-[10px] font-medium uppercase tracking-wider text-slate-400">
-                                {lang}
-                              </span>
+                            <div className="border-b border-gray-100 px-3 py-1 text-[10px] font-medium uppercase tracking-wider text-gray-400">
+                              {lang}
                             </div>
                           )}
-                          <pre className="overflow-x-auto bg-slate-900 p-3">
-                            <code className="font-mono text-xs leading-relaxed text-slate-100">{children}</code>
+                          <pre className="overflow-x-auto p-3">
+                            <code className="font-mono text-[11px] leading-relaxed text-gray-700">{children}</code>
                           </pre>
                         </div>
                       );
                     },
-                    hr: () => <hr className="my-3 border-gray-200" />,
+                    hr: () => <hr className="my-2 border-gray-100" />,
                     a: ({ href, children }) => (
                       <a
                         href={href}
                         target="_blank"
                         rel="noopener noreferrer"
-                        className="text-blue-600 underline decoration-blue-300 underline-offset-2 hover:text-blue-800 hover:decoration-blue-500"
+                        className="text-blue-600 underline underline-offset-1 hover:text-blue-800"
                       >
                         {children}
                       </a>
                     ),
                     img: ({ src, alt }) => (
-                      <img src={src} alt={alt} className="my-2 max-w-full rounded-lg border border-gray-200 shadow-sm" />
+                      <img src={src} alt={alt} className="my-2 max-w-full rounded-md" />
                     ),
                   }}
                 >
@@ -1204,13 +1198,13 @@ function AICopilot({ setCopilotOpen, api, promptRequest, onPromptHandled }) {
         ))}
         {loading && (
           <div className="flex justify-start">
-            <div className="rounded-xl rounded-bl-none border border-gray-200 bg-white px-5 py-3.5 shadow-sm">
-              <div className="flex items-center gap-3">
-                <div className="relative h-5 w-5">
+            <div className="rounded-md bg-gray-50 px-4 py-2.5">
+              <div className="flex items-center gap-2.5">
+                <div className="relative h-4 w-4">
                   <div className="absolute inset-0 rounded-full border-2 border-gray-200" />
                   <div className="absolute inset-0 animate-spin rounded-full border-2 border-transparent border-t-blue-500" />
                 </div>
-                <span className="text-sm text-gray-500">AI 正在分析中...</span>
+                <span className="text-sm text-gray-400">分析中...</span>
               </div>
             </div>
           </div>

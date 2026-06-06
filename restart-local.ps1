@@ -25,14 +25,22 @@ foreach ($port in @(8787, 5178, 5174)) {
 Start-Sleep -Seconds 3
 Write-Host "  All stopped." -ForegroundColor Green
 
-# ── 2. Start Orchestrator (port 8787) ──
+# ── 2. Start Orchestrator (port 8787) - Python LangGraph ──
 Write-Host ""
-Write-Host "[2/4] Starting Orchestrator on port 8787..." -ForegroundColor Yellow
+Write-Host "[2/4] Starting Orchestrator on port 8787 (Python)..." -ForegroundColor Yellow
 $orchDir = Join-Path $Root "aegis-alpha-orchestrator"
 $orchLog = "$env:TEMP\aegis-orchestrator.log"
 $orchErr = "$env:TEMP\aegis-orchestrator-err.log"
 
-$orchProc = Start-Process -FilePath "node" -ArgumentList "server.mjs" `
+# Use Python virtual environment if available
+$pythonExe = "python"
+$venvPath = Join-Path $orchDir ".venv\Scripts\python.exe"
+if (Test-Path $venvPath) {
+    $pythonExe = $venvPath
+    Write-Host "  Using virtual environment: $venvPath" -ForegroundColor DarkGray
+}
+
+$orchProc = Start-Process -FilePath $pythonExe -ArgumentList "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8787" `
     -WorkingDirectory $orchDir -PassThru -WindowStyle Hidden `
     -RedirectStandardOutput $orchLog -RedirectStandardError $orchErr
 Write-Host "  PID: $($orchProc.Id)"
@@ -46,7 +54,7 @@ for ($i = 0; $i -lt 30; $i++) {
         $health = $r.Content | ConvertFrom-Json
         if ($health.ok) {
             $orchReady = $true
-            Write-Host "  Orchestrator ready! (mock=$($health.mock), apiKey=$($health.hasApiKey))" -ForegroundColor Green
+            Write-Host "  Orchestrator ready! (mock=$($health.mock), apiKey=$($health.has_api_key))" -ForegroundColor Green
             break
         }
     } catch {}
