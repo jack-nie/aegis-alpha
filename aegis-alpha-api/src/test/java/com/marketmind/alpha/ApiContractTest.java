@@ -61,6 +61,7 @@ class ApiContractTest {
         langChainResult.put("content", "Mock LangChain result");
         when(langChainGateway.runAgent(any(), anyMap(), anyMap(), anyString())).thenReturn(langChainResult);
         when(langChainGateway.executeNode(any(), anyMap(), anyMap(), anyString())).thenReturn(langChainResult);
+        when(langChainGateway.classifyIntent(anyString(), any())).thenReturn(null);
         when(marketDataService.quote(anyString())).thenReturn(marketQuote());
         when(marketDataService.financials(anyString())).thenReturn(marketFinancials());
         when(marketDataService.news(anyString())).thenReturn(marketNews());

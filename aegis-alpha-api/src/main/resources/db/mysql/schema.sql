@@ -83,7 +83,9 @@ CREATE TABLE IF NOT EXISTS workflow_definition (
   edges INT NOT NULL,
   readonly_flag TINYINT NOT NULL DEFAULT 1,
   owner_username VARCHAR(128),
-  updated_at VARCHAR(32) NOT NULL DEFAULT ''
+  updated_at VARCHAR(32) NOT NULL DEFAULT '',
+  trigger_keywords VARCHAR(1024),
+  routing_description VARCHAR(512)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS workflow_layout (

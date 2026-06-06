@@ -96,7 +96,9 @@ CREATE TABLE workflow_definition (
   edges INT NOT NULL,
   readonly_flag TINYINT NOT NULL DEFAULT 1,
   owner_username VARCHAR(128),
-  updated_at VARCHAR(32) NOT NULL DEFAULT ''
+  updated_at VARCHAR(32) NOT NULL DEFAULT '',
+  trigger_keywords VARCHAR(1024),
+  routing_description VARCHAR(512)
 );
 CREATE TABLE workflow_layout (
   workflow_key VARCHAR(128) PRIMARY KEY,

@@ -15,11 +15,14 @@ import java.util.Map;
 public class WorkflowNodeExecutionService {
     private final String executionToken;
     private final MarketDataService marketDataService;
+    private final PortfolioService portfolioService;
 
     public WorkflowNodeExecutionService(@Value("${marketmind.dify.node-execution-token:}") String executionToken,
-                                        MarketDataService marketDataService) {
+                                        MarketDataService marketDataService,
+                                        PortfolioService portfolioService) {
         this.executionToken = executionToken;
         this.marketDataService = marketDataService;
+        this.portfolioService = portfolioService;
     }
 
     public boolean authorized(String token) {
@@ -42,11 +45,8 @@ public class WorkflowNodeExecutionService {
         }
         result.put("executedAt", LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")));
 
-        if ("portfolio.get_positions".equals(functionName)) {
-            result.put("position_ids", new ArrayList<String>());
-            result.put("positions", new ArrayList<Object>());
-            result.put("tickers", new ArrayList<String>());
-            return result;
+        if (isPortfolioHandler(functionName)) {
+            return handlePortfolio(functionName, request, result);
         }
         if ("general.agent".equals(functionName) && "hydrate_market_data".equals(action)) {
             Map<String, Object> overview = marketDataService.overview(symbol(request));
@@ -107,12 +107,128 @@ public class WorkflowNodeExecutionService {
         return result;
     }
 
+    private boolean isPortfolioHandler(String functionName) {
+        return "portfolio.get_context".equals(functionName)
+                || "portfolio.get_positions".equals(functionName)
+                || "portfolio.positions".equals(functionName)
+                || "portfolio.summary".equals(functionName)
+                || "portfolio.trades".equals(functionName);
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> handlePortfolio(String functionName, Map<String, Object> request, Map<String, Object> result) {
+        String portfolioId = resolvePortfolioId(request);
+        result.put("status", "ok");
+        result.put("provider", "aegis-alpha-portfolio");
+
+        if ("portfolio.get_context".equals(functionName)) {
+            if (!portfolioId.isEmpty()) {
+                Map<String, Object> summary = portfolioService.summaryContract(portfolioId);
+                result.put("portfolioId", portfolioId);
+                result.put("summary", summary.get("summary"));
+                result.put("dataCompleteness", summary.get("dataCompleteness"));
+                result.put("sourceStatus", summary.get("sourceStatus"));
+                result.put("positionCount", summary.get("positionCount"));
+                result.put("tradeCount", summary.get("tradeCount"));
+            } else {
+                List<?> all = portfolioService.findAll();
+                result.put("portfolioCount", all.size());
+                result.put("portfolios", all);
+            }
+            return result;
+        }
+
+        if ("portfolio.get_positions".equals(functionName) || "portfolio.positions".equals(functionName)) {
+            if (!portfolioId.isEmpty()) {
+                Map<String, Object> contract = portfolioService.positionsContract(portfolioId);
+                result.put("portfolioId", portfolioId);
+                result.put("positions", contract.get("positions"));
+                List<Object> tickers = new ArrayList<Object>();
+                for (Map<String, Object> pos : (List<Map<String, Object>>) contract.get("positions")) {
+                    tickers.add(pos.get("symbol"));
+                }
+                result.put("tickers", tickers);
+                result.put("positionCount", contract.get("positionCount"));
+            } else {
+                result.put("positions", new ArrayList<Object>());
+                result.put("tickers", new ArrayList<String>());
+                result.put("positionCount", 0);
+            }
+            return result;
+        }
+
+        if ("portfolio.summary".equals(functionName)) {
+            if (!portfolioId.isEmpty()) {
+                Map<String, Object> contract = portfolioService.summaryContract(portfolioId);
+                result.put("portfolioId", portfolioId);
+                result.put("summary", contract.get("summary"));
+                result.put("dataCompleteness", contract.get("dataCompleteness"));
+            } else {
+                List<?> all = portfolioService.findAll();
+                result.put("portfolioCount", all.size());
+                result.put("portfolios", all);
+            }
+            return result;
+        }
+
+        if ("portfolio.trades".equals(functionName)) {
+            if (!portfolioId.isEmpty()) {
+                Map<String, Object> contract = portfolioService.tradesContract(portfolioId);
+                result.put("portfolioId", portfolioId);
+                result.put("trades", contract.get("trades"));
+                result.put("tradeCount", contract.get("tradeCount"));
+            } else {
+                result.put("trades", new ArrayList<Object>());
+                result.put("tradeCount", 0);
+            }
+            return result;
+        }
+
+        return result;
+    }
+
+    @SuppressWarnings("unchecked")
+    private String resolvePortfolioId(Map<String, Object> request) {
+        String direct = firstText(request, "portfolioId", "portfolio_id");
+        if (!direct.isEmpty()) { return direct; }
+        Object params = request.get("params");
+        if (params instanceof Map) {
+            String nested = firstText((Map<String, Object>) params, "portfolioId", "portfolio_id");
+            if (!nested.isEmpty()) { return nested; }
+        }
+        if (params instanceof String) {
+            String nested = extractFromJsonLike((String) params, "portfolioId", "portfolio_id");
+            if (!nested.isEmpty()) { return nested; }
+        }
+        Object extra = request.get("extra");
+        if (extra instanceof Map) {
+            String nested = firstText((Map<String, Object>) extra, "portfolioId", "portfolio_id");
+            if (!nested.isEmpty()) { return nested; }
+        }
+        return "";
+    }
+
+    private String extractFromJsonLike(String text, String... keys) {
+        for (String key : keys) {
+            String needle = "\"" + key + "\"";
+            int index = text.indexOf(needle);
+            if (index < 0) { continue; }
+            int colon = text.indexOf(":", index + needle.length());
+            int quoteStart = colon < 0 ? -1 : text.indexOf("\"", colon);
+            int quoteEnd = quoteStart < 0 ? -1 : text.indexOf("\"", quoteStart + 1);
+            if (quoteEnd > quoteStart) { return text.substring(quoteStart + 1, quoteEnd); }
+        }
+        return "";
+    }
     private boolean isQuoteHandler(String functionName) {
         return "fdb.daily_ohlc".equals(functionName)
                 || "fdb.money_flow".equals(functionName)
                 || "finance.market_analysis".equals(functionName)
                 || "finance.technical_analysis".equals(functionName)
-                || "finance.money_flow_analysis".equals(functionName);
+                || "finance.money_flow_analysis".equals(functionName)
+                || "finance.peer_comparison".equals(functionName)
+                || "finance.risk_reward_analysis".equals(functionName)
+                || "finance.entry_strategy".equals(functionName);
     }
 
     private boolean isFinancialHandler(String functionName) {
@@ -133,7 +249,9 @@ public class WorkflowNodeExecutionService {
                 || "general.web_search".equals(functionName)
                 || "general.fetch_news".equals(functionName)
                 || "general.get_sector_news".equals(functionName)
-                || "general.get_tech_breakthroughs".equals(functionName);
+                || "general.get_tech_breakthroughs".equals(functionName)
+                || "finance.catalyst_analysis".equals(functionName)
+                || "finance.thesis_builder".equals(functionName);
     }
 
     @SuppressWarnings("unchecked")
@@ -206,3 +324,4 @@ public class WorkflowNodeExecutionService {
         return value == null ? "" : String.valueOf(value);
     }
 }
+

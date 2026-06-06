@@ -37,6 +37,7 @@ public class LangChainGateway {
                             @Value("${marketmind.langchain.read-timeout-ms:30000}") int readTimeoutMs) {
         this.objectMapper = objectMapper;
         this.restTemplate = restTemplate(connectTimeoutMs, readTimeoutMs);
+        this.shortTimeoutRestTemplate = restTemplate(2000, 5000);
         this.enabled = enabled;
         this.engineUrl = engineUrl;
         this.provider = provider;
@@ -119,6 +120,62 @@ public class LangChainGateway {
         wrapped.put("content", response);
         wrapped.put("provider", provider);
         return wrapped;
+    }
+
+    public String streamWorkflowUrl() {
+        return trimSlash(engineUrl) + "/stream-workflow";
+    }
+
+    public String buildStreamBody(Map<String, Object> layout, String subject, Map<String, Object> inputs) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        if (apiKey != null && !apiKey.trim().isEmpty()) {
+            body.put("apiKey", apiKey);
+        }
+        if (baseUrl != null && !baseUrl.trim().isEmpty()) {
+            body.put("baseUrl", baseUrl);
+        }
+        body.put("provider", provider);
+        body.put("model", defaultModel);
+        body.put("nodes", layout.get("nodes"));
+        body.put("edges", layout.get("edges"));
+        body.put("subject", subject);
+        Map<String, Object> state = new LinkedHashMap<>(inputs);
+        state.put("subject", subject);
+        body.put("state", state);
+        try {
+            return objectMapper.writeValueAsString(body);
+        } catch (Exception ex) {
+            throw new IllegalStateException("Failed to build stream body", ex);
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    public Map<String, Object> classifyIntent(String message, java.util.List<Map<String, String>> workflows) {
+        if (!enabled) {
+            return null;
+        }
+        try {
+            Map<String, Object> body = new LinkedHashMap<>();
+            body.put("message", message);
+            body.put("workflows", workflows);
+            if (apiKey != null && !apiKey.trim().isEmpty()) {
+                body.put("apiKey", apiKey);
+            }
+            if (baseUrl != null && !baseUrl.trim().isEmpty()) {
+                body.put("baseUrl", baseUrl);
+            }
+            body.put("model", defaultModel);
+            HttpHeaders headers = new HttpHeaders();
+            headers.setContentType(MediaType.APPLICATION_JSON);
+            HttpEntity<Map<String, Object>> request = new HttpEntity<>(body, headers);
+            Object response = shortTimeoutRestTemplate.postForObject(trimSlash(engineUrl) + "/classify-intent", request, Object.class);
+            if (response instanceof Map) {
+                return (Map<String, Object>) response;
+            }
+            return null;
+        } catch (Exception ex) {
+            return null;
+        }
     }
 
     private Map<String, Object> localStructuredNode(AgentTemplate agent, Map<String, Object> state, Map<String, Object> node, String subject, String reason) {
@@ -241,6 +298,8 @@ public class LangChainGateway {
     private String deepSeekDefaultModel() {
         return isSupportedDeepSeekModel(defaultModel) ? defaultModel : "deepseek-v4-flash";
     }
+
+    private final RestTemplate shortTimeoutRestTemplate;
 
     private RestTemplate restTemplate(int connectTimeoutMs, int readTimeoutMs) {
         SimpleClientHttpRequestFactory factory = new SimpleClientHttpRequestFactory();

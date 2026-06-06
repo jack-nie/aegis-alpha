@@ -62,7 +62,9 @@ class AuthServiceTest {
         assertThat(response.get("access_token")).asString().contains(".");
         assertThat(response.get("tenant_id")).isEqualTo("tenant-1");
         Map<String, Object> tokenPayload = tokenService.verify(String.valueOf(response.get("access_token")));
-        assertThat((Iterable<?>) tokenPayload.get("roles")).contains("portfolio_manager");
+        @SuppressWarnings("unchecked")
+        java.util.List<String> roles = (java.util.List<String>) tokenPayload.get("roles");
+        assertThat(roles).contains("portfolio_manager");
     }
 
     @Test
