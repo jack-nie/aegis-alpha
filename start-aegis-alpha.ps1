@@ -192,6 +192,34 @@ Import-UserEnvironmentVariable "AEGIS_ALPHA_LANGCHAIN_MODEL"
 Import-UserEnvironmentVariable "OPENAI_BASE_URL"
 Import-UserEnvironmentVariable "AEGIS_ALPHA_LANGCHAIN_BASE_URL"
 Import-UserEnvironmentVariable "AEGIS_ALPHA_LANGCHAIN_TIMEOUT_MS"
+Import-UserEnvironmentVariable "AEGIS_ALPHA_DB_USER"
+Import-UserEnvironmentVariable "AEGIS_ALPHA_DB_PASSWORD"
+Import-UserEnvironmentVariable "AEGIS_ALPHA_DB_URL"
+Import-UserEnvironmentVariable "AEGIS_ALPHA_TOKEN_SECRET"
+Import-UserEnvironmentVariable "AEGIS_ALPHA_REDIS_HOST"
+Import-UserEnvironmentVariable "AEGIS_ALPHA_REDIS_PORT"
+Import-UserEnvironmentVariable "AEGIS_ALPHA_REDIS_PASSWORD"
+if (-not $env:AEGIS_ALPHA_DB_USER) {
+    $env:AEGIS_ALPHA_DB_USER = "marketmind"
+}
+if (-not $env:AEGIS_ALPHA_DB_PASSWORD) {
+    $env:AEGIS_ALPHA_DB_PASSWORD = "aegis-local-db-2026"
+}
+if (-not $env:AEGIS_ALPHA_DB_URL) {
+    $env:AEGIS_ALPHA_DB_URL = "jdbc:mysql://127.0.0.1:3306/aegis_alpha?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&useSSL=false&allowPublicKeyRetrieval=true"
+}
+if (-not $env:AEGIS_ALPHA_TOKEN_SECRET) {
+    $env:AEGIS_ALPHA_TOKEN_SECRET = "aegis-local-token-secret-2026"
+}
+if (-not $env:AEGIS_ALPHA_REDIS_HOST) {
+    $env:AEGIS_ALPHA_REDIS_HOST = "127.0.0.1"
+}
+if (-not $env:AEGIS_ALPHA_REDIS_PORT) {
+    $env:AEGIS_ALPHA_REDIS_PORT = "6379"
+}
+if (-not $env:AEGIS_ALPHA_REDIS_PASSWORD) {
+    $env:AEGIS_ALPHA_REDIS_PASSWORD = "1234"
+}
 if ($env:OPENAI_API_KEY -and (-not $env:AEGIS_ALPHA_LANGCHAIN_API_KEY)) {
     $env:AEGIS_ALPHA_LANGCHAIN_API_KEY = $env:OPENAI_API_KEY
 }
@@ -229,9 +257,13 @@ if ($StartLangGraph) {
         Write-Step "LangGraph port $LangGraphPort is already listening. Skip engine startup."
     } else {
         Write-Step "Starting LangGraph engine on port $LangGraphPort ..."
+        $PythonExe = Join-Path $LangGraphDir ".venv\Scripts\python.exe"
+        if (-not (Test-Path $PythonExe)) {
+            $PythonExe = "python"
+        }
         $LangGraphProcess = Start-Process `
-            -FilePath $Node `
-            -ArgumentList @("server.mjs") `
+            -FilePath $PythonExe `
+            -ArgumentList @("-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "$LangGraphPort") `
             -WorkingDirectory $LangGraphDir `
             -WindowStyle Hidden `
             -RedirectStandardOutput (Join-Path $LogDir "langgraph.out.log") `
