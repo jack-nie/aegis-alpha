@@ -1,5 +1,4 @@
 .ai-memory
-docs/
 logs/
 target/
 .next/
@@ -7,10 +6,9 @@ node_modules/
 out/
 dist/
 *.log
-.env*.local
-target/
-.ace-tool/
 .env
+.env*.local
+.ace-tool/
 
 # Temporary fix/patch scripts
 fix_*.py
@@ -22,9 +20,14 @@ _p.py
 .venv/
 __pycache__/
 *.pyc
+.pytest_cache/
 
 # Local config
 application-local.yml
 
 # Claude memory
 MEMORY.md
+
+# Orchestrator runtime artifacts
+aegis-alpha-orchestrator/.coverage
+aegis-alpha-orchestrator/data/
