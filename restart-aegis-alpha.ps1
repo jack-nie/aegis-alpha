@@ -63,13 +63,19 @@ Write-Host "[Aegis Alpha] Starting frontend ..."
 Start-Process -FilePath "npm.cmd" -ArgumentList "run","start" -WorkingDirectory $FrontendDir -WindowStyle Hidden | Out-Null
 
 Write-Host "[Aegis Alpha] Preparing LangGraph engine ..."
-if (-not (Test-Path (Join-Path $LangGraphDir "node_modules"))) {
+$venvPython = Join-Path $LangGraphDir ".venv\Scripts\python.exe"
+if (-not (Test-Path $venvPython)) {
+  Write-Host "[Aegis Alpha] Creating Python venv for orchestrator ..."
   Push-Location $LangGraphDir
-  & npm.cmd install
-  if ($LASTEXITCODE -ne 0) { throw "LangGraph install failed." }
+  & python -m venv .venv
+  if ($LASTEXITCODE -ne 0) { throw "Venv creation failed." }
+  & $venvPython -m pip install --upgrade pip
+  if ($LASTEXITCODE -ne 0) { throw "Pip upgrade failed." }
+  & $venvPython -m pip install -r requirements.txt
+  if ($LASTEXITCODE -ne 0) { throw "Orchestrator requirements install failed." }
   Pop-Location
 }
-Start-Process -FilePath "node.exe" -ArgumentList "server.mjs" -WorkingDirectory $LangGraphDir -WindowStyle Hidden | Out-Null
+Start-Process -FilePath $venvPython -ArgumentList "-m","uvicorn","app.main:app","--host","127.0.0.1","--port","$LangGraphPort" -WorkingDirectory $LangGraphDir -WindowStyle Hidden | Out-Null
 
 $deadline = (Get-Date).AddSeconds(60)
 while ((Get-Date) -lt $deadline) {

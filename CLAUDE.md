@@ -7,7 +7,7 @@
 **核心功能**：投资组合管理、市场数据采集（Yahoo/Stooq/SEC/GDELT）、LangGraph Agent 执行、回测、推荐治理（审批/驳回）。
 
 **技术栈**：
-- **Backend**: Spring Boot 2.7.18 / Java 8 / MyBatis / MySQL 8.0 / Redis 7
+- **Backend**: Spring Boot 2.7.18 / Java 17 / MyBatis / MySQL 8.0 / Redis 7
 - **Orchestrator**: Python 3.11 / FastAPI / LangGraph 0.2.x / langchain-openai 0.2.x
 - **Frontend**: Next.js 15 App Router / React 19 / Tailwind CSS / @xyflow/react / JSX（非 TypeScript）
 - **Infra**: Docker Compose / GitHub Actions CI

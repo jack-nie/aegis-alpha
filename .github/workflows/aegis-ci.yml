@@ -21,7 +21,7 @@ jobs:
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: "8"
+          java-version: "17"
           cache: maven
       - name: Run tests
         run: mvn -B -ntp test
@@ -63,7 +63,14 @@ jobs:
           python-version: "3.11"
           cache: pip
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
+      - name: Run unit tests
+        env:
+          AEGIS_ALPHA_LANGCHAIN_MOCK: "true"
+          AEGIS_ALPHA_LANGCHAIN_API_KEY: test-key
+        run: python -m pytest tests -q
       - name: Check syntax
         run: python -m py_compile app/main.py
       - name: Start orchestrator

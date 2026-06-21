@@ -6,8 +6,9 @@
   "scripts": {
     "format": "prettier --write \"aegis-alpha-web/**/*.{js,jsx,json,css,md}\" \"aegis-alpha-orchestrator/**/*.{js,mjs,json,md}\"",
     "format:check": "prettier --check \"aegis-alpha-web/**/*.{js,jsx,json,css,md}\" \"aegis-alpha-orchestrator/**/*.{js,mjs,json,md}\"",
-    "lint": "eslint aegis-alpha-web/app aegis-alpha-orchestrator/server.mjs",
-    "lint:fix": "eslint --fix aegis-alpha-web/app aegis-alpha-orchestrator/server.mjs"
+    "lint": "eslint aegis-alpha-web/app",
+    "lint:fix": "eslint --fix aegis-alpha-web/app",
+    "lint:orchestrator": "python3 -m py_compile aegis-alpha-orchestrator/app/main.py"
   },
   "devDependencies": {
     "@eslint/js": "^9.0.0",

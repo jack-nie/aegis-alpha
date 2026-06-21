@@ -42,6 +42,7 @@ $pipExe = Join-Path $venvPath "Scripts\pip.exe"
 
 & $pipExe install --upgrade pip -q
 & $pipExe install -r (Join-Path $ScriptDir "requirements.txt") -q
+& $pipExe install -r (Join-Path $ScriptDir "requirements-dev.txt") -q
 
 if ($LASTEXITcode -ne 0) {
     Write-Host "  ERROR: Failed to install dependencies" -ForegroundColor Red
