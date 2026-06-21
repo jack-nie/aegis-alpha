@@ -10,7 +10,7 @@
 - persistent_store.py 是 SQLite 持久化存储的底层实现
 - 支持 OpenAI 和 DeepSeek 两个 provider（通过 OpenAI-compatible API）
 - Mock 模式 (`AEGIS_ALPHA_LANGCHAIN_MOCK=true`) 用于离线测试
-- 环境变量使用 AEGIS_ALPHA_* 前缀
+- 环境变量使用 AEGIS*ALPHA*\* 前缀
 
 ## Architecture
 

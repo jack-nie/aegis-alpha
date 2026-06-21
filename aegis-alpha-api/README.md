@@ -4,7 +4,7 @@ Spring Boot 2.7 + MyBatis + MySQL + Redis API for the Aegis Alpha Platform.
 
 ## Runtime
 
-This machine currently has Java 8, so the project uses Spring Boot 2.7.x instead of Spring Boot 3.x.
+The project targets Java 17 (LTS) and uses Spring Boot 2.7.x (still compatible with the 17 runtime; no Spring Boot 3 upgrade is planned yet).
 
 ## MySQL Setup
 
