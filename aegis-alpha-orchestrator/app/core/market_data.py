@@ -57,7 +57,7 @@ class MarketDataService:
         try:
             await self.start()
             response = await self._client.get(
-                f"{backend_url}/api/market-data/quote",
+                f"{backend_url}/_backend/market-data/quote",
                 params={"symbol": ticker},
                 headers={
                     "Authorization": f"Bearer {self._config.node_execution_token}",

@@ -552,7 +552,7 @@ class WorkflowEngine:
     @staticmethod
     def topological_sort(nodes: list[Node], edges: list[Edge]) -> list[Node]:
         """Sort nodes in topological order using Kahn's algorithm."""
-        node_map = {n.id for n in nodes}
+        node_map = {n.id: n for n in nodes}
         in_degree: dict[str, int] = {n.id: 0 for n in nodes}
         adjacency: dict[str, list[str]] = defaultdict(list)
 
