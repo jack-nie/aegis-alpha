@@ -103,6 +103,7 @@ class NodeExecutor:
                     base_url=base_url or self._config.effective_base_url,
                     model=model,
                     started_at=started_at,
+                    node_label=node_label,
                 )
                 logger.info(f"[THINKING] Node invoke succeeded: id={node.id} handler={handler} attempt={attempt + 1}")
                 return result
@@ -166,9 +167,12 @@ class NodeExecutor:
         base_url: str,
         model: str | None,
         started_at: str,
+        node_label: str | None = None,
     ) -> NodeResult:
         """Invoke LLM for node execution."""
         data = node.data
+        if not node_label:
+            node_label = data.label or data.title or node.id
 
         # Build agent name
         agent_name = (

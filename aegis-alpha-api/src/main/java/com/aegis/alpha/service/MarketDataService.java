@@ -130,51 +130,145 @@ public class MarketDataService {
             @Override
             public Map<String, Object> get() {
                 List<String> attempted = new ArrayList<String>();
+
+                // Build candidate providers based on ticker type and available API keys
+                List<java.util.concurrent.Callable<Map<String, Object>>> candidates =
+                        new ArrayList<java.util.concurrent.Callable<Map<String, Object>>>();
+
                 if (isAShare(ticker)) {
                     attempted.add("tencent-finance");
-                    try {
-                        return quoteFromTencent(ticker);
-                    } catch (Exception ignored) {
-                        // Continue to free providers.
-                    }
+                    candidates.add(new java.util.concurrent.Callable<Map<String, Object>>() {
+                        @Override
+                        public Map<String, Object> call() throws Exception {
+                            return quoteFromTencent(ticker);
+                        }
+                    });
                 }
+
                 if (!finnhubApiKey.isEmpty()) {
                     attempted.add("finnhub");
-                    try {
-                        return quoteFromFinnhub(ticker);
-                    } catch (Exception ignored) {
-                        // Continue to free providers.
-                    }
+                    candidates.add(new java.util.concurrent.Callable<Map<String, Object>>() {
+                        @Override
+                        public Map<String, Object> call() throws Exception {
+                            return quoteFromFinnhub(ticker);
+                        }
+                    });
                 }
+
                 if (!alphaVantageApiKey.isEmpty()) {
                     attempted.add("alpha-vantage");
-                    try {
-                        return quoteFromAlphaVantage(ticker);
-                    } catch (Exception ignored) {
-                        // Continue to next provider.
-                    }
+                    candidates.add(new java.util.concurrent.Callable<Map<String, Object>>() {
+                        @Override
+                        public Map<String, Object> call() throws Exception {
+                            return quoteFromAlphaVantage(ticker);
+                        }
+                    });
                 }
+
                 if (!fmpApiKey.isEmpty()) {
                     attempted.add("fmp");
-                    try {
-                        return quoteFromFmp(ticker);
-                    } catch (Exception ignored) {
-                        // Continue to free providers.
-                    }
+                    candidates.add(new java.util.concurrent.Callable<Map<String, Object>>() {
+                        @Override
+                        public Map<String, Object> call() throws Exception {
+                            return quoteFromFmp(ticker);
+                        }
+                    });
                 }
+
+                // Always add free providers as fallback
                 attempted.add("yahoo-chart");
-                try {
-                    return quoteFromYahoo(ticker);
-                } catch (Exception ignored) {
-                    attempted.add("stooq");
-                    try {
+                candidates.add(new java.util.concurrent.Callable<Map<String, Object>>() {
+                    @Override
+                    public Map<String, Object> call() throws Exception {
+                        return quoteFromYahoo(ticker);
+                    }
+                });
+
+                attempted.add("stooq");
+                candidates.add(new java.util.concurrent.Callable<Map<String, Object>>() {
+                    @Override
+                    public Map<String, Object> call() throws Exception {
                         return quoteFromStooq(ticker);
+                    }
+                });
+
+                // Race: submit all candidates concurrently, return first success
+                return race(candidates, attempted, ticker);
+            }
+        }, DEFAULT_TTL_MS);
+    }
+
+    /**
+     * Race multiple candidates concurrently. Return the first successful result.
+     * If all fail, return unavailable with all errors.
+     */
+    private Map<String, Object> race(
+            List<java.util.concurrent.Callable<Map<String, Object>>> candidates,
+            List<String> attempted,
+            String ticker) {
+        if (candidates.isEmpty()) {
+            return unavailable("quote", ticker, attempted, new IllegalStateException("No providers available"));
+        }
+        if (candidates.size() == 1) {
+            try {
+                return candidates.get(0).call();
+            } catch (Exception ex) {
+                return unavailable("quote", ticker, attempted, ex);
+            }
+        }
+
+        java.util.concurrent.ExecutorService executor = java.util.concurrent.Executors.newFixedThreadPool(
+                Math.min(candidates.size(), 6));
+        try {
+            List<java.util.concurrent.Future<Map<String, Object>>> futures =
+                    new ArrayList<java.util.concurrent.Future<Map<String, Object>>>();
+            for (java.util.concurrent.Callable<Map<String, Object>> candidate : candidates) {
+                futures.add(executor.submit(candidate));
+            }
+
+            // Wait for first success or all failures
+            List<Exception> errors = new ArrayList<Exception>();
+            long deadline = System.currentTimeMillis() + 8000; // 8s total timeout
+
+            for (int i = 0; i < futures.size(); i++) {
+                long remaining = deadline - System.currentTimeMillis();
+                if (remaining <= 0) {
+                    break;
+                }
+                try {
+                    Map<String, Object> result = futures.get(i).get(Math.min(remaining, 3000),
+                            java.util.concurrent.TimeUnit.MILLISECONDS);
+                    if (result != null && Boolean.TRUE.equals(result.get("ok"))) {
+                        // Cancel remaining futures
+                        for (int j = i + 1; j < futures.size(); j++) {
+                            futures.get(j).cancel(true);
+                        }
+                        return result;
+                    }
+                } catch (Exception ex) {
+                    errors.add(ex);
+                }
+            }
+
+            // Check remaining futures that might have completed
+            for (java.util.concurrent.Future<Map<String, Object>> future : futures) {
+                if (future.isDone() && !future.isCancelled()) {
+                    try {
+                        Map<String, Object> result = future.get(0, java.util.concurrent.TimeUnit.MILLISECONDS);
+                        if (result != null && Boolean.TRUE.equals(result.get("ok"))) {
+                            return result;
+                        }
                     } catch (Exception ex) {
-                        return unavailable("quote", ticker, attempted, ex);
+                        // Ignore
                     }
                 }
             }
-        }, DEFAULT_TTL_MS);
+
+            Exception lastError = errors.isEmpty() ? new IllegalStateException("All providers timed out") : errors.get(errors.size() - 1);
+            return unavailable("quote", ticker, attempted, lastError);
+        } finally {
+            executor.shutdownNow();
+        }
     }
 
     public Map<String, Object> financials(String symbol) {

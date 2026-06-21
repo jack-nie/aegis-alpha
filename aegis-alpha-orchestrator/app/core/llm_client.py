@@ -149,7 +149,7 @@ class LLMClient:
         ]
 
         try:
-            use_structured = tools is None and not is_aggregate_handler(system)
+            use_structured = tools is None and not self._is_aggregate_handler(system)
             if use_structured:
                 try:
                     structured_llm = client.with_structured_output(AnalystResult)
