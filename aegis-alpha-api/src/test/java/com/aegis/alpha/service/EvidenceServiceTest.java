@@ -163,4 +163,83 @@ class EvidenceServiceTest {
 
         verify(governanceMapper).insertEvidence(argThat(item -> "TIER_3".equals(item.getTrustTier())));
     }
+
+    @Test
+    void materializeEvidenceInsertsFromDataClaims() throws Exception {
+        when(governanceMapper.countEvidence("run-claims")).thenReturn(0);
+
+        WorkflowNodeRun nodeRun = new WorkflowNodeRun();
+        nodeRun.setNodeRunId("nr-claims");
+        nodeRun.setNodeName("aggregate");
+        nodeRun.setCompletedAt("2026-01-01 12:00:00");
+        String outputJson = objectMapper.writeValueAsString(mapOf(
+                entry("data", mapOf(
+                        entry("claims", Arrays.asList(
+                                mapOf(
+                                        entry("claimId", "c_last_price"),
+                                        entry("field", "last_price"),
+                                        entry("value", 190.2),
+                                        entry("evidenceId", "e-market-1"),
+                                        entry("asOf", "2026-01-01T15:30:00Z")
+                                ),
+                                mapOf(
+                                        entry("claimId", "c_thesis"),
+                                        entry("field", "thesis_summary"),
+                                        entry("value", "growth story"),
+                                        entry("asOf", "2026-01-01T15:30:00Z")
+                                )
+                        ))
+                ))
+        ));
+        nodeRun.setOutputJson(outputJson);
+        when(workflowMapper.findNodeRuns("run-claims")).thenReturn(Arrays.asList(nodeRun));
+
+        WorkflowRun run = new WorkflowRun();
+        run.setRunId("run-claims");
+
+        service.materializeEvidence(run);
+
+        verify(governanceMapper).insertEvidence(argThat(item ->
+                "market".equals(item.getSourceType())
+                        && "TIER_1".equals(item.getTrustTier())
+                        && "e-market-1".equals(item.getEvidenceId())
+                        && item.getTitle().contains("last_price")
+                        && item.getTitle().contains("190.2")
+        ));
+        verify(governanceMapper).insertEvidence(argThat(item ->
+                "claim".equals(item.getSourceType())
+                        && "TIER_3".equals(item.getTrustTier())
+                        && item.getTitle().contains("thesis_summary")
+        ));
+        verify(governanceMapper, times(2)).insertEvidence(any(EvidenceItem.class));
+    }
+
+    @Test
+    void materializeEvidenceKeepsSourcesAndClaimsTogether() throws Exception {
+        when(governanceMapper.countEvidence("run-both")).thenReturn(0);
+
+        WorkflowNodeRun nodeRun = new WorkflowNodeRun();
+        nodeRun.setNodeRunId("nr-both");
+        nodeRun.setNodeName("research");
+        nodeRun.setCompletedAt("2026-01-01 12:00:00");
+        String outputJson = objectMapper.writeValueAsString(mapOf(
+                entry("sources", Arrays.asList(
+                        mapOf(entry("sourceType", "news"), entry("title", "Headline"))
+                )),
+                entry("data", mapOf(
+                        entry("claims", Arrays.asList(
+                                mapOf(entry("field", "revenue"), entry("value", 1000), entry("claimId", "c_rev"))
+                        ))
+                ))
+        ));
+        nodeRun.setOutputJson(outputJson);
+        when(workflowMapper.findNodeRuns("run-both")).thenReturn(Arrays.asList(nodeRun));
+
+        WorkflowRun run = new WorkflowRun();
+        run.setRunId("run-both");
+
+        service.materializeEvidence(run);
+
+        verify(governanceMapper, times(2)).insertEvidence(any(EvidenceItem.class));
+    }
 }

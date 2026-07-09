@@ -8,6 +8,7 @@ from typing import Any
 import httpx
 
 from ..config import Settings
+from ..utils.symbol_normalize import try_normalize_symbol
 
 logger = logging.getLogger(__name__)
 
@@ -48,10 +49,26 @@ class MarketDataService:
         if not self.should_hydrate(handler):
             return None
 
-        ticker = self._extract_ticker(state, subject)
-        if not ticker:
-            return None
+        resolved = self._resolve_symbol(state, subject)
+        if not resolved.get("ok"):
+            error = resolved.get("error") or "symbol_unresolved"
+            raw = resolved.get("raw") or ""
+            if not raw and error in ("empty_symbol", "no_ticker"):
+                return None
+            logger.warning(
+                "Market hydration skipped: symbol normalize failed raw=%s error=%s",
+                raw,
+                error,
+            )
+            return {
+                "ok": False,
+                "status": "missing_symbol",
+                "error": error,
+                "rawSymbol": raw,
+                "missing": ["normalized_symbol"],
+            }
 
+        ticker = resolved["symbol"]
         backend_url = self._config.effective_backend_url
 
         try:
@@ -67,6 +84,12 @@ class MarketDataService:
             if response.status_code == 200:
                 data = response.json()
                 logger.info(f"Hydrated market data for {ticker}")
+                if isinstance(data, dict):
+                    data = {
+                        **data,
+                        "normalizedSymbol": ticker,
+                        "market": resolved.get("market"),
+                    }
                 return data
             else:
                 logger.warning(
@@ -76,6 +99,37 @@ class MarketDataService:
         except Exception as e:
             logger.error(f"Market data hydration error: {e}")
             return {"ok": False, "status": "unavailable", "error": str(e)}
+
+    def _resolve_symbol(self, state: dict[str, Any], subject: str) -> dict[str, Any]:
+        """Extract and normalize ticker; hard-fail ambiguous A-share bare codes."""
+        raw = self._extract_ticker(state, subject)
+        if not raw:
+            return {"ok": False, "error": "no_ticker", "raw": ""}
+
+        market_hint = None
+        if isinstance(state, dict):
+            market_hint = (
+                state.get("market")
+                or state.get("marketHint")
+                or state.get("exchange")
+            )
+            if market_hint is not None:
+                market_hint = str(market_hint)
+
+        normalized = try_normalize_symbol(raw, market_hint)
+        if not normalized.get("ok"):
+            return {
+                "ok": False,
+                "error": normalized.get("error") or "symbol_normalize_failed",
+                "raw": raw,
+                "symbol": raw,
+            }
+        return {
+            "ok": True,
+            "symbol": normalized["symbol"],
+            "market": normalized.get("market"),
+            "raw": raw,
+        }
 
     def _extract_ticker(self, state: dict[str, Any], subject: str) -> str:
         """Extract ticker symbol from state or subject."""
@@ -88,8 +142,12 @@ class MarketDataService:
         if subject:
             parts = subject.split()
             if parts:
-                candidate = parts[0].upper()
-                # Simple heuristic: ticker is usually 1-5 uppercase chars
-                if 1 <= len(candidate) <= 5 and candidate.isalpha():
+                candidate = parts[0].strip()
+                upper = candidate.upper()
+                # US-style: 1-5 letters
+                if 1 <= len(upper) <= 5 and upper.isalpha():
+                    return upper
+                # A-share / HK style tokens (digits or digits.suffix)
+                if any(ch.isdigit() for ch in candidate) and len(candidate) <= 12:
                     return candidate
         return ""

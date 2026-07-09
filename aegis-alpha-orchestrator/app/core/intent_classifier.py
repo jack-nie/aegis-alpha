@@ -7,6 +7,7 @@ import re
 from typing import Any
 
 from ..models.responses import IntentResult
+from ..utils.symbol_normalize import try_normalize_symbol
 from .llm_client import LLMClient
 
 logger = logging.getLogger(__name__)
@@ -17,6 +18,24 @@ class IntentClassifier:
 
     def __init__(self, llm_client: LLMClient):
         self._llm_client = llm_client
+
+    @staticmethod
+    def _attach_normalized_symbol(ticker: str | None) -> dict[str, Any]:
+        """If ticker looks normalizable, attach structured symbol metadata."""
+        if not ticker or not str(ticker).strip():
+            return {}
+        normalized = try_normalize_symbol(str(ticker).strip())
+        if normalized.get("ok"):
+            return {
+                "normalizedSymbol": normalized.get("symbol"),
+                "market": normalized.get("market"),
+                "symbolNormalizeOk": True,
+            }
+        return {
+            "symbolNormalizeOk": False,
+            "symbolNormalizeError": normalized.get("error"),
+            "rawSymbol": ticker,
+        }
 
     async def classify(
         self, message: str, workflows: list[dict[str, Any]]
@@ -37,7 +56,9 @@ class IntentClassifier:
             result = await self._llm_client.classify_intent(message, tools)
             if result:
                 function_name = result.get("function", "")
-                ticker = result.get("ticker", "")
+                ticker = result.get("ticker", "") or None
+                if ticker is not None and not str(ticker).strip():
+                    ticker = None
 
                 # Look up original key; never reverse-munge underscores/hyphens
                 workflow_key = function_name_map.get(function_name)
@@ -50,9 +71,10 @@ class IntentClassifier:
 
                 return IntentResult(
                     workflow_key=workflow_key,
-                    ticker=ticker or None,
+                    ticker=ticker,
                     confidence=0.9 if matched_wf else 0.5,
                     source="llm_function_calling",
+                    data=self._attach_normalized_symbol(ticker),
                 )
 
             # No function call - try keyword fallback
@@ -140,12 +162,15 @@ class IntentClassifier:
                 best_score = score
                 best_wf = wf
 
+        symbol_data = self._attach_normalized_symbol(ticker)
+
         if best_wf and best_score > 0:
             return IntentResult(
                 workflow_key=best_wf.get("workflowKey"),
                 ticker=ticker,
                 confidence=min(0.5 + best_score * 0.1, 0.8),
                 source="keyword_fallback",
+                data=symbol_data,
             )
 
         return IntentResult(
@@ -153,4 +178,5 @@ class IntentClassifier:
             ticker=ticker,
             confidence=0,
             source="no_match",
+            data=symbol_data,
         )

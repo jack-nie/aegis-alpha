@@ -52,7 +52,11 @@ function normalizePathname(value) {
     String(value || "/")
       .split("?")[0]
       .replace(/\/+$/, "") || "/";
-  return KNOWN_APP_PATHS.has(raw) ? raw : "/";
+  if (KNOWN_APP_PATHS.has(raw)) return raw;
+  // Deep links that survive refresh/share (Phase 0.5 / P0 UX)
+  if (/^\/runs\/[^/]+$/.test(raw)) return raw;
+  if (/^\/recommendations\/[^/]+$/.test(raw)) return raw;
+  return "/";
 }
 
 function readInitialPathname() {
@@ -63,6 +67,26 @@ function readInitialPathname() {
 function readSearchParam(name, fallback = "") {
   if (typeof window === "undefined") return fallback;
   return new URLSearchParams(window.location.search).get(name) || fallback;
+}
+
+function extractDeepLinkRunId(path) {
+  const match = String(path || "").match(/^\/runs\/([^/]+)$/);
+  if (!match) return "";
+  try {
+    return decodeURIComponent(match[1]);
+  } catch {
+    return match[1];
+  }
+}
+
+function extractDeepLinkRecommendationId(path) {
+  const match = String(path || "").match(/^\/recommendations\/([^/]+)$/);
+  if (!match) return "";
+  try {
+    return decodeURIComponent(match[1]);
+  } catch {
+    return match[1];
+  }
 }
 
 const pageTitles = {
@@ -91,6 +115,13 @@ const pageTitles = {
   "/governance/models": "治理 / 模型治理",
   "/recommendations": "研究与推荐 / 推荐历史",
 };
+
+function resolvePageTitle(path) {
+  if (pageTitles[path]) return pageTitles[path];
+  if (extractDeepLinkRunId(path)) return pageTitles["/workflow/runs"];
+  if (extractDeepLinkRecommendationId(path)) return pageTitles["/recommendations"];
+  return "Aegis Alpha";
+}
 
 const navItems = [
   { label: "主页", icon: "home", path: "/", exact: true },
@@ -809,7 +840,12 @@ function Sidebar({ path, navigate, _collapsed, _setCollapsed, mobile = false, on
 
   useEffect(() => {
     if (path.startsWith("/portfolio")) setExpandedMenus((items) => Array.from(new Set([...items, "投资组合"])));
-    if (path.startsWith("/agent") || path.startsWith("/workflow") || path.startsWith("/report"))
+    if (
+      path.startsWith("/agent") ||
+      path.startsWith("/workflow") ||
+      path.startsWith("/report") ||
+      path.startsWith("/runs/")
+    )
       setExpandedMenus((items) => Array.from(new Set([...items, "AI+"])));
     if (path.startsWith("/backtest")) setExpandedMenus((items) => Array.from(new Set([...items, "回测"])));
     if (path.startsWith("/recommendations")) setExpandedMenus((items) => Array.from(new Set([...items, "研究与推荐"])));
@@ -818,7 +854,10 @@ function Sidebar({ path, navigate, _collapsed, _setCollapsed, mobile = false, on
 
   const toggleMenu = (label) =>
     setExpandedMenus((prev) => (prev.includes(label) ? prev.filter((item) => item !== label) : [...prev, label]));
-  const isActive = (target, exact) => (exact ? path === target : path === target || path.startsWith(`${target}/`));
+  const isActive = (target, exact) => {
+    if (target === "/workflow/runs" && path.startsWith("/runs/")) return true;
+    return exact ? path === target : path === target || path.startsWith(`${target}/`);
+  };
   const handleNavigate = (target) => {
     navigate(target);
     onNavigate?.();
@@ -894,7 +933,7 @@ function Sidebar({ path, navigate, _collapsed, _setCollapsed, mobile = false, on
 }
 
 function Header({ path, copilotOpen, setCopilotOpen, me, onLogout, onMenuOpen }) {
-  const title = pageTitles[path] || "Aegis Alpha";
+  const title = resolvePageTitle(path);
   return (
     <header className="min-h-16 flex-shrink-0 border-b border-gray-200 bg-white px-3 py-3 sm:px-4 lg:px-6">
       <div className="flex min-w-0 items-center justify-between gap-3">
@@ -4531,7 +4570,7 @@ function Dashboard({ api }) {
   );
 }
 
-function WorkflowRunCenterPage({ api }) {
+function WorkflowRunCenterPage({ api, navigate, deepLinkRunId = "" }) {
   const [runs, setRuns] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -4539,6 +4578,8 @@ function WorkflowRunCenterPage({ api }) {
   const [detail, setDetail] = useState({ open: false, row: null, nodes: [], loading: false, error: "" });
   const [statusFilter, setStatusFilter] = useState(() => readSearchParam("status", "ALL").toUpperCase());
   const [traceSearch, setTraceSearch] = useState(() => readSearchParam("traceId", ""));
+  const openDetailRequestRef = useRef(0);
+  const pendingRunHintRef = useRef(null);
 
   const loadRuns = useCallback(async () => {
     setLoading(true);
@@ -4560,23 +4601,82 @@ function WorkflowRunCenterPage({ api }) {
     loadRuns();
   }, [loadRuns]);
 
-  const openTrace = async (run) => {
+  const openTraceById = useCallback(
+    async (runId, runHint = null) => {
+      const requestId = ++openDetailRequestRef.current;
+      if (!runId) {
+        setDetail({
+          open: true,
+          row: runHint,
+          nodes: [],
+          loading: false,
+          error: "该运行记录缺少 runId，无法查询节点详情。",
+        });
+        return;
+      }
+      let run = runHint;
+      if (!run) {
+        run = runs.find((item) => String(pickFirst(item, ["runId", "run_id", "id"])) === String(runId)) || null;
+      }
+      if (!run) {
+        try {
+          run = await api(`/workflow/runs/${encodeURIComponent(String(runId))}`);
+        } catch {
+          run = { runId };
+        }
+      }
+      if (requestId !== openDetailRequestRef.current) return;
+      setDetail({
+        open: true,
+        row: run,
+        nodes: [],
+        loading: true,
+        error: "",
+      });
+      try {
+        const response = await api(`/workflow/runs/${encodeURIComponent(String(runId))}/nodes`);
+        if (requestId !== openDetailRequestRef.current) return;
+        setDetail({ open: true, row: run, nodes: normalizeListResponse(response), loading: false, error: "" });
+      } catch (ex) {
+        if (requestId !== openDetailRequestRef.current) return;
+        setDetail({ open: true, row: run, nodes: [], loading: false, error: ex.message || "加载节点详情失败" });
+      }
+    },
+    [api, runs],
+  );
+
+  const openTrace = (run) => {
     const runId = pickFirst(run, ["runId", "run_id", "id"]);
-    setDetail({
-      open: true,
-      row: run,
-      nodes: [],
-      loading: Boolean(runId),
-      error: runId ? "" : "该运行记录缺少 runId，无法查询节点详情。",
-    });
-    if (!runId) return;
-    try {
-      const response = await api(`/workflow/runs/${runId}/nodes`);
-      setDetail({ open: true, row: run, nodes: normalizeListResponse(response), loading: false, error: "" });
-    } catch (ex) {
-      setDetail({ open: true, row: run, nodes: [], loading: false, error: ex.message || "加载节点详情失败" });
+    if (runId && navigate) {
+      pendingRunHintRef.current = run;
+      navigate(`/runs/${encodeURIComponent(String(runId))}`);
+      return;
     }
+    openTraceById(runId, run);
   };
+
+  const closeTrace = () => {
+    openDetailRequestRef.current += 1;
+    pendingRunHintRef.current = null;
+    setDetail({ open: false, row: null, nodes: [], loading: false, error: "" });
+    if (navigate) navigate("/workflow/runs");
+  };
+
+  useEffect(() => {
+    if (!deepLinkRunId) {
+      setDetail((prev) =>
+        prev.open ? { open: false, row: null, nodes: [], loading: false, error: "" } : prev,
+      );
+      return;
+    }
+    const currentId = pickFirst(detail.row, ["runId", "run_id", "id"]);
+    if (detail.open && String(currentId) === String(deepLinkRunId) && !detail.loading) return;
+    const runHint = pendingRunHintRef.current;
+    pendingRunHintRef.current = null;
+    openTraceById(deepLinkRunId, runHint);
+    // Only react to deep-link id changes; openTraceById is stable for a given runs snapshot.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [deepLinkRunId]);
 
   const runAction = async (run, action) => {
     const runId = pickFirst(run, ["runId", "run_id", "id"]);
@@ -4888,12 +4988,7 @@ function WorkflowRunCenterPage({ api }) {
         </div>
       </div>
 
-      {detail.open && (
-        <BacktestTracePanel
-          detail={detail}
-          onClose={() => setDetail({ open: false, row: null, nodes: [], loading: false, error: "" })}
-        />
-      )}
+      {detail.open && <BacktestTracePanel detail={detail} onClose={closeTrace} />}
     </div>
   );
 }
@@ -5156,7 +5251,7 @@ function ModelGovernancePage({ api }) {
   );
 }
 
-function RecommendationHistoryPage({ api }) {
+function RecommendationHistoryPage({ api, navigate, deepLinkWorkflowRunId = "" }) {
   const [items, setItems] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -5169,6 +5264,8 @@ function RecommendationHistoryPage({ api }) {
     loading: false,
     error: "",
   });
+  const openDetailRequestRef = useRef(0);
+  const pendingRecommendationHintRef = useRef(null);
 
   const loadRecommendations = useCallback(async () => {
     setLoading(true);
@@ -5187,46 +5284,90 @@ function RecommendationHistoryPage({ api }) {
     loadRecommendations();
   }, [loadRecommendations]);
 
-  const openDetail = async (row) => {
-    const workflowRunId = pickFirst(row, ["workflowRunId", "workflow_run_id"]);
-    setDetail({
-      open: true,
-      recommendation: row,
-      evidence: [],
-      llmCalls: [],
-      loading: Boolean(workflowRunId),
-      error: workflowRunId ? "" : "缺少 workflowRunId，无法加载推荐证据。",
-    });
-    if (!workflowRunId) return;
-    try {
-      const response = await api(`/recommendations/${workflowRunId}`);
-      let llmCalls = [];
-      try {
-        llmCalls = normalizeListResponse(
-          await api(`/governance/llm-calls?workflowRunId=${encodeURIComponent(workflowRunId)}`),
-        );
-      } catch {
-        llmCalls = [];
-      }
-      setDetail({
-        open: true,
-        recommendation: response?.recommendation || row,
-        evidence: normalizeListResponse(response?.evidence || []),
-        llmCalls,
-        loading: false,
-        error: "",
-      });
-    } catch (ex) {
+  const openDetailById = useCallback(
+    async (workflowRunId, rowHint = null) => {
+      const requestId = ++openDetailRequestRef.current;
+      const row =
+        rowHint ||
+        items.find((item) => String(pickFirst(item, ["workflowRunId", "workflow_run_id"])) === String(workflowRunId)) ||
+        (workflowRunId ? { workflowRunId } : null);
       setDetail({
         open: true,
         recommendation: row,
         evidence: [],
         llmCalls: [],
-        loading: false,
-        error: ex.message || "加载推荐详情失败",
+        loading: Boolean(workflowRunId),
+        error: workflowRunId ? "" : "缺少 workflowRunId，无法加载推荐证据。",
       });
+      if (!workflowRunId) return;
+      try {
+        const response = await api(`/recommendations/${encodeURIComponent(String(workflowRunId))}`);
+        let llmCalls = [];
+        try {
+          llmCalls = normalizeListResponse(
+            await api(`/governance/llm-calls?workflowRunId=${encodeURIComponent(String(workflowRunId))}`),
+          );
+        } catch {
+          llmCalls = [];
+        }
+        if (requestId !== openDetailRequestRef.current) return;
+        setDetail({
+          open: true,
+          recommendation: response?.recommendation || row,
+          evidence: normalizeListResponse(response?.evidence || []),
+          llmCalls,
+          loading: false,
+          error: "",
+        });
+      } catch (ex) {
+        if (requestId !== openDetailRequestRef.current) return;
+        setDetail({
+          open: true,
+          recommendation: row,
+          evidence: [],
+          llmCalls: [],
+          loading: false,
+          error: ex.message || "加载推荐详情失败",
+        });
+      }
+    },
+    [api, items],
+  );
+
+  const openDetail = (row) => {
+    const workflowRunId = pickFirst(row, ["workflowRunId", "workflow_run_id"]);
+    if (workflowRunId && navigate) {
+      pendingRecommendationHintRef.current = row;
+      navigate(`/recommendations/${encodeURIComponent(String(workflowRunId))}`);
+      return;
     }
+    openDetailById(workflowRunId, row);
   };
+
+  const closeDetail = () => {
+    openDetailRequestRef.current += 1;
+    pendingRecommendationHintRef.current = null;
+    setDetail({ open: false, recommendation: null, evidence: [], llmCalls: [], loading: false, error: "" });
+    if (navigate) navigate("/recommendations");
+  };
+
+  useEffect(() => {
+    if (!deepLinkWorkflowRunId) {
+      setDetail((prev) =>
+        prev.open
+          ? { open: false, recommendation: null, evidence: [], llmCalls: [], loading: false, error: "" }
+          : prev,
+      );
+      return;
+    }
+    const currentId = pickFirst(detail.recommendation, ["workflowRunId", "workflow_run_id"]);
+    if (detail.open && String(currentId) === String(deepLinkWorkflowRunId) && !detail.loading) return;
+    const rowHint = pendingRecommendationHintRef.current;
+    pendingRecommendationHintRef.current = null;
+    openDetailById(deepLinkWorkflowRunId, rowHint);
+    // Only react to deep-link id changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [deepLinkWorkflowRunId]);
 
   const decide = async (row, action) => {
     const workflowRunId = pickFirst(row, ["workflowRunId", "workflow_run_id"]);
@@ -5390,9 +5531,7 @@ function RecommendationHistoryPage({ api }) {
         <RecommendationDetailPanel
           detail={detail}
           actionBusy={actionBusy}
-          onClose={() =>
-            setDetail({ open: false, recommendation: null, evidence: [], llmCalls: [], loading: false, error: "" })
-          }
+          onClose={closeDetail}
           onDecision={decide}
         />
       )}
@@ -6252,9 +6391,13 @@ export default function App() {
     return <div className="grid min-h-screen place-items-center text-sm text-gray-500">加载 Aegis Alpha...</div>;
   if (!token) return <LoginPage onLogin={login} />;
 
+  const deepLinkRunId = extractDeepLinkRunId(path);
+  const deepLinkWorkflowRunId = extractDeepLinkRecommendationId(path);
+
   let page = <Home navigate={navigate} openCopilotWithPrompt={openCopilotWithPrompt} />;
   if (path === "/agent") page = <AgentPage api={api} />;
-  else if (path === "/workflow/runs") page = <WorkflowRunCenterPage api={api} />;
+  else if (path === "/workflow/runs" || deepLinkRunId)
+    page = <WorkflowRunCenterPage api={api} navigate={navigate} deepLinkRunId={deepLinkRunId} />;
   else if (path === "/workflow") page = <WorkflowPage api={api} token={token} />;
   else if (path.startsWith("/portfolio")) page = <Portfolio api={api} navigate={navigate} path={path} />;
   else if (path === "/data-center/dashboard") page = <Dashboard api={api} />;
@@ -6263,7 +6406,14 @@ export default function App() {
   else if (path.startsWith("/backtest")) page = <Placeholder title={pageTitles[path] || "回测"} />;
   else if (path === "/governance/models") page = <ModelGovernancePage api={api} />;
   else if (path === "/governance/audit") page = <AuditLogPage api={api} />;
-  else if (path === "/recommendations") page = <RecommendationHistoryPage api={api} />;
+  else if (path === "/recommendations" || deepLinkWorkflowRunId)
+    page = (
+      <RecommendationHistoryPage
+        api={api}
+        navigate={navigate}
+        deepLinkWorkflowRunId={deepLinkWorkflowRunId}
+      />
+    );
   else if (path === "/watchlist")
     page = <Placeholder title="自选股" desc="自选股页面保持当前导航样式，后续可接入关注列表与价格提醒。" />;
   else if (path.startsWith("/profile")) page = <Placeholder title={pageTitles[path] || "个人中心"} />;

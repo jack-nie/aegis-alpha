@@ -15,6 +15,19 @@ assert.doesNotMatch(
   "Path state should not be a fixed in-memory default.",
 );
 
+assert.match(source, /extractDeepLinkRunId/, "App should parse /runs/:runId deep links.");
+assert.match(source, /extractDeepLinkRecommendationId/, "App should parse /recommendations/:workflowRunId deep links.");
+assert.match(source, /\\\/runs\\\/\[\^\/\]\+/, "normalizePathname should accept /runs/:runId paths.");
+assert.match(source, /\\\/recommendations\\\/\[\^\/\]\+/, "normalizePathname should accept /recommendations/:id paths.");
+assert.match(source, /deepLinkRunId/, "Workflow run center should accept a deep-linked run id.");
+assert.match(source, /deepLinkWorkflowRunId/, "Recommendation history should accept a deep-linked workflow run id.");
+assert.match(source, /navigate\(`\/runs\/\$\{/, "Opening a run detail should push /runs/:runId.");
+assert.match(
+  source,
+  /navigate\(`\/recommendations\/\$\{/,
+  "Opening a recommendation detail should push /recommendations/:workflowRunId.",
+);
+
 assert.match(source, /function\s+ModalShell/, "Agent dialogs should use the shared ModalShell.");
 assert.match(source, /function\s+DrawerShell/, "Drawers should use the shared DrawerShell.");
 assert.match(source, /role=["']dialog["']/, "Dialogs and drawers should expose role=dialog.");

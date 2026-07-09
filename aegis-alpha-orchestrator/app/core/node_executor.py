@@ -12,6 +12,7 @@ from ..config import Settings
 from ..models.workflow import Node, AgentTemplate
 from ..models.responses import NodeResult
 from ..prompts import PromptManager
+from .critique import critique_recommendation_draft
 from .llm_client import LLMClient
 from .market_data import MarketDataService
 from .recommendation_policy import enforce_recommendation_policy
@@ -276,6 +277,25 @@ class NodeExecutor:
                 degraded=bool(result_data.get("degraded")) if isinstance(result_data, dict) else False,
                 sources=sources,
             )
+            draft_for_critique = {
+                "recommendation": str(draft_label) if draft_label is not None else None,
+                "confidence": confidence,
+                "claims": result_data.get("claims") if isinstance(result_data, dict) else None,
+                "missingData": result_data.get("missingData") if isinstance(result_data, dict) else None,
+                "degraded": bool(result_data.get("degraded")) if isinstance(result_data, dict) else False,
+                "sources": sources,
+                "conflicts": result_data.get("conflicts") if isinstance(result_data, dict) else None,
+            }
+            critique = critique_recommendation_draft(state, draft_for_critique)
+            # Policy already maps failing BUY/SELL → INSUFFICIENT_DATA; critique records the gate failure.
+            if not critique.get("ok") and policy["recommendation"] in ("BUY", "SELL"):
+                # Safety net: never leave actionable labels when critique fails.
+                policy = {
+                    **policy,
+                    "recommendation": "INSUFFICIENT_DATA",
+                    "forcedInsufficient": True,
+                    "degraded": True,
+                }
             result_data = {
                 **result_data,
                 "recommendation": policy["recommendation"],
@@ -289,9 +309,28 @@ class NodeExecutor:
                     "hasFinancials": policy["hasFinancials"],
                     "hasEvidence": policy["hasEvidence"],
                 },
+                "critique": critique,
             }
             confidence = policy["confidence"]
             degraded = policy["degraded"]
+            # Optional policy source summarizing critique outcome
+            critique_notes = critique.get("notes") or []
+            critique_missing = critique.get("missing_data") or []
+            sources = [
+                *sources,
+                {
+                    "title": "recommendation_critique",
+                    "url": "",
+                    "type": "policy",
+                    "sourceType": "policy",
+                    "summary": (
+                        f"ok={critique.get('ok')} "
+                        f"missing={len(critique_missing)} "
+                        f"conflicts={len(critique.get('conflicts') or [])} "
+                        f"notes={','.join(str(n) for n in critique_notes[:5])}"
+                    ).strip(),
+                },
+            ]
             # Surface machine-readable label in summary prefix for Java materializer
             summary = f"[{policy['recommendation']}] {summary or ''}".strip()
 

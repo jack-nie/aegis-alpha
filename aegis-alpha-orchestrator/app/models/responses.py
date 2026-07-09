@@ -57,6 +57,8 @@ class IntentResult(BaseModel):
     source: str = ""
     reason: str | None = None
     error: str | None = None
+    # Optional extras (e.g. normalized symbol); ignored by older Java consumers
+    data: dict[str, Any] = Field(default_factory=dict)
 
 
 class HealthResponse(BaseModel):
