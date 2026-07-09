@@ -51,6 +51,8 @@ class RecommendationServiceTest {
 
         assertThat(detail).containsKey("recommendation");
         assertThat(detail).containsKey("evidence");
+        assertThat(detail).containsKey("approvable");
+        assertThat(detail.get("approvable")).isInstanceOf(Boolean.class);
     }
 
     @Test
@@ -106,9 +108,11 @@ class RecommendationServiceTest {
 
         Recommendation result = service.createFromWorkflowRun(workflowRun, backtestRun, inputs);
 
-        assertThat(result.getRecommendation()).isEqualTo("BUY");
+        // Empty evidence forces actionable BUY → INSUFFICIENT_DATA (approve gate)
+        assertThat(result.getRecommendation()).isEqualTo("INSUFFICIENT_DATA");
         assertThat(result.getSymbol()).isEqualTo("AAPL");
         assertThat(result.getApprovalStatus()).isEqualTo("PENDING_REVIEW");
+        assertThat(result.getDisclaimer()).contains("DEGRADED");
         verify(governanceMapper).insertRecommendation(any(Recommendation.class));
     }
 
@@ -128,7 +132,8 @@ class RecommendationServiceTest {
 
         Recommendation result = service.createFromWorkflowRun(workflowRun, backtestRun, null);
 
-        assertThat(result.getRecommendation()).isEqualTo("SELL");
+        // Empty evidence forces actionable SELL → INSUFFICIENT_DATA (approve gate)
+        assertThat(result.getRecommendation()).isEqualTo("INSUFFICIENT_DATA");
     }
 
     @Test

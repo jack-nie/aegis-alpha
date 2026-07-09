@@ -52,7 +52,34 @@ public class EvidenceService {
                 item.setRetrievedAt(text(first(source.get("retrievedAt"), source.get("publishedAt")), text(nodeRun.getCompletedAt(), now())));
                 governanceMapper.insertEvidence(item);
             }
+            for (Map<String, Object> claim : claims(output)) {
+                EvidenceItem item = fromClaim(run.getRunId(), nodeRun, claim);
+                if (item != null) {
+                    governanceMapper.insertEvidence(item);
+                }
+            }
         }
+    }
+
+    private EvidenceItem fromClaim(String workflowRunId, WorkflowNodeRun nodeRun, Map<String, Object> claim) {
+        if (claim == null || claim.isEmpty()) {
+            return null;
+        }
+        String field = text(claim.get("field"), "");
+        String value = claim.get("value") == null ? "" : String.valueOf(claim.get("value")).trim();
+        boolean market = isMarketField(field);
+        EvidenceItem item = new EvidenceItem();
+        String claimEvidenceId = text(first(claim.get("evidenceId"), claim.get("claimId")), "");
+        item.setEvidenceId(claimEvidenceId.isEmpty() ? UUID.randomUUID().toString() : claimEvidenceId);
+        item.setWorkflowRunId(workflowRunId);
+        item.setNodeRunId(nodeRun.getNodeRunId());
+        item.setSourceType(market ? "market" : "claim");
+        item.setTitle((field + " " + value).trim());
+        item.setUrl("");
+        item.setTrustTier(market ? "TIER_1" : "TIER_3");
+        item.setSummary(toJson(claim));
+        item.setRetrievedAt(text(first(claim.get("asOf"), claim.get("as_of")), text(nodeRun.getCompletedAt(), now())));
+        return item;
     }
 
     @SuppressWarnings("unchecked")
@@ -64,6 +91,47 @@ public class EvidenceService {
         return java.util.Collections.emptyList();
     }
 
+    @SuppressWarnings("unchecked")
+    private List<Map<String, Object>> claims(Map<String, Object> output) {
+        Object claims = null;
+        Object data = output.get("data");
+        if (data instanceof Map) {
+            claims = ((Map<String, Object>) data).get("claims");
+        }
+        if (!(claims instanceof List)) {
+            claims = output.get("claims");
+        }
+        if (!(claims instanceof List)) {
+            return java.util.Collections.emptyList();
+        }
+        List<Map<String, Object>> result = new java.util.ArrayList<>();
+        for (Object entry : (List<?>) claims) {
+            if (entry instanceof Map) {
+                result.add((Map<String, Object>) entry);
+            }
+        }
+        return result;
+    }
+
+    private boolean isMarketField(String field) {
+        if (field == null || field.trim().isEmpty()) {
+            return false;
+        }
+        String normalized = field.trim().toLowerCase().replace('-', '_');
+        return "last_price".equals(normalized)
+                || "price".equals(normalized)
+                || "quote".equals(normalized)
+                || "volume".equals(normalized)
+                || "market_cap".equals(normalized)
+                || "marketcap".equals(normalized)
+                || "revenue".equals(normalized)
+                || "net_income".equals(normalized)
+                || "netincome".equals(normalized)
+                || "eps".equals(normalized)
+                || "financials".equals(normalized)
+                || normalized.contains("price");
+    }
+
     private String trustTier(String sourceType, String title) {
         String combined = (sourceType + " " + title).toLowerCase();
         if (combined.contains("filing") || combined.contains("sec") || combined.contains("10-k") || combined.contains("10-q")) {
@@ -73,6 +141,14 @@ public class EvidenceService {
             return "TIER_2";
         }
         return "TIER_3";
+    }
+
+    private String toJson(Object value) {
+        try {
+            return objectMapper.writeValueAsString(value);
+        } catch (Exception ignored) {
+            return String.valueOf(value);
+        }
     }
 
     private Object first(Object value, Object fallback) {

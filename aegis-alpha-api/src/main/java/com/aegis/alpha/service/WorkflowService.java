@@ -421,15 +421,54 @@ public class WorkflowService {
                         ev.setSortOrder(0);
                         mapper.insertRunEvent(ev);
                         emitter.send(org.springframework.web.servlet.mvc.method.annotation.SseEmitter.event().name("node_update").data(data));
+                    } else if ("degraded".equals(eventName)) {
+                        Map<String, Object> payload = parseJsonMap(data);
+                        recordRunEvent(run, "RUN_DEGRADED", null, null, "RUNNING",
+                                "Workflow run degraded (streaming).", payload, 900000);
+                        emitter.send(org.springframework.web.servlet.mvc.method.annotation.SseEmitter.event()
+                                .name("degraded").data(data == null ? "{}" : data));
+                    } else if ("human_interrupt".equals(eventName)) {
+                        Map<String, Object> payload = parseJsonMap(data);
+                        run.setStatus("PAUSED");
+                        run.setControlStatus("PAUSED");
+                        run.setPauseRequested(1);
+                        mapper.updateRun(run);
+                        recordRunEvent(run, "RUN_PAUSED", null, null, "PAUSED",
+                                "Workflow paused for human interrupt (streaming).", payload, 950000);
+                        emitter.send(org.springframework.web.servlet.mvc.method.annotation.SseEmitter.event()
+                                .name("human_interrupt").data(data == null ? "{}" : data));
                     } else if ("workflow_complete".equals(eventName)) {
+                        Map<String, Object> payload = parseJsonMap(data);
+                        boolean degraded = Boolean.TRUE.equals(payload.get("degraded"))
+                                || "true".equalsIgnoreCase(String.valueOf(payload.get("degraded")));
                         run.setStatus("COMPLETED");
                         run.setCompletedAt(now());
                         run.setControlStatus("COMPLETED");
                         run.setPauseRequested(0);
                         run.setCancelRequested(0);
+                        if (degraded) {
+                            if (run.getErrorMessage() == null || run.getErrorMessage().trim().isEmpty()) {
+                                run.setErrorMessage("DEGRADED");
+                            }
+                            Map<String, Object> result = new LinkedHashMap<>();
+                            result.put("ok", true);
+                            result.put("degraded", true);
+                            if (payload.get("reasons") != null) {
+                                result.put("reasons", payload.get("reasons"));
+                            }
+                            run.setResultJson(toJson(result));
+                            recordRunEvent(run, "RUN_DEGRADED", null, null, "COMPLETED",
+                                    "Workflow completed with degradation (streaming).", payload, 999999);
+                        }
                         mapper.updateRun(run);
-                        recordRunEvent(run, "RUN_COMPLETED", null, null, "COMPLETED", "Workflow run completed (streaming).", null, 1000000);
-                        emitter.send(org.springframework.web.servlet.mvc.method.annotation.SseEmitter.event().name("workflow_complete").data("{\"ok\":true}"));
+                        recordRunEvent(run, "RUN_COMPLETED", null, null, "COMPLETED",
+                                degraded ? "Workflow run completed degraded (streaming)." : "Workflow run completed (streaming).",
+                                payload, 1000000);
+                        String completeData = data == null || data.trim().isEmpty()
+                                ? (degraded ? "{\"ok\":true,\"degraded\":true}" : "{\"ok\":true}")
+                                : data;
+                        emitter.send(org.springframework.web.servlet.mvc.method.annotation.SseEmitter.event()
+                                .name("workflow_complete").data(completeData));
                         emitter.complete();
                     } else if ("error".equals(eventName)) {
                         JsonNode en = objectMapper.readTree(data);

@@ -70,13 +70,18 @@ jobs:
         env:
           AEGIS_ALPHA_LANGCHAIN_MOCK: "true"
           AEGIS_ALPHA_LANGCHAIN_API_KEY: test-key
-        run: python -m pytest tests -q
+          AEGIS_ALPHA_NODE_EXECUTION_TOKEN: local-workflow-node-token
+        # Full suite includes contract/smoke auth tests (test_service_auth, test_contract_intent_response)
+        run: python -m pytest tests -q --tb=short
       - name: Check syntax
         run: python -m py_compile app/main.py
       - name: Start orchestrator
         shell: bash
+        env:
+          AEGIS_ALPHA_LANGCHAIN_MOCK: "true"
+          AEGIS_ALPHA_NODE_EXECUTION_TOKEN: local-workflow-node-token
         run: |
-          AEGIS_ALPHA_LANGCHAIN_MOCK=true python -m uvicorn app.main:app --host 0.0.0.0 --port 8787 > orchestrator-ci.log 2>&1 &
+          python -m uvicorn app.main:app --host 0.0.0.0 --port 8787 > orchestrator-ci.log 2>&1 &
           for i in {1..30}; do
             if curl -fsS http://127.0.0.1:8787/health >/dev/null 2>&1; then
               echo "Orchestrator is healthy"
@@ -89,10 +94,29 @@ jobs:
           exit 1
       - name: Smoke test
         shell: bash
+        env:
+          AEGIS_ALPHA_NODE_EXECUTION_TOKEN: local-workflow-node-token
         run: |
+          set -euo pipefail
           curl -fsS http://127.0.0.1:8787/health
           echo ""
-          echo "Smoke test passed"
+          # Protected route without token must be unauthorized (Phase 0.5 auth smoke)
+          code=$(curl -s -o /dev/null -w "%{http_code}" -X POST http://127.0.0.1:8787/classify-intent \
+            -H "Content-Type: application/json" -d '{}')
+          if [ "$code" != "401" ]; then
+            echo "Expected 401 without token for /classify-intent, got $code"
+            exit 1
+          fi
+          # With service token, must not be 401
+          code=$(curl -s -o /dev/null -w "%{http_code}" -X POST http://127.0.0.1:8787/classify-intent \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer local-workflow-node-token" \
+            -d '{}')
+          if [ "$code" = "401" ]; then
+            echo "Unexpected 401 with valid service token for /classify-intent"
+            exit 1
+          fi
+          echo "Smoke test passed (health + service auth)"
 
   deploy:
     name: Deploy to production
