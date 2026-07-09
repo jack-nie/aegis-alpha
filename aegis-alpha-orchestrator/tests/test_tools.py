@@ -92,3 +92,62 @@ def test_get_backend_client_singleton():
     c2 = get_backend_client(settings)
     assert c1 is c2
     tools_module._backend_client = None
+
+
+def test_authorization_defaults_to_node_token():
+    from app.config import Settings
+    from app.core.tools import ToolBackendClient
+
+    settings = Settings(
+        AEGIS_ALPHA_LANGCHAIN_API_KEY="test",
+        AEGIS_ALPHA_NODE_EXECUTION_TOKEN="node-tok",
+        AEGIS_ALPHA_DELEGATED_TOKEN="",
+    )
+    client = ToolBackendClient(settings)
+    assert client._authorization_header() == "Bearer node-tok"
+
+
+def test_authorization_uses_delegated_token_config():
+    from app.config import Settings
+    from app.core.tools import ToolBackendClient
+
+    settings = Settings(
+        AEGIS_ALPHA_LANGCHAIN_API_KEY="test",
+        AEGIS_ALPHA_NODE_EXECUTION_TOKEN="node-tok",
+        AEGIS_ALPHA_DELEGATED_TOKEN="deleg-tok",
+    )
+    client = ToolBackendClient(settings)
+    assert client._authorization_header() == "Bearer deleg-tok"
+
+
+def test_authorization_override_contextvar_wins():
+    from app.config import Settings
+    from app.core.tools import ToolBackendClient, use_authorization
+
+    settings = Settings(
+        AEGIS_ALPHA_LANGCHAIN_API_KEY="test",
+        AEGIS_ALPHA_NODE_EXECUTION_TOKEN="node-tok",
+        AEGIS_ALPHA_DELEGATED_TOKEN="deleg-tok",
+    )
+    client = ToolBackendClient(settings)
+    with use_authorization("Bearer override-tok"):
+        assert client._authorization_header() == "Bearer override-tok"
+    assert client._authorization_header() == "Bearer deleg-tok"
+
+
+def test_set_extra_headers_authorization():
+    from app.config import Settings
+    from app.core.tools import ToolBackendClient
+
+    settings = Settings(
+        AEGIS_ALPHA_LANGCHAIN_API_KEY="test",
+        AEGIS_ALPHA_NODE_EXECUTION_TOKEN="node-tok",
+        AEGIS_ALPHA_DELEGATED_TOKEN="",
+    )
+    client = ToolBackendClient(settings)
+    client.set_extra_headers({"Authorization": "Bearer sticky-tok", "X-Trace": "1"})
+    headers = client._request_headers()
+    assert headers["Authorization"] == "Bearer sticky-tok"
+    assert headers["X-Trace"] == "1"
+    client.clear_extra_headers()
+    assert client._authorization_header() == "Bearer node-tok"

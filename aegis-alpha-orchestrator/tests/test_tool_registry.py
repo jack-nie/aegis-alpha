@@ -6,9 +6,11 @@ from app.core.tool_registry import (
     TOOL_ROLES,
     TOOL_SPECS,
     create_tool_registry,
+    resolve_agent_roles,
     tool_names_for_roles,
     tools_for_roles,
 )
+from app.models.workflow import Node, NodeData
 
 
 def _settings() -> Settings:
@@ -86,3 +88,39 @@ def test_tool_roles_constant_covers_phase1():
         "supervisor",
     }
     assert expected <= set(TOOL_ROLES)
+
+
+def test_resolve_agent_roles_from_fundamentals_agent_id():
+    node = Node(
+        id="fundamentals",
+        data=NodeData(handler="general.agent", agentId="specialist_fundamentals"),
+    )
+    assert resolve_agent_roles(node) == ["fundamentals"]
+
+
+def test_resolve_agent_roles_from_handler_heuristics():
+    assert resolve_agent_roles(
+        Node(id="n", data=NodeData(handler="finance.industry_news"))
+    ) == ["news"]
+    assert resolve_agent_roles(
+        Node(id="n", data=NodeData(handler="finance.fundamental_analysis"))
+    ) == ["fundamentals"]
+    assert resolve_agent_roles(
+        Node(id="n", data=NodeData(handler="finance.valuation_analysis"))
+    ) == ["valuation"]
+    assert resolve_agent_roles(
+        Node(id="n", data=NodeData(handler="finance.risk_assessment"))
+    ) == ["risk"]
+    assert resolve_agent_roles(
+        Node(id="n", data=NodeData(handler="general.agent"))
+    ) == ["general"]
+
+
+def test_tools_for_roles_news_excludes_portfolio():
+    registry = create_tool_registry(_settings())
+    tools = tools_for_roles(registry, ["news"])
+    names = {t.name for t in tools}
+    assert "get_news" in names
+    assert "get_portfolio_positions" not in names
+    assert "get_portfolio_summary" not in names
+    assert "get_stock_quote" not in names

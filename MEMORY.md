@@ -7,6 +7,8 @@ Claude 每次新任务开始前应读取此文件。
 
 - 项目已从 MarketMind 完成重命名为 Aegis Alpha（包名、变量名、CI 配置均已更新）
 - 自定义 Token 认证（HmacSHA256），不是标准 JWT — TokenService 是核心不可轻改
+- 委托 token（typ=delegation）：`TokenService.issueServiceDelegation`；positions/summary 可读；用户 login token 无 typ 字段；`POST /_backend/workflow-runs/{runId}/delegated-token` 签发短时 portfolio:read
+- orchestrator `ToolBackendClient`：Authorization 优先级 contextvar override > extra headers > AEGIS_ALPHA_DELEGATED_TOKEN > node_execution_token
 - 前端是 catch-all routing，所有页面逻辑集中在 App.jsx
 - orchestrator 已从 Node.js 重写为 Python FastAPI + LangGraph，分层架构
 - orchestrator 已启用 LangGraph checkpointer，workflow 支持断点恢复

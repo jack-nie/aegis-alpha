@@ -88,8 +88,8 @@ class ApiContractTest {
             stockAnalysis.setWorkflowKey("stock_analysis");
             stockAnalysis.setName("Stock Analysis");
             stockAnalysis.setVersion(1);
-            stockAnalysis.setNodes(9);
-            stockAnalysis.setEdges(10);
+            stockAnalysis.setNodes(7);
+            stockAnalysis.setEdges(6);
             workflowMapper.insertDefinition(stockAnalysis);
         }
         if (workflowMapper.findDefinition("stock_analysis") == null) {
@@ -97,8 +97,8 @@ class ApiContractTest {
             sa.setWorkflowKey("stock_analysis");
             sa.setName("Stock Analysis");
             sa.setVersion(1);
-            sa.setNodes(9);
-            sa.setEdges(10);
+            sa.setNodes(7);
+            sa.setEdges(6);
             workflowMapper.insertDefinition(sa);
         }
         if (dashboardMapper.countQuadrant() == 0) {
@@ -735,12 +735,12 @@ class ApiContractTest {
         String token = login.replaceAll(".*\"access_token\":\"([^\"]+)\".*", "$1");
         String auth = "Bearer " + token;
 
-        // Verify stock_analysis layout returns the default parallel DAG
+        // Verify stock_analysis layout returns sequential multi-specialist chain
         mockMvc.perform(get("/_backend/workflows/stock_analysis/layout").header("Authorization", auth))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.workflowKey").value("stock_analysis"))
-                .andExpect(jsonPath("$.nodes", hasSize(9)))
-                .andExpect(jsonPath("$.edges", hasSize(10)));
+                .andExpect(jsonPath("$.nodes", hasSize(7)))
+                .andExpect(jsonPath("$.edges", hasSize(6)));
 
         // Run the workflow
         String runJson = mockMvc.perform(post("/_backend/workflows/stock_analysis/run").header("Authorization", auth)
@@ -753,10 +753,10 @@ class ApiContractTest {
                 .andReturn().getResponse().getContentAsString();
         String runId = runJson.replaceAll(".*\"runId\":\"([^\"]+)\".*", "$1");
 
-        // Verify all 9 nodes executed
+        // Verify all 7 nodes executed
         mockMvc.perform(get("/_backend/workflow/runs/" + runId + "/nodes").header("Authorization", auth))
                 .andExpect(status().isOk())
-                .andExpect(jsonPath("$", hasSize(9)));
+                .andExpect(jsonPath("$", hasSize(7)));
     }
 
     private Map<String, Object> marketOverview() {

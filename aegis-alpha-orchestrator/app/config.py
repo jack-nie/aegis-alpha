@@ -33,6 +33,9 @@ class Settings(BaseSettings):
     node_execution_token: str = Field(
         default="local-workflow-node-token", alias="AEGIS_ALPHA_NODE_EXECUTION_TOKEN"
     )
+    # Optional run-scoped portfolio:read delegation token (tests / explicit inject).
+    # Prefer contextvar authorization_override on ToolBackendClient for per-run use.
+    delegated_token: str = Field(default="", alias="AEGIS_ALPHA_DELEGATED_TOKEN")
 
     # Market Data
     market_data_timeout_ms: int = Field(default=8000, alias="AEGIS_ALPHA_MARKET_DATA_TIMEOUT_MS")

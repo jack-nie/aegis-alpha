@@ -2,12 +2,22 @@
 
 Tool instances are built here; role allowlists live in ``tool_registry``.
 ``create_tools`` remains the public full-list factory (backward compatible).
+
+Portfolio reads on the Java backend accept:
+- user Bearer token
+- service node-execution-token
+- run-scoped delegation token (typ=delegation, scope portfolio:read)
+
+Use ``authorization_override`` contextvar or ``AEGIS_ALPHA_DELEGATED_TOKEN`` to
+inject a delegation token without changing the default node token path.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Any
+from contextlib import contextmanager
+from contextvars import ContextVar
+from typing import Any, Iterator
 
 import httpx
 from langchain_core.tools import tool
@@ -16,6 +26,9 @@ from ..config import Settings
 
 logger = logging.getLogger(__name__)
 
+# Run-scoped Authorization override for future inject from workflow executor.
+authorization_override: ContextVar[str | None] = ContextVar("authorization_override", default=None)
+
 
 class ToolBackendClient:
     """HTTP client for calling Java backend APIs from tools."""
@@ -23,6 +36,38 @@ class ToolBackendClient:
     def __init__(self, config: Settings):
         self._config = config
         self._client: httpx.AsyncClient | None = None
+        self._extra_headers: dict[str, str] = {}
+
+    def set_extra_headers(self, headers: dict[str, str] | None) -> None:
+        """Merge/replace sticky extra headers on subsequent requests."""
+        self._extra_headers = dict(headers or {})
+
+    def clear_extra_headers(self) -> None:
+        self._extra_headers = {}
+
+    def _authorization_header(self) -> str:
+        """Resolve Authorization: context override > extra headers > delegated token > node token.
+
+        ``Settings.delegated_token`` maps env ``AEGIS_ALPHA_DELEGATED_TOKEN`` (tests/local inject).
+        """
+        override = authorization_override.get()
+        if override:
+            return override if override.lower().startswith("bearer ") else f"Bearer {override}"
+
+        extra_auth = self._extra_headers.get("Authorization") or self._extra_headers.get("authorization")
+        if extra_auth:
+            return extra_auth
+
+        delegated = (getattr(self._config, "delegated_token", None) or "").strip()
+        if delegated:
+            return delegated if delegated.lower().startswith("bearer ") else f"Bearer {delegated}"
+
+        return f"Bearer {self._config.node_execution_token}"
+
+    def _request_headers(self) -> dict[str, str]:
+        headers = dict(self._extra_headers)
+        headers["Authorization"] = self._authorization_header()
+        return headers
 
     async def start(self) -> None:
         if self._client is None or self._client.is_closed:
@@ -40,7 +85,7 @@ class ToolBackendClient:
             response = await self._client.get(
                 f"{backend_url}{path}",
                 params=params or {},
-                headers={"Authorization": f"Bearer {self._config.node_execution_token}"},
+                headers=self._request_headers(),
             )
             if response.status_code == 200:
                 return response.json()
@@ -48,6 +93,16 @@ class ToolBackendClient:
         except Exception as e:
             logger.error(f"Tool backend call failed: {path} - {e}")
             return {"error": str(e), "status": "error"}
+
+
+@contextmanager
+def use_authorization(token: str | None) -> Iterator[None]:
+    """Temporarily override Authorization for tool backend calls in this context."""
+    token_handle = authorization_override.set(token)
+    try:
+        yield
+    finally:
+        authorization_override.reset(token_handle)
 
 
 _backend_client: ToolBackendClient | None = None
@@ -107,7 +162,7 @@ def create_tools(config: Settings) -> list:
         Args:
             portfolio_id: Portfolio ID (e.g., '1', '2')
         """
-        # PortfolioController is under /_backend/portfolio; endpoints require user auth (authService.me).
+        # Portfolio positions/summary accept user token, node token, or portfolio:read delegation.
         return await client.get(f"/_backend/portfolio/{portfolio_id}/positions")
 
     @tool
@@ -117,7 +172,6 @@ def create_tools(config: Settings) -> list:
         Args:
             portfolio_id: Portfolio ID (e.g., '1', '2')
         """
-        # PortfolioController is under /_backend/portfolio; endpoints require user auth (authService.me).
         return await client.get(f"/_backend/portfolio/{portfolio_id}/summary")
 
     return [

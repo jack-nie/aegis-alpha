@@ -61,6 +61,10 @@ public class AuthService {
         if (payload == null) {
             return null;
         }
+        // Delegation tokens must not authenticate as interactive users (no typ = user token).
+        if ("delegation".equals(payload.get("typ"))) {
+            return null;
+        }
         User user = userMapper.findByUsername(String.valueOf(payload.get("sub")));
         return user == null ? null : toPrincipal(user);
     }
