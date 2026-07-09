@@ -70,13 +70,21 @@ public class GovernanceController {
     }
 
     @PostMapping("/recommendations/{workflowRunId}/approve")
-    public ResponseEntity<Recommendation> approveRecommendation(@RequestHeader(value = "Authorization", required = false) String authorization,
-                                                               @PathVariable String workflowRunId) {
+    public ResponseEntity<?> approveRecommendation(@RequestHeader(value = "Authorization", required = false) String authorization,
+                                                   @PathVariable String workflowRunId) {
         if (authService.me(authorization) == null) {
             return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build();
         }
-        Recommendation recommendation = recommendationService.approve(workflowRunId);
-        return recommendation == null ? ResponseEntity.notFound().build() : ResponseEntity.ok(recommendation);
+        try {
+            Recommendation recommendation = recommendationService.approve(workflowRunId);
+            return recommendation == null ? ResponseEntity.notFound().build() : ResponseEntity.ok(recommendation);
+        } catch (IllegalStateException ex) {
+            Map<String, Object> body = new java.util.LinkedHashMap<>();
+            body.put("ok", false);
+            body.put("error", ex.getMessage());
+            body.put("code", "NOT_APPROVABLE");
+            return ResponseEntity.status(HttpStatus.CONFLICT).body(body);
+        }
     }
 
     @PostMapping("/recommendations/{workflowRunId}/reject")

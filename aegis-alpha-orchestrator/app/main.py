@@ -8,11 +8,20 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from .config import settings
 from .dependencies import market_data, memory_store_manager
 from .core.tools import get_backend_client
 from .routers import health, workflow, intent
+
+# Paths that do not require service token (health/docs only)
+_PUBLIC_PATH_PREFIXES = (
+    "/health",
+    "/docs",
+    "/openapi.json",
+    "/redoc",
+)
 
 # Configure logging
 logging.basicConfig(
@@ -54,6 +63,41 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def _extract_bearer(authorization: str | None) -> str | None:
+    if not authorization:
+        return None
+    value = authorization.strip()
+    if value.lower().startswith("bearer "):
+        return value[7:].strip()
+    return value
+
+
+@app.middleware("http")
+async def service_auth_middleware(request: Request, call_next):
+    """Require service token on non-public routes (fail-closed when token configured)."""
+    path = request.url.path or ""
+    if any(path == p or path.startswith(p + "/") for p in _PUBLIC_PATH_PREFIXES):
+        return await call_next(request)
+
+    expected = (settings.node_execution_token or "").strip()
+    if not expected:
+        return JSONResponse(
+            status_code=503,
+            content={"ok": False, "error": "service_token_not_configured", "code": "AUTHZ_DENIED"},
+        )
+
+    provided = _extract_bearer(request.headers.get("authorization"))
+    if provided != expected:
+        # Also accept X-Service-Token for mesh callers
+        provided = (request.headers.get("x-service-token") or "").strip() or provided
+    if provided != expected:
+        return JSONResponse(
+            status_code=401,
+            content={"ok": False, "error": "unauthorized", "code": "AUTHZ_DENIED"},
+        )
+    return await call_next(request)
 
 
 @app.middleware("http")

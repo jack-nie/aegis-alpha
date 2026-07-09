@@ -14,6 +14,7 @@ from ..models.responses import NodeResult
 from ..prompts import PromptManager
 from .llm_client import LLMClient
 from .market_data import MarketDataService
+from .recommendation_policy import enforce_recommendation_policy
 
 logger = logging.getLogger(__name__)
 
@@ -206,10 +207,11 @@ class NodeExecutor:
         # Build system prompt
         if is_aggregate:
             system = (
-                f"You are {agent_name}. Generate a comprehensive investment research report. "
+                f"You are {agent_name}. Generate an evidence-based investment research report. "
                 "Use markdown formatting with clear sections. "
-                "Include actual data values from the context. "
-                "Do NOT say 'data insufficient' or 'unable to analyze'."
+                "Use only numbers present in marketDataContext / tool outputs. "
+                "If critical market or financial data is missing, recommend INSUFFICIENT_DATA "
+                "and list missing fields. Never invent prices, multiples, or target prices."
             )
         else:
             system = (
@@ -233,6 +235,66 @@ class NodeExecutor:
         logger.info(f"[THINKING] Node completed: id={node.id} handler={handler} label={node_label} duration={duration_ms}ms status=completed confidence={response.confidence}")
         logger.info(f"[THINKING] Node output: id={node.id} summary={response.summary[:200] if response.summary else 'N/A'}")
 
+        sources = [
+            s if isinstance(s, dict) else {"title": str(s), "url": "", "type": "llm"}
+            for s in response.sources
+        ]
+        # Prefer market hydration as a structured source when present
+        market_ctx = state.get("marketDataContext")
+        if isinstance(market_ctx, dict) and market_ctx:
+            sources = [
+                {
+                    "title": "marketDataContext",
+                    "url": "",
+                    "type": "market",
+                    "sourceType": "market",
+                    "summary": "Hydrated quote/financials/news context",
+                },
+                *sources,
+            ]
+
+        result_data = dict(response.data or {})
+        summary = response.summary
+        confidence = response.confidence
+        degraded = False
+        content = response.content
+
+        if is_aggregate:
+            draft_label = None
+            if isinstance(result_data, dict):
+                draft_label = result_data.get("recommendation") or result_data.get("label")
+            if not draft_label and content:
+                draft_label = self._extract_recommendation_label(content)
+            if not draft_label:
+                draft_label = summary
+            policy = enforce_recommendation_policy(
+                label=str(draft_label) if draft_label is not None else None,
+                confidence=confidence,
+                state=state,
+                claims=result_data.get("claims") if isinstance(result_data, dict) else None,
+                missing_data=result_data.get("missingData") if isinstance(result_data, dict) else None,
+                degraded=bool(result_data.get("degraded")) if isinstance(result_data, dict) else False,
+                sources=sources,
+            )
+            result_data = {
+                **result_data,
+                "recommendation": policy["recommendation"],
+                "confidence": policy["confidence"],
+                "claims": policy["claims"],
+                "missingData": policy["missingData"],
+                "degraded": policy["degraded"],
+                "policy": {
+                    "forcedInsufficient": policy["forcedInsufficient"],
+                    "hasQuote": policy["hasQuote"],
+                    "hasFinancials": policy["hasFinancials"],
+                    "hasEvidence": policy["hasEvidence"],
+                },
+            }
+            confidence = policy["confidence"]
+            degraded = policy["degraded"]
+            # Surface machine-readable label in summary prefix for Java materializer
+            summary = f"[{policy['recommendation']}] {summary or ''}".strip()
+
         return NodeResult(
             ok=True,
             status="completed",
@@ -240,16 +302,38 @@ class NodeExecutor:
             node_id=node.id,
             node_name=data.label or data.title or node.id,
             subject=subject,
-            summary=response.summary,
+            summary=summary,
             signals=[self._normalize_signal(s) for s in response.signals],
-            sources=[s if isinstance(s, dict) else {"title": str(s), "url": "", "type": "llm"} for s in response.sources],
-            confidence=response.confidence,
-            data=response.data,
+            sources=sources,
+            confidence=confidence,
+            data=result_data,
             duration_ms=duration_ms,
-            content=response.content,
+            content=content,
+            degraded=degraded,
             provider=self._config.provider,
             model=model or self._config.model,
         )
+
+    @staticmethod
+    def _extract_recommendation_label(text: str) -> str | None:
+        """Best-effort parse of recommendation enum from model text/JSON fence."""
+        if not text:
+            return None
+        import re  # local import keeps module import surface small
+
+        # JSON fence recommendation field
+        match = re.search(
+            r'"recommendation"\s*:\s*"(BUY|HOLD|SELL|WATCH|INSUFFICIENT_DATA)"',
+            text,
+            re.IGNORECASE,
+        )
+        if match:
+            return match.group(1).upper()
+        upper = text.upper()
+        for label in ("INSUFFICIENT_DATA", "STRONG BUY", "BUY", "SELL", "HOLD", "WATCH"):
+            if label in upper:
+                return label.replace(" ", "_") if label != "STRONG BUY" else "BUY"
+        return None
 
     def _mock_result(
         self,

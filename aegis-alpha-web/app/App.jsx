@@ -2148,8 +2148,13 @@ function WorkflowComposer({ api, token }) {
                     cur.map((n) => (n.id === nid ? { ...n, data: { ...n.data, runStatus: status } } : n)),
                   );
                 }, 300);
+              } else if (currentEvent === "degraded") {
+                const reasons = Array.isArray(data.reasons) ? data.reasons.join(", ") : "";
+                showToast(`运行降级完成${reasons ? "：" + reasons : ""}（草稿不可直接批准）`);
+              } else if (currentEvent === "human_interrupt") {
+                showToast(data.message || "工作流等待人工审批");
               } else if (currentEvent === "workflow_complete") {
-                showToast("运行完成");
+                showToast(data.degraded ? "运行完成（含降级）" : "运行完成");
               } else if (currentEvent === "error") {
                 showToast(`运行错误：${data.error || "unknown"}`);
               }
@@ -5445,6 +5450,30 @@ function RecommendationDetailPanel({ detail, actionBusy, onClose, onDecision }) 
           {!detail.loading && !detail.error && (
             <div className="space-y-5">
               <section className="rounded-xl border border-gray-200 bg-white p-4">
+                {(() => {
+                  const approval = String(
+                    pickFirst(recommendation, ["approvalStatus", "approval_status"]) || "",
+                  ).toUpperCase();
+                  const recLabel = String(pickFirst(recommendation, ["recommendation"]) || "").toUpperCase();
+                  const disclaimer = String(pickFirst(recommendation, ["disclaimer"]) || "");
+                  const isDraft =
+                    approval === "PENDING_REVIEW" ||
+                    recLabel === "INSUFFICIENT_DATA" ||
+                    disclaimer.includes("DEGRADED") ||
+                    disclaimer.includes("DRAFT");
+                  const approveBlocked =
+                    recLabel === "INSUFFICIENT_DATA" ||
+                    disclaimer.includes("DEGRADED") ||
+                    !Array.isArray(evidence) ||
+                    evidence.length === 0;
+                  return (
+                    <>
+                      {isDraft && (
+                        <div className="mb-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs font-semibold text-amber-800">
+                          草稿 / 待审 — 非正式可交易建议
+                          {approveBlocked ? "；当前状态不可批准（数据不足、降级或无证据）" : ""}
+                        </div>
+                      )}
                 <div className="flex flex-wrap items-center justify-between gap-3">
                   <div className="flex flex-wrap items-center gap-2">
                     <StatusPill status={pickFirst(recommendation, ["recommendation"])} />
@@ -5459,7 +5488,7 @@ function RecommendationDetailPanel({ detail, actionBusy, onClose, onDecision }) 
                       type="button"
                       data-testid="recommendation-approve"
                       onClick={() => onDecision(recommendation, "approve")}
-                      disabled={Boolean(busyPrefix)}
+                      disabled={Boolean(busyPrefix) || approveBlocked}
                       className="rounded-lg border border-emerald-200 px-3 py-1.5 text-xs font-semibold text-emerald-700 hover:bg-emerald-50 disabled:cursor-not-allowed disabled:opacity-40"
                     >
                       批准
@@ -5482,6 +5511,9 @@ function RecommendationDetailPanel({ detail, actionBusy, onClose, onDecision }) 
                   compact
                   value={summarizeJson(pickFirst(recommendation, ["rationaleJson", "rationale_json"]))}
                 />
+                    </>
+                  );
+                })()}
               </section>
 
               <section className="rounded-xl border border-gray-200 bg-white p-4">

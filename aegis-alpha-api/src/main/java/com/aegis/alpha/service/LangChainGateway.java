@@ -27,6 +27,7 @@ public class LangChainGateway {
     private final String defaultModel;
     private final String apiKey;
     private final String baseUrl;
+    private final String serviceToken;
 
     @Autowired
     public LangChainGateway(ObjectMapper objectMapper,
@@ -37,7 +38,8 @@ public class LangChainGateway {
                             @Value("${aegis.langchain.api-key:}") String apiKey,
                             @Value("${aegis.langchain.base-url:}") String baseUrl,
                             @Value("${aegis.langchain.connect-timeout-ms:3000}") int connectTimeoutMs,
-                            @Value("${aegis.langchain.read-timeout-ms:30000}") int readTimeoutMs) {
+                            @Value("${aegis.langchain.read-timeout-ms:30000}") int readTimeoutMs,
+                            @Value("${aegis.dify.node-execution-token:local-workflow-node-token}") String serviceToken) {
         this.objectMapper = objectMapper;
         this.restTemplate = restTemplate(connectTimeoutMs, readTimeoutMs);
         this.shortTimeoutRestTemplate = restTemplate(2000, 5000);
@@ -47,6 +49,7 @@ public class LangChainGateway {
         this.defaultModel = defaultModel;
         this.apiKey = apiKey;
         this.baseUrl = baseUrl;
+        this.serviceToken = serviceToken == null ? "" : serviceToken.trim();
         log.info("[LangChainGateway] enabled={}, engineUrl={}, provider={}, model={}, connectTimeoutMs={}, readTimeoutMs={}",
                 enabled, engineUrl, provider, defaultModel, connectTimeoutMs, readTimeoutMs);
     }
@@ -58,7 +61,22 @@ public class LangChainGateway {
                             String defaultModel,
                             String apiKey,
                             String baseUrl) {
-        this(objectMapper, enabled, engineUrl, provider, defaultModel, apiKey, baseUrl, 3000, 30000);
+        this(objectMapper, enabled, engineUrl, provider, defaultModel, apiKey, baseUrl, 3000, 30000,
+                "local-workflow-node-token");
+    }
+
+    public String serviceAuthorizationHeader() {
+        if (serviceToken == null || serviceToken.isEmpty()) {
+            return null;
+        }
+        return "Bearer " + serviceToken;
+    }
+
+    private void applyServiceAuth(HttpHeaders headers) {
+        String auth = serviceAuthorizationHeader();
+        if (auth != null) {
+            headers.set("Authorization", auth);
+        }
     }
 
     public Map<String, Object> runAgent(AgentTemplate agent, Map<String, Object> state, Map<String, Object> node, String subject) {
@@ -118,6 +136,7 @@ public class LangChainGateway {
 
         HttpHeaders headers = new HttpHeaders();
         headers.setContentType(MediaType.APPLICATION_JSON);
+        applyServiceAuth(headers);
         HttpEntity<Map<String, Object>> request = new HttpEntity<>(body, headers);
         Object response = restTemplate.postForObject(trimSlash(engineUrl) + path, request, Object.class);
         if (response instanceof Map) {
@@ -174,6 +193,7 @@ public class LangChainGateway {
             body.put("model", defaultModel);
             HttpHeaders headers = new HttpHeaders();
             headers.setContentType(MediaType.APPLICATION_JSON);
+            applyServiceAuth(headers);
             HttpEntity<Map<String, Object>> request = new HttpEntity<>(body, headers);
             Object response = shortTimeoutRestTemplate.postForObject(trimSlash(engineUrl) + "/classify-intent", request, Object.class);
             if (response instanceof Map) {
