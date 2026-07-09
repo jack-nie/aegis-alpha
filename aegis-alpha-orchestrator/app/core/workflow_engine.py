@@ -209,13 +209,15 @@ class WorkflowEngine:
                 routing_map[agent_id + "__next"] = next_nodes[0]
                 graph.add_conditional_edges(agent_id, route_to_tools, routing_map)
 
-            if len(agent_nodes) == 1:
-                graph.add_edge("tools", agent_nodes[0])
-            else:
-                # Multi-agent: ideally return to the agent that issued tool_calls.
-                # Messages currently lack reliable agent-node attribution, so fall
-                # back to the first agent (same as historical behavior).
-                graph.add_edge("tools", agent_nodes[0])
+            # Route tools back to the agent that last ran (final_state.last_agent_id).
+            def route_after_tools(state: WorkflowState, _agents: list[str] = list(agent_nodes)) -> str:
+                last = (state.get("final_state") or {}).get("last_agent_id")
+                if last in _agents:
+                    return last
+                return _agents[0]
+
+            tools_routing = {agent_id: agent_id for agent_id in agent_nodes}
+            graph.add_conditional_edges("tools", route_after_tools, tools_routing)
 
         for edge in edges:
             if edge.source not in node_ids or edge.target not in node_ids:
@@ -362,6 +364,9 @@ class WorkflowEngine:
             state_update = {node.id: result.model_dump()}
             if result.handler:
                 state_update[result.handler] = result.model_dump()
+            if is_agent_with_tools:
+                # Attribution for tools → agent return path
+                state_update["last_agent_id"] = node.id
 
             return {
                 "final_state": state_update,
@@ -434,9 +439,16 @@ class WorkflowEngine:
             "messages": [],
         }
 
+        degraded_reasons: list[str] = []
         try:
             async for chunk in graph.astream(initial_state, config=config, stream_mode="updates"):
                 for node_name, update in chunk.items():
+                    if node_name == "__interrupt__":
+                        yield SSEEvent(
+                            event="human_interrupt",
+                            data={"message": "Workflow paused for approval", "ok": True},
+                        )
+                        continue
                     trace_entry = (update.get("trace") or [{}])[0]
                     if node_name == "tools":
                         yield SSEEvent(
@@ -455,6 +467,18 @@ class WorkflowEngine:
                         node_status = trace_entry.get("status", "")
                         node_ok = trace_entry.get("ok", False)
                         node_duration = trace_entry.get("durationMs", 0)
+                        node_degraded = bool(trace_entry.get("degraded", False))
+                        if node_degraded:
+                            degraded_reasons.append(f"node:{node_id}")
+                        # Inspect aggregate policy in node_outputs
+                        outputs = update.get("node_outputs") or {}
+                        for _nid, payload in outputs.items():
+                            if isinstance(payload, dict) and payload.get("degraded"):
+                                degraded_reasons.append(f"output:{_nid}")
+                            if isinstance(payload, dict) and isinstance(payload.get("data"), dict):
+                                missing = payload["data"].get("missingData") or []
+                                for m in missing:
+                                    degraded_reasons.append(str(m))
                         logger.info(f"[THINKING] SSE node_update: id={node_id} status={node_status} ok={node_ok} duration={node_duration}ms")
                         yield SSEEvent(
                             event="node_update",
@@ -464,17 +488,24 @@ class WorkflowEngine:
                                 "handler": trace_entry.get("handler", ""),
                                 "status": node_status,
                                 "ok": node_ok,
-                                "degraded": trace_entry.get("degraded", False),
+                                "degraded": node_degraded,
                                 "startedAt": trace_entry.get("startedAt", ""),
                                 "completedAt": trace_entry.get("completedAt", ""),
                                 "durationMs": node_duration,
                             },
                         )
 
-            yield SSEEvent(event="workflow_complete", data={"ok": True})
+            if degraded_reasons:
+                # Dedupe reasons
+                unique_reasons = list(dict.fromkeys(degraded_reasons))
+                yield SSEEvent(event="degraded", data={"ok": True, "reasons": unique_reasons})
+            yield SSEEvent(
+                event="workflow_complete",
+                data={"ok": True, "degraded": bool(degraded_reasons)},
+            )
         except Exception as e:
             logger.error(f"[THINKING] Workflow streaming failed: subject={subject} error={e}")
-            yield SSEEvent(event="error", data={"ok": False, "error": str(e)})
+            yield SSEEvent(event="error", data={"ok": False, "error": str(e), "code": "WORKFLOW_ERROR"})
 
     async def stream_workflow_tokens(
         self,

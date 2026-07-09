@@ -401,7 +401,8 @@ public class WorkflowService {
         String streamUrl = langChainGateway.streamWorkflowUrl();
         String streamBody = langChainGateway.buildStreamBody(runLayout, subject, safeInputs);
         final String runId = run.getRunId();
-        SseStreamReader.readSse(streamUrl, streamBody, new SseStreamReader.SseEventHandler() {
+        SseStreamReader.readSse(streamUrl, streamBody, langChainGateway.serviceAuthorizationHeader(),
+                new SseStreamReader.SseEventHandler() {
             @Override public void onEvent(String eventName, String data) {
                 try {
                     if ("node_update".equals(eventName)) {

@@ -16,6 +16,10 @@ public class SseStreamReader {
     }
 
     public static void readSse(String urlStr, String jsonBody, SseEventHandler handler) {
+        readSse(urlStr, jsonBody, null, handler);
+    }
+
+    public static void readSse(String urlStr, String jsonBody, String authorization, SseEventHandler handler) {
         HttpURLConnection connection = null;
         try {
             URL url = new URL(urlStr);
@@ -24,6 +28,11 @@ public class SseStreamReader {
             connection.setRequestProperty("Content-Type", "application/json");
             connection.setRequestProperty("Accept", "text/event-stream");
             connection.setRequestProperty("Cache-Control", "no-cache");
+            if (authorization != null && !authorization.trim().isEmpty()) {
+                connection.setRequestProperty("Authorization", authorization.startsWith("Bearer ")
+                        ? authorization
+                        : "Bearer " + authorization);
+            }
             connection.setDoOutput(true);
             connection.setConnectTimeout(5000);
             connection.setReadTimeout(300000);
