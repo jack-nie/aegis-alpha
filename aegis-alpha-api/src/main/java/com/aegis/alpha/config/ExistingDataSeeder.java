@@ -94,6 +94,17 @@ public class ExistingDataSeeder implements CommandLineRunner {
                     "股票推荐,选股,推荐股票,recommendation,stock pick,stock screener",
                     "Orchestrate multi-agent stock recommendation research pipeline with market analysis, industry share, sentiment monitoring, tech breakthrough, industry news, web search, financial interpretation, and final stock recommendation aggregation");
         }
+        /* Phase 1 research workflows — idempotent by workflow_key */
+        if (workflowMapper.findDefinition("earnings_reaction") == null) {
+            workflow("earnings_reaction", "Earnings Reaction", 1, 10, 10,
+                    "earnings,财报,业绩,季报,earnings reaction,earnings call,业绩会,财报解读",
+                    "Analyze post-earnings market reaction for a ticker: parse results vs expectations, price/volume reaction, news & sentiment pulse, peer relative move, risk flags, and a concise reaction call / next catalyst watchlist");
+        }
+        if (workflowMapper.findDefinition("watchlist_digest") == null) {
+            workflow("watchlist_digest", "Watchlist Morning Digest", 1, 8, 8,
+                    "digest,早报,自选,watchlist,morning digest,自选股,晨间摘要,watchlist digest",
+                    "Generate a change-driven morning digest for the user's watchlist: overnight market context, news highlights, sentiment shifts, notable movers, and prioritized action items for the session");
+        }
     }
 
     private void workflow(String key, String name, int version, int nodes, int edges, String triggerKeywords, String routingDescription) {

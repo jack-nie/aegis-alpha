@@ -1,4 +1,8 @@
-"""LangChain tools for agent tool-calling."""
+"""LangChain tools for agent tool-calling.
+
+Tool instances are built here; role allowlists live in ``tool_registry``.
+``create_tools`` remains the public full-list factory (backward compatible).
+"""
 
 from __future__ import annotations
 
@@ -57,13 +61,13 @@ def get_backend_client(config: Settings) -> ToolBackendClient:
 
 
 def create_tools(config: Settings) -> list:
-    """Create all LangChain tools."""
+    """Create all LangChain tools (full list; backward compatible with pre-registry callers)."""
     client = get_backend_client(config)
 
     @tool
     async def get_stock_quote(symbol: str) -> dict[str, Any]:
         """Get real-time stock quote including price, volume, market cap, P/E ratio.
-        
+
         Args:
             symbol: Stock ticker symbol (e.g., 'AAPL', 'MSFT', '600519.SH')
         """
@@ -72,7 +76,7 @@ def create_tools(config: Settings) -> list:
     @tool
     async def get_financials(symbol: str) -> dict[str, Any]:
         """Get financial statements and fundamentals (revenue, earnings, margins, ROE).
-        
+
         Args:
             symbol: Stock ticker symbol (e.g., 'AAPL', 'MSFT')
         """
@@ -81,7 +85,7 @@ def create_tools(config: Settings) -> list:
     @tool
     async def get_news(symbol: str) -> dict[str, Any]:
         """Get recent news articles and sentiment data for a stock.
-        
+
         Args:
             symbol: Stock ticker symbol (e.g., 'AAPL', 'MSFT')
         """
@@ -90,7 +94,7 @@ def create_tools(config: Settings) -> list:
     @tool
     async def get_company_overview(symbol: str) -> dict[str, Any]:
         """Get company overview including industry, sector, description, key metrics.
-        
+
         Args:
             symbol: Stock ticker symbol (e.g., 'AAPL', 'MSFT')
         """
@@ -99,7 +103,7 @@ def create_tools(config: Settings) -> list:
     @tool
     async def get_portfolio_positions(portfolio_id: str) -> dict[str, Any]:
         """Get current holdings and positions in a portfolio.
-        
+
         Args:
             portfolio_id: Portfolio ID (e.g., '1', '2')
         """
@@ -109,7 +113,7 @@ def create_tools(config: Settings) -> list:
     @tool
     async def get_portfolio_summary(portfolio_id: str) -> dict[str, Any]:
         """Get portfolio summary including total value, P&L, allocation.
-        
+
         Args:
             portfolio_id: Portfolio ID (e.g., '1', '2')
         """
@@ -124,3 +128,11 @@ def create_tools(config: Settings) -> list:
         get_portfolio_positions,
         get_portfolio_summary,
     ]
+
+
+def create_tools_for_roles(config: Settings, roles: list[str]) -> list:
+    """Create tools filtered by specialist role allowlists."""
+    from .tool_registry import create_tool_registry, tools_for_roles
+
+    registry = create_tool_registry(config)
+    return tools_for_roles(registry, roles)

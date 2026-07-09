@@ -30,10 +30,11 @@ public class ChatService {
     private static final Pattern SECTOR_ANALYSIS_PATTERN =
             Pattern.compile("分析.{0,20}(?:板块|行业)|(?:板块|行业).{0,10}分析");
 
-    /* Seeded keys from ExistingDataSeeder (+ stock_recommendation_research add-on) */
+    /* Seeded keys from ExistingDataSeeder (+ research Phase 1 add-ons) */
     private static final Set<String> VALID_WORKFLOW_KEYS = Collections.unmodifiableSet(new HashSet<String>(Arrays.asList(
             "daily", "deep_dive", "stock_analysis", "stock_recommendation_research", "exit_workflow",
-            "portfolio_workflow", "position_workflow", "sector-analyst-workflow"
+            "portfolio_workflow", "position_workflow", "sector-analyst-workflow",
+            "earnings_reaction", "watchlist_digest"
     )));
 
     private final ChatMapper mapper;
@@ -132,6 +133,16 @@ public class ChatService {
         /* sector analyst - flexible regex: analysis + sector/industry name */
         if (SECTOR_ANALYSIS_PATTERN.matcher(msg).find()) {
             return "sector-analyst-workflow";
+        }
+        /* earnings reaction */
+        if (matchesAny(msg,
+                "earnings", "财报", "业绩", "季报", "earnings reaction", "earnings call", "业绩会", "财报解读")) {
+            return "earnings_reaction";
+        }
+        /* watchlist morning digest */
+        if (matchesAny(msg,
+                "digest", "早报", "自选", "watchlist", "morning digest", "自选股", "晨间摘要", "watchlist digest")) {
+            return "watchlist_digest";
         }
 
         return null;

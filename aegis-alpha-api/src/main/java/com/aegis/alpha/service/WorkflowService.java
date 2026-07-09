@@ -446,24 +446,22 @@ public class WorkflowService {
                         run.setControlStatus("COMPLETED");
                         run.setPauseRequested(0);
                         run.setCancelRequested(0);
+                        Map<String, Object> result = buildStreamingCompleteResult(payload, degraded);
                         if (degraded) {
                             if (run.getErrorMessage() == null || run.getErrorMessage().trim().isEmpty()) {
                                 run.setErrorMessage("DEGRADED");
                             }
-                            Map<String, Object> result = new LinkedHashMap<>();
-                            result.put("ok", true);
-                            result.put("degraded", true);
-                            if (payload.get("reasons") != null) {
-                                result.put("reasons", payload.get("reasons"));
-                            }
                             run.setResultJson(toJson(result));
                             recordRunEvent(run, "RUN_DEGRADED", null, null, "COMPLETED",
                                     "Workflow completed with degradation (streaming).", payload, 999999);
+                        } else if (result != null && !result.isEmpty()) {
+                            run.setResultJson(toJson(result));
                         }
                         mapper.updateRun(run);
                         recordRunEvent(run, "RUN_COMPLETED", null, null, "COMPLETED",
                                 degraded ? "Workflow run completed degraded (streaming)." : "Workflow run completed (streaming).",
                                 payload, 1000000);
+                        materializeStreamingCompletedRun(runId, safeInputs);
                         String completeData = data == null || data.trim().isEmpty()
                                 ? (degraded ? "{\"ok\":true,\"degraded\":true}" : "{\"ok\":true}")
                                 : data;
@@ -503,10 +501,59 @@ public class WorkflowService {
                     latest.setStatus("COMPLETED"); latest.setCompletedAt(now());
                     latest.setControlStatus("COMPLETED");
                     mapper.updateRun(latest);
+                    recordRunEvent(latest, "RUN_COMPLETED", null, null, "COMPLETED",
+                            "Workflow run completed (streaming stream end).", null, 1000000);
+                    materializeStreamingCompletedRun(runId, safeInputs);
                 }
             }
         });
         return mapper.findRun(runId);
+    }
+
+    private void materializeStreamingCompletedRun(String runId, Map<String, Object> inputs) {
+        try {
+            WorkflowRun completed = mapper.findRun(runId);
+            if (completed == null || !"COMPLETED".equals(completed.getStatus())) {
+                return;
+            }
+            backtestService.createFromWorkflowRun(completed, inputs);
+        } catch (Exception ex) {
+            try {
+                WorkflowRun latest = mapper.findRun(runId);
+                if (latest == null) {
+                    return;
+                }
+                Map<String, Object> payload = new LinkedHashMap<>();
+                payload.put("error", ex.getMessage());
+                recordRunEvent(latest, "MATERIALIZE_FAILED", null, null, latest.getStatus(),
+                        "Failed to materialize recommendation/evidence from streaming run.",
+                        payload, 1000001);
+            } catch (Exception ignored) {
+                // isolation: materialize failure must not affect streaming client completion
+            }
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> buildStreamingCompleteResult(Map<String, Object> payload, boolean degraded) {
+        Map<String, Object> result = new LinkedHashMap<>();
+        Object finalState = payload == null ? null : payload.get("final_state");
+        if (finalState instanceof Map) {
+            result.putAll((Map<String, Object>) finalState);
+        }
+        if (degraded) {
+            result.put("ok", true);
+            result.put("degraded", true);
+            if (payload != null && payload.get("reasons") != null) {
+                result.put("reasons", payload.get("reasons"));
+            }
+            return result;
+        }
+        if (!result.isEmpty()) {
+            result.putIfAbsent("ok", true);
+            return result;
+        }
+        return null;
     }
 
 
@@ -1006,6 +1053,16 @@ public class WorkflowService {
             layout.put("edges", telegramDigestEdges());
             return layout;
         }
+        if ("earnings_reaction".equals(definition.getWorkflowKey())) {
+            layout.put("nodes", earningsReactionNodes());
+            layout.put("edges", earningsReactionEdges());
+            return layout;
+        }
+        if ("watchlist_digest".equals(definition.getWorkflowKey())) {
+            layout.put("nodes", watchlistDigestNodes());
+            layout.put("edges", watchlistDigestEdges());
+            return layout;
+        }
         List<Map<String, Object>> nodes = new ArrayList<>();
         nodes.add(flowNode("start", "Start", "start", 80, 260, "scheduler.manual", null));
         nodes.add(flowNode("context", "Load Context", "logic", 320, 260, "portfolio.get_context", null));
@@ -1295,6 +1352,62 @@ public class WorkflowService {
         edges.add(edge("start", "news_fetch"));
         edges.add(edge("news_fetch", "sentiment_filter"));
         edges.add(edge("sentiment_filter", "end"));
+        return edges;
+    }
+
+    // ===== earnings_reaction (Phase 1 research) =====
+    private List<Map<String, Object>> earningsReactionNodes() {
+        List<Map<String, Object>> nodes = new ArrayList<>();
+        nodes.add(flowNode("start", "Start", "start", 80, 280, "scheduler.manual", null));
+        nodes.add(flowNode("context", "Load Context", "logic", 280, 280, "portfolio.get_context", null));
+        nodes.add(flowNode("earnings_parse", "Earnings Parse", "agent", 500, 140, "finance.financial_interpretation", "agent-preset-fundamental"));
+        nodes.add(flowNode("price_reaction", "Price Reaction", "agent", 500, 420, "finance.technical_analysis", "agent-preset-technical"));
+        nodes.add(flowNode("news_scan", "News Scan", "agent", 740, 140, "finance.industry_news", null));
+        nodes.add(flowNode("sentiment", "Sentiment Pulse", "agent", 740, 420, "finance.sentiment_monitor", null));
+        nodes.add(flowNode("peer_compare", "Peer Relative", "agent", 980, 200, "finance.peer_comparison", null));
+        nodes.add(flowNode("risk", "Risk Flags", "agent", 980, 360, "finance.risk_assessment", "agent-preset-risk-exit"));
+        nodes.add(flowNode("reaction_call", "Reaction Call", "agent", 1220, 280, "finance.stock_recommendation_aggregate", null));
+        nodes.add(flowNode("end", "End", "end", 1460, 280, "workflow.end", null));
+        return nodes;
+    }
+    private List<Map<String, Object>> earningsReactionEdges() {
+        List<Map<String, Object>> edges = new ArrayList<>();
+        edges.add(edge("start", "context"));
+        edges.add(edge("context", "earnings_parse"));
+        edges.add(edge("context", "price_reaction"));
+        edges.add(edge("earnings_parse", "news_scan"));
+        edges.add(edge("price_reaction", "sentiment"));
+        edges.add(edge("news_scan", "peer_compare"));
+        edges.add(edge("sentiment", "risk"));
+        edges.add(edge("peer_compare", "reaction_call"));
+        edges.add(edge("risk", "reaction_call"));
+        edges.add(edge("reaction_call", "end"));
+        return edges;
+    }
+
+    // ===== watchlist_digest (Phase 1 research) =====
+    private List<Map<String, Object>> watchlistDigestNodes() {
+        List<Map<String, Object>> nodes = new ArrayList<>();
+        nodes.add(flowNode("start", "Start", "start", 80, 260, "scheduler.manual", null));
+        nodes.add(flowNode("load_watchlist", "Load Watchlist", "logic", 300, 260, "portfolio.get_context", null));
+        nodes.add(flowNode("market_overview", "Market Overview", "agent", 540, 120, "finance.market_analysis", null));
+        nodes.add(flowNode("news_scan", "News Highlights", "agent", 540, 400, "finance.industry_news", null));
+        nodes.add(flowNode("sentiment_pulse", "Sentiment Shifts", "agent", 780, 120, "finance.sentiment_monitor", null));
+        nodes.add(flowNode("movers", "Notable Movers", "agent", 780, 400, "finance.technical_analysis", null));
+        nodes.add(flowNode("digest_summary", "Morning Digest", "agent", 1020, 260, "finance.stock_recommendation_aggregate", null));
+        nodes.add(flowNode("end", "End", "end", 1260, 260, "workflow.end", null));
+        return nodes;
+    }
+    private List<Map<String, Object>> watchlistDigestEdges() {
+        List<Map<String, Object>> edges = new ArrayList<>();
+        edges.add(edge("start", "load_watchlist"));
+        edges.add(edge("load_watchlist", "market_overview"));
+        edges.add(edge("load_watchlist", "news_scan"));
+        edges.add(edge("market_overview", "sentiment_pulse"));
+        edges.add(edge("news_scan", "movers"));
+        edges.add(edge("sentiment_pulse", "digest_summary"));
+        edges.add(edge("movers", "digest_summary"));
+        edges.add(edge("digest_summary", "end"));
         return edges;
     }
 
