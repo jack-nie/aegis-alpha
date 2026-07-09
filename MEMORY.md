@@ -19,6 +19,7 @@ Claude 每次新任务开始前应读取此文件。
 
 ## Lessons Learned
 
+- 前端 deep link：`/runs/:runId` → 运行中心详情；`/recommendations/:workflowRunId` → 推荐详情；由 `normalizePathname` + `extractDeepLink*` 解析，打开详情走 `navigate`/`pushState`，关闭回到列表 path
 - 修改 auth 模块前必须先理解 TokenService 的 Base64+HMAC 签名机制
 - orchestrator 的 mock 模式是重要的离线测试手段，新功能必须兼容
 - MyBatis mapper XML 和接口必须同步修改
