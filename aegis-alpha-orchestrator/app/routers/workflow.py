@@ -1,5 +1,6 @@
 """Workflow execution router."""
 
+from contextlib import nullcontext
 from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
@@ -8,6 +9,7 @@ from typing import Any
 from ..models.requests import WorkflowRequest, NodeRequest
 from ..models.responses import WorkflowResult, NodeResult
 from ..dependencies import workflow_engine, node_executor
+from ..core.tools import use_authorization
 
 router = APIRouter(tags=["workflow"])
 
@@ -18,6 +20,13 @@ class ResumeRequest(BaseModel):
 
     class Config:
         populate_by_name = True
+
+
+def _authorization_context(delegated_token: str | None):
+    """Scope tool Authorization to a run-scoped delegated token when present."""
+    if not delegated_token or not str(delegated_token).strip():
+        return nullcontext()
+    return use_authorization(str(delegated_token).strip())
 
 
 @router.post("/resume-workflow")
@@ -43,15 +52,17 @@ async def stream_workflow(request: Request, body: WorkflowRequest):
     import json
 
     async def event_generator():
-        async for event in workflow_engine.stream_workflow(
-            nodes=body.nodes,
-            edges=body.edges,
-            state=body.state,
-            subject=body.subject,
-            require_approval=body.require_approval,
-            thread_id=body.thread_id,
-        ):
-            yield f"event: {event.event}\ndata: {json.dumps(event.data)}\n\n"
+        # use_authorization resets override on context exit (including generator teardown)
+        with _authorization_context(body.delegated_token):
+            async for event in workflow_engine.stream_workflow(
+                nodes=body.nodes,
+                edges=body.edges,
+                state=body.state,
+                subject=body.subject,
+                require_approval=body.require_approval,
+                thread_id=body.thread_id,
+            ):
+                yield f"event: {event.event}\ndata: {json.dumps(event.data)}\n\n"
 
     return StreamingResponse(
         event_generator(),
@@ -69,15 +80,16 @@ async def stream_workflow_tokens(request: Request, body: WorkflowRequest):
     import json
 
     async def event_generator():
-        async for event in workflow_engine.stream_workflow_tokens(
-            nodes=body.nodes,
-            edges=body.edges,
-            state=body.state,
-            subject=body.subject,
-            require_approval=body.require_approval,
-            thread_id=body.thread_id,
-        ):
-            yield f"event: {event.event}\ndata: {json.dumps(event.data)}\n\n"
+        with _authorization_context(body.delegated_token):
+            async for event in workflow_engine.stream_workflow_tokens(
+                nodes=body.nodes,
+                edges=body.edges,
+                state=body.state,
+                subject=body.subject,
+                require_approval=body.require_approval,
+                thread_id=body.thread_id,
+            ):
+                yield f"event: {event.event}\ndata: {json.dumps(event.data)}\n\n"
 
     return StreamingResponse(
         event_generator(),
@@ -94,14 +106,15 @@ async def stream_workflow_tokens(request: Request, body: WorkflowRequest):
 async def execute_workflow(request: Request, body: WorkflowRequest) -> WorkflowResult:
     """Non-streaming workflow execution."""
     try:
-        result = await workflow_engine.execute_workflow(
-            nodes=body.nodes,
-            edges=body.edges,
-            state=body.state,
-            subject=body.subject,
-            require_approval=body.require_approval,
-            thread_id=body.thread_id,
-        )
+        with _authorization_context(body.delegated_token):
+            result = await workflow_engine.execute_workflow(
+                nodes=body.nodes,
+                edges=body.edges,
+                state=body.state,
+                subject=body.subject,
+                require_approval=body.require_approval,
+                thread_id=body.thread_id,
+            )
         return result
     except Exception as e:
         return WorkflowResult(

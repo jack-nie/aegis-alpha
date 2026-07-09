@@ -60,6 +60,30 @@ class LangChainGatewayTest {
         assertThat(result.get("message"), is("Real LLM summary"));
     }
 
+    @Test
+    void buildStreamBodyIncludesDelegatedTokenWhenPresent() throws Exception {
+        LangChainGateway gateway = new LangChainGateway(
+                new ObjectMapper(),
+                false,
+                "http://127.0.0.1:8787",
+                "openai",
+                "deepseek-v4-flash",
+                "test-key",
+                "http://example.test/v1"
+        );
+        Map<String, Object> layout = new LinkedHashMap<String, Object>();
+        layout.put("nodes", java.util.Collections.emptyList());
+        layout.put("edges", java.util.Collections.emptyList());
+        Map<String, Object> inputs = new LinkedHashMap<String, Object>();
+        inputs.put("ticker", "AAPL");
+
+        String withToken = gateway.buildStreamBody(layout, "subject", inputs, "deleg-token-1");
+        assertThat(withToken.contains("\"delegatedToken\":\"deleg-token-1\""), is(true));
+
+        String withoutToken = gateway.buildStreamBody(layout, "subject", inputs, null);
+        assertThat(withoutToken.contains("delegatedToken"), is(false));
+    }
+
     private void summaryOnlyResponse(HttpExchange exchange) throws IOException {
         byte[] response = "{\"ok\":true,\"summary\":\"Real LLM summary\",\"provider\":\"langchain-openai\"}"
                 .getBytes(StandardCharsets.UTF_8);

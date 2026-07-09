@@ -98,6 +98,93 @@ def test_normalize_content_empty(mock_settings):
 def test_clamp_confidence():
     from app.core.llm_client import LLMClient
     assert LLMClient._clamp_confidence(1.5) == 1.0
+
+
+@pytest.mark.asyncio
+async def test_invoke_agent_with_tools_returns_tool_calls(mock_settings):
+    from unittest.mock import AsyncMock, MagicMock
+    from langchain_core.messages import AIMessage
+    from app.core.llm_client import LLMClient
+
+    client = LLMClient(mock_settings)
+    ai = AIMessage(
+        content="",
+        tool_calls=[{"name": "get_news", "args": {"ticker": "AAPL"}, "id": "tc1"}],
+    )
+    bound = MagicMock()
+    bound.ainvoke = AsyncMock(return_value=ai)
+    base = MagicMock()
+    base.bind_tools = MagicMock(return_value=bound)
+    client._build_client = MagicMock(return_value=base)
+
+    result = await client.invoke_agent_with_tools(
+        system="You are an agent",
+        prompt="Get news for AAPL",
+        tools=[MagicMock(name="get_news")],
+    )
+
+    assert result.has_tool_calls is True
+    assert result.ai_message.tool_calls
+    assert result.seed_human is not None
+    assert result.llm_response is None
+    base.bind_tools.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_invoke_agent_with_tools_final_text(mock_settings):
+    from unittest.mock import AsyncMock, MagicMock
+    from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+    from app.core.llm_client import LLMClient
+
+    client = LLMClient(mock_settings)
+    ai = AIMessage(content='{"summary": "done", "confidence": 0.8}')
+    bound = MagicMock()
+    bound.ainvoke = AsyncMock(return_value=ai)
+    base = MagicMock()
+    base.bind_tools = MagicMock(return_value=bound)
+    client._build_client = MagicMock(return_value=base)
+
+    prior = [
+        HumanMessage(content="task"),
+        AIMessage(content="", tool_calls=[{"name": "ping", "args": {}, "id": "1"}]),
+        ToolMessage(content="pong", tool_call_id="1"),
+    ]
+    result = await client.invoke_agent_with_tools(
+        system="You are an agent",
+        prompt="task",
+        tools=[MagicMock()],
+        prior_messages=prior,
+    )
+
+    assert result.has_tool_calls is False
+    assert result.llm_response is not None
+    assert result.llm_response.summary == "done"
+    assert result.seed_human is None  # continuation: no new human seed
+
+
+@pytest.mark.asyncio
+async def test_invoke_agent_with_tools_force_final_skips_bind(mock_settings):
+    from unittest.mock import AsyncMock, MagicMock
+    from langchain_core.messages import AIMessage
+    from app.core.llm_client import LLMClient
+
+    client = LLMClient(mock_settings)
+    ai = AIMessage(content="final answer without tools")
+    base = MagicMock()
+    base.ainvoke = AsyncMock(return_value=ai)
+    base.bind_tools = MagicMock()
+    client._build_client = MagicMock(return_value=base)
+
+    result = await client.invoke_agent_with_tools(
+        system="sys",
+        prompt="prompt",
+        tools=[MagicMock()],
+        force_final=True,
+    )
+
+    assert result.has_tool_calls is False
+    base.bind_tools.assert_not_called()
+    assert "final answer" in (result.llm_response.summary or "")
     assert LLMClient._clamp_confidence(-0.5) == 0.0
     assert LLMClient._clamp_confidence(0.7) == 0.7
     assert LLMClient._clamp_confidence("abc") == 0.5

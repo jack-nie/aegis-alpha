@@ -8,6 +8,8 @@ Claude 每次新任务开始前应读取此文件。
 - 项目已从 MarketMind 完成重命名为 Aegis Alpha（包名、变量名、CI 配置均已更新）
 - 自定义 Token 认证（HmacSHA256），不是标准 JWT — TokenService 是核心不可轻改
 - 委托 token（typ=delegation）：`TokenService.issueServiceDelegation`；positions/summary 可读；用户 login token 无 typ 字段；`POST /_backend/workflow-runs/{runId}/delegated-token` 签发短时 portfolio:read
+- 流式 run 自动注入：`WorkflowService.startWithStreaming` 签发 15min `portfolio:read` → `LangChainGateway.buildStreamBody(..., delegatedToken)` JSON 字段 `delegatedToken`；签发失败 log 后继续（无 token）
+- orchestrator `WorkflowRequest.delegated_token`（alias `delegatedToken`）；stream/execute 用 `use_authorization` contextvar 注入，run 结束自动 clear
 - orchestrator `ToolBackendClient`：Authorization 优先级 contextvar override > extra headers > AEGIS_ALPHA_DELEGATED_TOKEN > node_execution_token
 - 前端是 catch-all routing，所有页面逻辑集中在 App.jsx
 - orchestrator 已从 Node.js 重写为 Python FastAPI + LangGraph，分层架构
@@ -18,6 +20,7 @@ Claude 每次新任务开始前应读取此文件。
 - orchestrator Checkpointing 使用 SqliteSaver，workflow 可跨重启恢复
 - ToolNode 已集成，6 个 @tool 封装后端 API（行情/财务/新闻/组合）
 - SSE 流式支持 tool_call 事件类型，区分普通节点和工具调用
+- general.agent 真 tool-calling 循环：agent 写入带 tool_calls 的 AIMessage → tools__{id} → 回 agent；`final_state.tool_rounds[node_id]` 上限 3；finance.* 仍走 hydrate+LLM
 
 ## Lessons Learned
 

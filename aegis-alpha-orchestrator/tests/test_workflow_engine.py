@@ -397,3 +397,237 @@ async def test_resume_defaults_require_approval_true_without_meta(mock_node_exec
     assert call_args.kwargs.get("require_approval") is True or (
         len(call_args.args) >= 3 and call_args.args[2] is True
     )
+
+
+def test_messages_for_tool_continuation_empty():
+    from app.core.workflow_engine import _messages_for_tool_continuation
+
+    assert _messages_for_tool_continuation([]) == []
+    assert _messages_for_tool_continuation([MagicMock()]) == []
+
+
+def test_messages_for_tool_continuation_slices_from_human():
+    from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+    from app.core.workflow_engine import _messages_for_tool_continuation
+
+    msgs = [
+        HumanMessage(content="old"),
+        AIMessage(content="done"),
+        HumanMessage(content="new task"),
+        AIMessage(
+            content="",
+            tool_calls=[{"name": "ping", "args": {}, "id": "c1"}],
+        ),
+        ToolMessage(content="pong", tool_call_id="c1"),
+    ]
+    cont = _messages_for_tool_continuation(msgs)
+    assert len(cont) == 3
+    assert cont[0].content == "new task"
+    assert isinstance(cont[-1], ToolMessage)
+
+
+@pytest.mark.asyncio
+async def test_agent_tool_loop_calls_tool_once_then_final(mock_node_executor):
+    """LLM requests a tool once; after ToolNode, agent returns final text."""
+    from langchain_core.messages import AIMessage
+    from langchain_core.tools import tool
+    from app.core.llm_client import AgentToolResult, LLMResponse
+    from app.core.workflow_engine import MAX_TOOL_ROUNDS, WorkflowEngine
+
+    WorkflowEngine._graph_cache.clear()
+
+    @tool
+    def ping() -> str:
+        """Return pong for tool-loop tests."""
+        return "pong"
+
+    call_count = {"n": 0}
+
+    async def fake_invoke_agent_with_tools(
+        node,
+        state,
+        subject="",
+        tools=None,
+        prior_messages=None,
+        force_final=False,
+        agent=None,
+        model=None,
+    ):
+        from langchain_core.messages import HumanMessage
+
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            assert force_final is False
+            assert prior_messages in (None, [])
+            ai = AIMessage(
+                content="",
+                tool_calls=[{"name": "ping", "args": {}, "id": "call_ping_1"}],
+            )
+            return AgentToolResult(
+                ai,
+                has_tool_calls=True,
+                seed_human=HumanMessage(content="use ping"),
+            )
+        # Second turn (after tools) or force_final: final JSON-ish summary
+        assert prior_messages is not None or force_final
+        if prior_messages:
+            assert any(type(m).__name__ == "ToolMessage" for m in prior_messages)
+        ai = AIMessage(content='{"summary": "ping said pong", "confidence": 0.9}')
+        return AgentToolResult(
+            ai,
+            has_tool_calls=False,
+            llm_response=LLMResponse(
+                summary="ping said pong",
+                confidence=0.9,
+                content="ping said pong",
+            ),
+            seed_human=None,
+        )
+
+    mock_node_executor.invoke_agent_with_tools = AsyncMock(side_effect=fake_invoke_agent_with_tools)
+
+    engine = WorkflowEngine(mock_node_executor, tools=[ping])
+    nodes = [
+        Node(id="agent", data=NodeData(handler="general.agent", prompt="use ping")),
+        Node(id="end", data=NodeData(handler="end", nodeType="end")),
+    ]
+    edges = [Edge(source="agent", target="end")]
+
+    result = await engine.execute_workflow(
+        nodes=nodes,
+        edges=edges,
+        state={},
+        subject="tool loop test",
+    )
+
+    assert result.ok is True
+    assert call_count["n"] == 2
+    agent_out = (result.node_outputs or {}).get("agent") or (result.final_state or {}).get("agent")
+    assert agent_out is not None
+    assert "pong" in (agent_out.get("summary") or "")
+    assert (result.final_state or {}).get("last_agent_id") == "agent"
+    # One tool round recorded
+    rounds = (result.final_state or {}).get("tool_rounds") or {}
+    assert rounds.get("agent") == 1
+    assert MAX_TOOL_ROUNDS == 3
+
+
+@pytest.mark.asyncio
+async def test_agent_tool_loop_caps_at_max_rounds(mock_node_executor):
+    """Agent that always requests tools is forced to final after MAX_TOOL_ROUNDS."""
+    from langchain_core.messages import AIMessage
+    from langchain_core.tools import tool
+    from app.core.llm_client import AgentToolResult, LLMResponse
+    from app.core.workflow_engine import MAX_TOOL_ROUNDS, WorkflowEngine
+
+    WorkflowEngine._graph_cache.clear()
+
+    @tool
+    def ping() -> str:
+        """Return pong."""
+        return "pong"
+
+    call_ids = {"n": 0}
+
+    async def always_tools(
+        node,
+        state,
+        subject="",
+        tools=None,
+        prior_messages=None,
+        force_final=False,
+        agent=None,
+        model=None,
+    ):
+        from langchain_core.messages import HumanMessage
+
+        if force_final:
+            ai = AIMessage(content='{"summary": "capped", "confidence": 0.5}')
+            return AgentToolResult(
+                ai,
+                has_tool_calls=False,
+                llm_response=LLMResponse(summary="capped", confidence=0.5, content="capped"),
+            )
+        call_ids["n"] += 1
+        ai = AIMessage(
+            content="",
+            tool_calls=[{"name": "ping", "args": {}, "id": f"call_cap_{call_ids['n']}"}],
+        )
+        seed = None if prior_messages else HumanMessage(content="cap test")
+        return AgentToolResult(ai, has_tool_calls=True, seed_human=seed)
+
+    mock_node_executor.invoke_agent_with_tools = AsyncMock(side_effect=always_tools)
+
+    engine = WorkflowEngine(mock_node_executor, tools=[ping])
+    nodes = [
+        Node(id="agent", data=NodeData(handler="general.agent")),
+        Node(id="end", data=NodeData(handler="end", nodeType="end")),
+    ]
+    edges = [Edge(source="agent", target="end")]
+
+    result = await engine.execute_workflow(
+        nodes=nodes,
+        edges=edges,
+        state={},
+        subject="cap test",
+    )
+
+    assert result.ok is True
+    # MAX_TOOL_ROUNDS tool requests + 1 force_final turn
+    assert mock_node_executor.invoke_agent_with_tools.await_count == MAX_TOOL_ROUNDS + 1
+    force_flags = [
+        c.kwargs.get("force_final")
+        for c in mock_node_executor.invoke_agent_with_tools.await_args_list
+    ]
+    assert force_flags[-1] is True
+    agent_out = (result.node_outputs or {}).get("agent") or (result.final_state or {}).get("agent")
+    assert agent_out is not None
+    assert "capped" in (agent_out.get("summary") or "")
+
+
+@pytest.mark.asyncio
+async def test_finance_handler_does_not_enter_tool_loop(mock_node_executor):
+    """finance.* handlers stay on hydrate+LLM execute path (no tool loop)."""
+    from langchain_core.tools import tool
+    from app.core.workflow_engine import WorkflowEngine
+    from app.models.responses import NodeResult
+
+    WorkflowEngine._graph_cache.clear()
+
+    @tool
+    def ping() -> str:
+        """Unused tool."""
+        return "pong"
+
+    mock_node_executor.execute = AsyncMock(
+        return_value=NodeResult(
+            ok=True,
+            status="completed",
+            handler="finance.market_analysis",
+            node_id="market",
+            node_name="market",
+            subject="s",
+            summary="finance path",
+        )
+    )
+    mock_node_executor.invoke_agent_with_tools = AsyncMock(
+        side_effect=AssertionError("tool loop must not run for finance.*")
+    )
+
+    engine = WorkflowEngine(mock_node_executor, tools=[ping])
+    nodes = [
+        Node(id="market", data=NodeData(handler="finance.market_analysis")),
+        Node(id="end", data=NodeData(handler="end", nodeType="end")),
+    ]
+    edges = [Edge(source="market", target="end")]
+
+    result = await engine.execute_workflow(
+        nodes=nodes,
+        edges=edges,
+        state={},
+        subject="finance only",
+    )
+
+    assert result.ok is True
+    mock_node_executor.invoke_agent_with_tools.assert_not_awaited()
+    mock_node_executor.execute.assert_awaited()

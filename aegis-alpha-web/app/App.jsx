@@ -346,6 +346,36 @@ const workflowPreviewDefinitions = [
     readonlyFlag: false,
     engine: "langgraph",
   },
+  {
+    workflowKey: "stock_analysis",
+    name: "个股综合分析",
+    version: 1,
+    versionLabel: "v1",
+    nodes: 7,
+    edges: 6,
+    readonlyFlag: false,
+    engine: "langgraph",
+  },
+  {
+    workflowKey: "earnings_reaction",
+    name: "财报反应",
+    version: 1,
+    versionLabel: "v1",
+    nodes: 6,
+    edges: 5,
+    readonlyFlag: false,
+    engine: "langgraph",
+  },
+  {
+    workflowKey: "watchlist_digest",
+    name: "自选早报",
+    version: 1,
+    versionLabel: "v1",
+    nodes: 5,
+    edges: 4,
+    readonlyFlag: false,
+    engine: "langgraph",
+  },
 ];
 
 const workflowPreviewByKey = Object.fromEntries(workflowPreviewDefinitions.map((item) => [item.workflowKey, item]));
@@ -1142,7 +1172,14 @@ function AICopilot({ setCopilotOpen, api, promptRequest, onPromptHandled }) {
       content: "你好！我是 Aegis Alpha Copilot，可以帮你分析市场、查询数据、生成报告。有什么可以帮你的？",
     },
   ];
-  const suggestions = ["分析当前市场宏观环境", "查看我的投资组合概况", "生成一份行业研究报告", "回测某个策略的表现"];
+  const suggestions = [
+    "分析当前市场宏观环境",
+    "查看我的投资组合概况",
+    "生成一份行业研究报告",
+    "回测某个策略的表现",
+    "解读 AAPL 最新财报反应",
+    "生成自选股早报摘要",
+  ];
   const [messages, setMessages] = useState(initialMessages);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
@@ -5251,16 +5288,90 @@ function ModelGovernancePage({ api }) {
   );
 }
 
+function isRecommendationDegradedDraft(item) {
+  if (!item) return false;
+  const recLabel = String(pickFirst(item, ["recommendation"]) || "").toUpperCase();
+  const disclaimer = String(pickFirst(item, ["disclaimer"]) || "");
+  const rationale = pickFirst(item, ["rationaleJson", "rationale_json"]);
+  let rationaleDegraded = false;
+  if (rationale && typeof rationale === "object") {
+    rationaleDegraded = Boolean(rationale.degraded);
+  } else if (typeof rationale === "string" && rationale.includes("degraded")) {
+    try {
+      const parsed = JSON.parse(rationale);
+      rationaleDegraded = Boolean(parsed?.degraded);
+    } catch {
+      rationaleDegraded = /"degraded"\s*:\s*true/i.test(rationale);
+    }
+  }
+  return (
+    recLabel === "INSUFFICIENT_DATA" ||
+    disclaimer.includes("DEGRADED") ||
+    disclaimer.includes("DRAFT/DEGRADED") ||
+    rationaleDegraded
+  );
+}
+
+/** Prefer explicit `approvable` from detail API; otherwise heuristic on label / disclaimer / evidence. */
+function resolveRecommendationApprovable(item, { approvable, evidence } = {}) {
+  if (!item) return false;
+  const approval = String(pickFirst(item, ["approvalStatus", "approval_status"]) || "").toUpperCase();
+  if (approval && approval !== "PENDING_REVIEW") return false;
+  if (typeof approvable === "boolean") return approvable;
+  if (typeof pickFirst(item, ["approvable"]) === "boolean") {
+    return Boolean(pickFirst(item, ["approvable"]));
+  }
+  if (isRecommendationDegradedDraft(item)) return false;
+  if (Array.isArray(evidence) && evidence.length === 0) return false;
+  return approval === "PENDING_REVIEW" || !approval;
+}
+
+function RecommendationQualityBadges({ item }) {
+  if (!item) return null;
+  const recLabel = String(pickFirst(item, ["recommendation"]) || "").toUpperCase();
+  const disclaimer = String(pickFirst(item, ["disclaimer"]) || "");
+  const insufficient = recLabel === "INSUFFICIENT_DATA";
+  const degraded =
+    disclaimer.includes("DEGRADED") ||
+    disclaimer.includes("DRAFT/DEGRADED") ||
+    disclaimer.includes("[DRAFT");
+  if (!insufficient && !degraded) return null;
+  return (
+    <span className="inline-flex flex-wrap items-center gap-1">
+      {insufficient && (
+        <span
+          data-testid="badge-insufficient-data"
+          className="inline-flex rounded-full border border-orange-300 bg-orange-50 px-2 py-0.5 text-[11px] font-semibold text-orange-800"
+          title="数据不足，不可批准"
+        >
+          数据不足
+        </span>
+      )}
+      {degraded && (
+        <span
+          data-testid="badge-degraded-draft"
+          className="inline-flex rounded-full border border-amber-300 bg-amber-50 px-2 py-0.5 text-[11px] font-semibold text-amber-800"
+          title="降级草稿，不可批准"
+        >
+          降级草稿
+        </span>
+      )}
+    </span>
+  );
+}
+
 function RecommendationHistoryPage({ api, navigate, deepLinkWorkflowRunId = "" }) {
   const [items, setItems] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [actionBusy, setActionBusy] = useState("");
+  const [approvalFilter, setApprovalFilter] = useState("all");
   const [detail, setDetail] = useState({
     open: false,
     recommendation: null,
     evidence: [],
     llmCalls: [],
+    approvable: null,
     loading: false,
     error: "",
   });
@@ -5296,6 +5407,7 @@ function RecommendationHistoryPage({ api, navigate, deepLinkWorkflowRunId = "" }
         recommendation: row,
         evidence: [],
         llmCalls: [],
+        approvable: null,
         loading: Boolean(workflowRunId),
         error: workflowRunId ? "" : "缺少 workflowRunId，无法加载推荐证据。",
       });
@@ -5311,11 +5423,18 @@ function RecommendationHistoryPage({ api, navigate, deepLinkWorkflowRunId = "" }
           llmCalls = [];
         }
         if (requestId !== openDetailRequestRef.current) return;
+        const recommendation = response?.recommendation || row;
+        const evidence = normalizeListResponse(response?.evidence || []);
+        const approvable =
+          typeof response?.approvable === "boolean"
+            ? response.approvable
+            : resolveRecommendationApprovable(recommendation, { evidence });
         setDetail({
           open: true,
-          recommendation: response?.recommendation || row,
-          evidence: normalizeListResponse(response?.evidence || []),
+          recommendation,
+          evidence,
           llmCalls,
+          approvable,
           loading: false,
           error: "",
         });
@@ -5326,6 +5445,7 @@ function RecommendationHistoryPage({ api, navigate, deepLinkWorkflowRunId = "" }
           recommendation: row,
           evidence: [],
           llmCalls: [],
+          approvable: null,
           loading: false,
           error: ex.message || "加载推荐详情失败",
         });
@@ -5347,7 +5467,15 @@ function RecommendationHistoryPage({ api, navigate, deepLinkWorkflowRunId = "" }
   const closeDetail = () => {
     openDetailRequestRef.current += 1;
     pendingRecommendationHintRef.current = null;
-    setDetail({ open: false, recommendation: null, evidence: [], llmCalls: [], loading: false, error: "" });
+    setDetail({
+      open: false,
+      recommendation: null,
+      evidence: [],
+      llmCalls: [],
+      approvable: null,
+      loading: false,
+      error: "",
+    });
     if (navigate) navigate("/recommendations");
   };
 
@@ -5355,7 +5483,15 @@ function RecommendationHistoryPage({ api, navigate, deepLinkWorkflowRunId = "" }
     if (!deepLinkWorkflowRunId) {
       setDetail((prev) =>
         prev.open
-          ? { open: false, recommendation: null, evidence: [], llmCalls: [], loading: false, error: "" }
+          ? {
+              open: false,
+              recommendation: null,
+              evidence: [],
+              llmCalls: [],
+              approvable: null,
+              loading: false,
+              error: "",
+            }
           : prev,
       );
       return;
@@ -5378,7 +5514,11 @@ function RecommendationHistoryPage({ api, navigate, deepLinkWorkflowRunId = "" }
       const updated = await api(recommendationDecisionPath(workflowRunId, action), { method: "POST" });
       setDetail((prev) =>
         prev.open && pickFirst(prev.recommendation, ["workflowRunId", "workflow_run_id"]) === workflowRunId
-          ? { ...prev, recommendation: updated }
+          ? {
+              ...prev,
+              recommendation: updated,
+              approvable: resolveRecommendationApprovable(updated, { evidence: prev.evidence }),
+            }
           : prev,
       );
       await loadRecommendations();
@@ -5389,12 +5529,31 @@ function RecommendationHistoryPage({ api, navigate, deepLinkWorkflowRunId = "" }
     }
   };
 
-  const pendingCount = items.filter(
+  const pendingItems = items.filter(
     (item) => String(pickFirst(item, ["approvalStatus", "approval_status"])).toUpperCase() === "PENDING_REVIEW",
-  ).length;
+  );
+  const pendingCount = pendingItems.length;
   const approvedCount = items.filter(
     (item) => String(pickFirst(item, ["approvalStatus", "approval_status"])).toUpperCase() === "APPROVED",
   ).length;
+  const approvableCount = pendingItems.filter((item) => resolveRecommendationApprovable(item)).length;
+  const notApprovableCount = pendingItems.filter((item) => !resolveRecommendationApprovable(item)).length;
+
+  const filteredItems = items.filter((item) => {
+    const approval = String(pickFirst(item, ["approvalStatus", "approval_status"])).toUpperCase();
+    const pending = approval === "PENDING_REVIEW";
+    if (approvalFilter === "pending") return pending;
+    if (approvalFilter === "approvable") return pending && resolveRecommendationApprovable(item);
+    if (approvalFilter === "not_approvable") return pending && !resolveRecommendationApprovable(item);
+    return true;
+  });
+
+  const filterChips = [
+    { key: "all", label: "全部", count: items.length },
+    { key: "pending", label: "待审", count: pendingCount },
+    { key: "approvable", label: "可批准", count: approvableCount },
+    { key: "not_approvable", label: "不可批准", count: notApprovableCount },
+  ];
 
   return (
     <div className="space-y-4">
@@ -5420,6 +5579,27 @@ function RecommendationHistoryPage({ api, navigate, deepLinkWorkflowRunId = "" }
           label="覆盖标的"
           value={new Set(items.map((item) => pickFirst(item, ["symbol"])).filter(Boolean)).size}
         />
+      </div>
+
+      <div className="flex flex-wrap items-center gap-2" data-testid="recommendation-approval-filters">
+        {filterChips.map((chip) => {
+          const active = approvalFilter === chip.key;
+          return (
+            <button
+              key={chip.key}
+              type="button"
+              onClick={() => setApprovalFilter(chip.key)}
+              className={`rounded-full border px-3 py-1 text-xs font-semibold transition-colors ${
+                active
+                  ? "border-blue-300 bg-blue-50 text-blue-700"
+                  : "border-gray-200 bg-white text-gray-600 hover:border-gray-300 hover:bg-gray-50"
+              }`}
+            >
+              {chip.label}
+              <span className={`ml-1 ${active ? "text-blue-500" : "text-gray-400"}`}>{chip.count}</span>
+            </button>
+          );
+        })}
       </div>
 
       <div className="overflow-hidden rounded-xl border border-gray-200 bg-white">
@@ -5451,18 +5631,23 @@ function RecommendationHistoryPage({ api, navigate, deepLinkWorkflowRunId = "" }
                   </td>
                 </tr>
               )}
-              {!loading && !error && !items.length && (
+              {!loading && !error && !filteredItems.length && (
                 <tr>
                   <td colSpan={9} className="px-4 py-10 text-center text-sm text-gray-400">
-                    暂无推荐历史
+                    {items.length ? "当前筛选下暂无推荐" : "暂无推荐历史"}
                   </td>
                 </tr>
               )}
               {!loading &&
                 !error &&
-                items.map((item, index) => {
+                filteredItems.map((item, index) => {
                   const workflowRunId = displayValue(pickFirst(item, ["workflowRunId", "workflow_run_id"]));
                   const busyPrefix = actionBusy.endsWith(`:${workflowRunId}`) ? actionBusy.split(":")[0] : "";
+                  const approval = String(
+                    pickFirst(item, ["approvalStatus", "approval_status"]) || "",
+                  ).toUpperCase();
+                  const canApprove = resolveRecommendationApprovable(item);
+                  const approveDisabled = Boolean(busyPrefix) || !canApprove || approval !== "PENDING_REVIEW";
                   return (
                     <tr
                       key={pickFirst(item, ["recommendationId", "recommendation_id"]) || workflowRunId || index}
@@ -5475,14 +5660,24 @@ function RecommendationHistoryPage({ api, navigate, deepLinkWorkflowRunId = "" }
                         {displayValue(pickFirst(item, ["symbol"])) || "-"}
                       </td>
                       <td className="table-cell">
-                        <StatusPill status={pickFirst(item, ["recommendation"])} />
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          <StatusPill status={pickFirst(item, ["recommendation"])} />
+                          <RecommendationQualityBadges item={item} />
+                        </div>
                       </td>
                       <td className="table-cell">{formatConfidence(pickFirst(item, ["confidence"]))}</td>
                       <td className="table-cell">
                         {displayValue(pickFirst(item, ["timeHorizon", "time_horizon"])) || "-"}
                       </td>
                       <td className="table-cell">
-                        <StatusPill status={pickFirst(item, ["approvalStatus", "approval_status"])} />
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          <StatusPill status={pickFirst(item, ["approvalStatus", "approval_status"])} />
+                          {approval === "PENDING_REVIEW" && !canApprove && (
+                            <span className="inline-flex rounded-full border border-gray-200 bg-gray-50 px-2 py-0.5 text-[11px] font-semibold text-gray-500">
+                              不可批准
+                            </span>
+                          )}
+                        </div>
                       </td>
                       <td className="table-cell max-w-[180px] truncate font-mono text-xs">
                         {displayValue(pickFirst(item, ["traceId", "trace_id"])) || "-"}
@@ -5503,7 +5698,8 @@ function RecommendationHistoryPage({ api, navigate, deepLinkWorkflowRunId = "" }
                             type="button"
                             data-testid="recommendation-approve"
                             onClick={() => decide(item, "approve")}
-                            disabled={Boolean(busyPrefix)}
+                            disabled={approveDisabled}
+                            title={approveDisabled && !busyPrefix ? "当前推荐不可批准（数据不足、降级或非待审）" : ""}
                             className="rounded-lg border border-emerald-200 px-2.5 py-1.5 text-xs font-semibold text-emerald-700 hover:bg-emerald-50 disabled:cursor-not-allowed disabled:opacity-40"
                           >
                             {busyPrefix === "approve" ? "..." : "批准"}
@@ -5512,7 +5708,7 @@ function RecommendationHistoryPage({ api, navigate, deepLinkWorkflowRunId = "" }
                             type="button"
                             data-testid="recommendation-reject"
                             onClick={() => decide(item, "reject")}
-                            disabled={Boolean(busyPrefix)}
+                            disabled={Boolean(busyPrefix) || approval !== "PENDING_REVIEW"}
                             className="rounded-lg border border-red-200 px-2.5 py-1.5 text-xs font-semibold text-red-700 hover:bg-red-50 disabled:cursor-not-allowed disabled:opacity-40"
                           >
                             {busyPrefix === "reject" ? "..." : "驳回"}
@@ -5600,11 +5796,13 @@ function RecommendationDetailPanel({ detail, actionBusy, onClose, onDecision }) 
                     recLabel === "INSUFFICIENT_DATA" ||
                     disclaimer.includes("DEGRADED") ||
                     disclaimer.includes("DRAFT");
-                  const approveBlocked =
-                    recLabel === "INSUFFICIENT_DATA" ||
-                    disclaimer.includes("DEGRADED") ||
-                    !Array.isArray(evidence) ||
-                    evidence.length === 0;
+                  const canApprove = resolveRecommendationApprovable(recommendation, {
+                    approvable: detail.approvable,
+                    evidence,
+                  });
+                  const approveBlocked = !canApprove || approval !== "PENDING_REVIEW";
+                  const insufficient = recLabel === "INSUFFICIENT_DATA";
+                  const degraded = isRecommendationDegradedDraft(recommendation);
                   return (
                     <>
                       {isDraft && (
@@ -5613,43 +5811,56 @@ function RecommendationDetailPanel({ detail, actionBusy, onClose, onDecision }) 
                           {approveBlocked ? "；当前状态不可批准（数据不足、降级或无证据）" : ""}
                         </div>
                       )}
-                <div className="flex flex-wrap items-center justify-between gap-3">
-                  <div className="flex flex-wrap items-center gap-2">
-                    <StatusPill status={pickFirst(recommendation, ["recommendation"])} />
-                    <StatusPill status={pickFirst(recommendation, ["approvalStatus", "approval_status"])} />
-                    <span className="text-sm text-gray-500">
-                      置信度 {formatConfidence(pickFirst(recommendation, ["confidence"]))}
-                    </span>
-                    <span className="text-sm text-gray-500">Token {formatNumber(totalTokens)}</span>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <button
-                      type="button"
-                      data-testid="recommendation-approve"
-                      onClick={() => onDecision(recommendation, "approve")}
-                      disabled={Boolean(busyPrefix) || approveBlocked}
-                      className="rounded-lg border border-emerald-200 px-3 py-1.5 text-xs font-semibold text-emerald-700 hover:bg-emerald-50 disabled:cursor-not-allowed disabled:opacity-40"
-                    >
-                      批准
-                    </button>
-                    <button
-                      type="button"
-                      data-testid="recommendation-reject"
-                      onClick={() => onDecision(recommendation, "reject")}
-                      disabled={Boolean(busyPrefix)}
-                      className="rounded-lg border border-red-200 px-3 py-1.5 text-xs font-semibold text-red-700 hover:bg-red-50 disabled:cursor-not-allowed disabled:opacity-40"
-                    >
-                      驳回
-                    </button>
-                  </div>
-                </div>
-                <p className="mt-3 text-sm leading-6 text-gray-600">
-                  {displayValue(pickFirst(recommendation, ["disclaimer"])) || "-"}
-                </p>
-                <JsonViewer
-                  compact
-                  value={summarizeJson(pickFirst(recommendation, ["rationaleJson", "rationale_json"]))}
-                />
+                      <div className="flex flex-wrap items-center justify-between gap-3">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <StatusPill status={pickFirst(recommendation, ["recommendation"])} />
+                          <StatusPill status={pickFirst(recommendation, ["approvalStatus", "approval_status"])} />
+                          <RecommendationQualityBadges item={recommendation} />
+                          {(insufficient || degraded) && !canApprove && (
+                            <span className="text-xs text-gray-500">
+                              {insufficient
+                                ? "证据或数据不足，后端将拒绝批准"
+                                : "降级产出不可批准，请补齐证据后重跑"}
+                            </span>
+                          )}
+                          <span className="text-sm text-gray-500">
+                            置信度 {formatConfidence(pickFirst(recommendation, ["confidence"]))}
+                          </span>
+                          <span className="text-sm text-gray-500">Token {formatNumber(totalTokens)}</span>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <button
+                            type="button"
+                            data-testid="recommendation-approve"
+                            onClick={() => onDecision(recommendation, "approve")}
+                            disabled={Boolean(busyPrefix) || approveBlocked}
+                            title={
+                              approveBlocked && !busyPrefix
+                                ? "当前推荐不可批准（数据不足、降级、无证据或非待审）"
+                                : ""
+                            }
+                            className="rounded-lg border border-emerald-200 px-3 py-1.5 text-xs font-semibold text-emerald-700 hover:bg-emerald-50 disabled:cursor-not-allowed disabled:opacity-40"
+                          >
+                            批准
+                          </button>
+                          <button
+                            type="button"
+                            data-testid="recommendation-reject"
+                            onClick={() => onDecision(recommendation, "reject")}
+                            disabled={Boolean(busyPrefix) || approval !== "PENDING_REVIEW"}
+                            className="rounded-lg border border-red-200 px-3 py-1.5 text-xs font-semibold text-red-700 hover:bg-red-50 disabled:cursor-not-allowed disabled:opacity-40"
+                          >
+                            驳回
+                          </button>
+                        </div>
+                      </div>
+                      <p className="mt-3 text-sm leading-6 text-gray-600">
+                        {displayValue(pickFirst(recommendation, ["disclaimer"])) || "-"}
+                      </p>
+                      <JsonViewer
+                        compact
+                        value={summarizeJson(pickFirst(recommendation, ["rationaleJson", "rationale_json"]))}
+                      />
                     </>
                   );
                 })()}
@@ -6187,13 +6398,15 @@ function summarizeJson(value) {
 function StatusPill({ status }) {
   const text = String(status || "UNKNOWN").toUpperCase();
   const tone =
-    text.includes("FAIL") || text.includes("ERROR")
-      ? "border-red-200 bg-red-50 text-red-700"
-      : text.includes("RUN") || text.includes("PENDING")
-        ? "border-blue-200 bg-blue-50 text-blue-700"
-        : text.includes("COMPLETE") || text.includes("SUCCESS")
-          ? "border-emerald-200 bg-emerald-50 text-emerald-700"
-          : "border-gray-200 bg-gray-50 text-gray-600";
+    text.includes("INSUFFICIENT")
+      ? "border-orange-300 bg-orange-50 text-orange-800"
+      : text.includes("FAIL") || text.includes("ERROR") || text.includes("REJECT")
+        ? "border-red-200 bg-red-50 text-red-700"
+        : text.includes("RUN") || text.includes("PENDING")
+          ? "border-blue-200 bg-blue-50 text-blue-700"
+          : text.includes("COMPLETE") || text.includes("SUCCESS") || text.includes("APPROVED")
+            ? "border-emerald-200 bg-emerald-50 text-emerald-700"
+            : "border-gray-200 bg-gray-50 text-gray-600";
   return (
     <span className={`inline-flex rounded-full border px-2 py-0.5 text-[11px] font-semibold ${tone}`}>{text}</span>
   );

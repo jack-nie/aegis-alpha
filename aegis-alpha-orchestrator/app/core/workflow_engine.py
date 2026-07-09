@@ -31,10 +31,45 @@ from .tool_registry import resolve_agent_roles, tools_for_roles
 logger = logging.getLogger(__name__)
 
 _GRAPH_CACHE_MAX = 100
+# Max agent→tools→agent iterations per specialist node (avoids infinite tool loops).
+MAX_TOOL_ROUNDS = 3
 
 
 def _is_tools_node_name(name: str) -> bool:
     return name == "tools" or name.startswith("tools__")
+
+
+def _is_tool_message(msg: Any) -> bool:
+    """True if msg is a LangChain ToolMessage (or duck-typed equivalent)."""
+    if msg is None:
+        return False
+    cls_name = type(msg).__name__
+    if cls_name == "ToolMessage":
+        return True
+    role = getattr(msg, "type", None) or getattr(msg, "role", None)
+    return role in ("tool", "function")
+
+
+def _messages_for_tool_continuation(messages: list[Any]) -> list[Any]:
+    """Slice conversation from the last HumanMessage when tools just returned.
+
+    Used so a mid-loop re-entry continues the same Human/AI/Tool thread without
+    re-seeding a new HumanMessage.
+    """
+    if not messages:
+        return []
+    last = messages[-1]
+    if not _is_tool_message(last):
+        return []
+    start = 0
+    for i in range(len(messages) - 1, -1, -1):
+        msg = messages[i]
+        cls_name = type(msg).__name__
+        role = getattr(msg, "type", None) or getattr(msg, "role", None)
+        if cls_name == "HumanMessage" or role in ("human", "user"):
+            start = i
+            break
+    return list(messages[start:])
 
 
 def deep_merge(current: dict, update: dict) -> dict:
@@ -85,6 +120,15 @@ class WorkflowEngine:
 
     def _has_tools_capability(self) -> bool:
         return bool(self._tools) or bool(self._tool_registry)
+
+    def _tools_for_node(self, node: Node) -> list:
+        """Role-filtered tools for a general.agent node (empty if none available)."""
+        if self._tool_registry:
+            roles = resolve_agent_roles(node)
+            return tools_for_roles(self._tool_registry, roles)
+        if self._tools:
+            return list(self._tools)
+        return []
 
     @classmethod
     def _node_content_fingerprint(cls, node: Node) -> dict[str, Any]:
@@ -322,8 +366,13 @@ class WorkflowEngine:
             started_at = datetime.now(timezone.utc).isoformat()
             subject = state.get("subject", "Aegis Alpha workflow")
             node_label = node.data.label or node.data.title or node.id
+            agent_tools = self._tools_for_node(node) if is_agent_with_tools else []
+            messages = list(state.get("messages") or [])
+            prior_for_tools = _messages_for_tool_continuation(messages)
+            mid_tool_loop = bool(prior_for_tools)
 
-            if store and handler != "start" and handler != "end":
+            # Skip ticker cache mid tool-loop so we re-enter with ToolMessages.
+            if store and handler != "start" and handler != "end" and not mid_tool_loop:
                 try:
                     ticker = state.get("final_state", {}).get("ticker", "") or state.get("final_state", {}).get("symbol", "")
                     cache_key = f"{handler}:v2"
@@ -363,6 +412,27 @@ class WorkflowEngine:
                     logger.warning(f"[THINKING] Store read error for node {node.id}: {cache_err}")
 
             logger.info(f"[THINKING] Workflow node starting: id={node.id} handler={handler} label={node_label} subject={subject}")
+
+            # True tool-calling loop for general.agent when tools are bound.
+            if agent_tools:
+                try:
+                    return await self._run_agent_tool_turn(
+                        node=node,
+                        state=state,
+                        subject=subject,
+                        node_label=node_label,
+                        handler=handler,
+                        agent_tools=agent_tools,
+                        prior_for_tools=prior_for_tools,
+                        mid_tool_loop=mid_tool_loop,
+                        started_at=started_at,
+                        store=store,
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"[THINKING] Agent tool-loop failed, falling back to execute: "
+                        f"id={node.id} error={e}"
+                    )
 
             try:
                 result = await self._node_executor.execute(
@@ -419,6 +489,145 @@ class WorkflowEngine:
             }
 
         return node_fn
+
+    async def _run_agent_tool_turn(
+        self,
+        *,
+        node: Node,
+        state: WorkflowState,
+        subject: str,
+        node_label: str,
+        handler: str,
+        agent_tools: list,
+        prior_for_tools: list[Any],
+        mid_tool_loop: bool,
+        started_at: str,
+        store: BaseStore | None,
+    ) -> dict:
+        """Execute one general.agent turn: request tools or produce final NodeResult."""
+        final_state = state.get("final_state") or {}
+        tool_rounds = final_state.get("tool_rounds") or {}
+        if not isinstance(tool_rounds, dict):
+            tool_rounds = {}
+        current_round = int(tool_rounds.get(node.id, 0) or 0)
+        force_final = current_round >= MAX_TOOL_ROUNDS
+
+        agent_result = await self._node_executor.invoke_agent_with_tools(
+            node=node,
+            state=final_state,
+            subject=subject,
+            tools=agent_tools,
+            prior_messages=prior_for_tools if mid_tool_loop else None,
+            force_final=force_final,
+        )
+
+        if agent_result.has_tool_calls and not force_final:
+            next_round = current_round + 1
+            tool_names: list[str] = []
+            ai_msg = agent_result.ai_message
+            for tc in getattr(ai_msg, "tool_calls", None) or []:
+                if isinstance(tc, dict):
+                    tool_names.append(str(tc.get("name") or tc.get("function", {}).get("name") or ""))
+                else:
+                    tool_names.append(str(getattr(tc, "name", "") or ""))
+            logger.info(
+                f"[THINKING] Agent requesting tools: id={node.id} round={next_round}/{MAX_TOOL_ROUNDS} "
+                f"tools={tool_names}"
+            )
+            trace_entry = {
+                "nodeId": node.id,
+                "nodeName": node_label,
+                "handler": handler,
+                "status": "awaiting_tools",
+                "ok": True,
+                "degraded": False,
+                "startedAt": started_at,
+                "completedAt": datetime.now(timezone.utc).isoformat(),
+                "durationMs": int(
+                    (datetime.now(timezone.utc) - datetime.fromisoformat(started_at)).total_seconds()
+                    * 1000
+                ),
+            }
+            # messages reducer concatenates; seed Human only on first loop entry.
+            return {
+                "messages": agent_result.messages_to_append,
+                "final_state": {
+                    "last_agent_id": node.id,
+                    "tool_rounds": {node.id: next_round},
+                },
+                "trace": [trace_entry],
+            }
+
+        # Final answer (no tool_calls, or forced after max rounds).
+        result = self._node_executor.agent_tool_result_to_node_result(
+            node=node,
+            subject=subject,
+            agent_result=agent_result,
+            started_at=started_at,
+        )
+        if force_final and agent_result.has_tool_calls:
+            # Model still tried to call tools past the cap; surface as degraded text.
+            result = NodeResult(
+                **{
+                    **result.model_dump(),
+                    "degraded": True,
+                    "summary": result.summary
+                    or f"Tool-call limit ({MAX_TOOL_ROUNDS}) reached for {node.id}",
+                    "data": {
+                        **(result.data or {}),
+                        "tool_round_capped": True,
+                        "tool_rounds": current_round,
+                    },
+                }
+            )
+
+        trace_entry = {
+            "nodeId": result.node_id,
+            "nodeName": result.node_name,
+            "handler": result.handler,
+            "status": result.status,
+            "ok": result.ok,
+            "degraded": result.degraded,
+            "startedAt": started_at,
+            "completedAt": datetime.now(timezone.utc).isoformat(),
+            "durationMs": result.duration_ms,
+        }
+        logger.info(
+            f"[THINKING] Agent tool-loop final: id={node.id} status={result.status} "
+            f"ok={result.ok} rounds={current_round}"
+        )
+
+        if store and handler != "start" and handler != "end":
+            try:
+                ticker = final_state.get("ticker", "") or final_state.get("symbol", "")
+                cache_key = f"{handler}:v2"
+                if ticker and result.ok:
+                    await store.aput(
+                        ("ticker", ticker),
+                        cache_key,
+                        result.model_dump(),
+                        ttl_seconds=1800,
+                    )
+            except Exception as cache_err:
+                logger.warning(f"[THINKING] Store write error for node {node.id}: {cache_err}")
+
+        state_update: dict[str, Any] = {
+            node.id: result.model_dump(),
+            "last_agent_id": node.id,
+        }
+        if result.handler:
+            state_update[result.handler] = result.model_dump()
+
+        out: dict[str, Any] = {
+            "final_state": state_update,
+            "trace": [trace_entry],
+            "node_outputs": {node.id: result.model_dump()},
+        }
+        # Keep final AI text in message history when present (no tool_calls).
+        append_msgs = agent_result.messages_to_append
+        if append_msgs:
+            out["messages"] = append_msgs
+        return out
 
     async def execute_workflow(
         self,
