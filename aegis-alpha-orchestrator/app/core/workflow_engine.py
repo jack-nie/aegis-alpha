@@ -72,13 +72,54 @@ class WorkflowEngine:
         self._tools = tools or []
         self._store = store
         self._tool_node = ToolNode(self._tools) if self._tools else None
+        # Persist layout/flags per thread so resume rebuilds the same graph.
+        self._thread_meta: dict[str, dict[str, Any]] = {}
+
+    @classmethod
+    def _node_content_fingerprint(cls, node: Node) -> dict[str, Any]:
+        """Stable executable fields that affect compiled node behavior."""
+        data = node.data
+        return {
+            "id": node.id,
+            "handler": data.handler or "",
+            "prompt": data.prompt or "",
+            "agentId": data.agent_id or "",
+            "functionName": data.function_name or "",
+            "nodeType": data.node_type or "",
+        }
 
     @classmethod
     def _topology_hash(cls, nodes: list[Node], edges: list[Edge]) -> str:
-        sorted_node_ids = sorted(n.id for n in nodes)
-        sorted_edge_pairs = sorted((e.source, e.target) for e in edges)
-        payload = json.dumps({"nodes": sorted_node_ids, "edges": sorted_edge_pairs}, sort_keys=True)
+        """Hash topology and executable node content so cache invalidates on edits."""
+        sorted_nodes = [
+            cls._node_content_fingerprint(n)
+            for n in sorted(nodes, key=lambda n: n.id)
+        ]
+        sorted_edges = sorted(
+            (
+                e.source,
+                e.target,
+                json.dumps(e.condition, sort_keys=True, default=str) if e.condition else None,
+            )
+            for e in edges
+        )
+        payload = json.dumps({"nodes": sorted_nodes, "edges": sorted_edges}, sort_keys=True)
         return str(hash(payload))
+
+    def _remember_thread(
+        self,
+        thread_id: str,
+        *,
+        require_approval: bool,
+        nodes: list[Node],
+        edges: list[Edge],
+    ) -> None:
+        """Store layout and approval flag for later resume on the same thread."""
+        self._thread_meta[thread_id] = {
+            "require_approval": require_approval,
+            "nodes": nodes,
+            "edges": edges,
+        }
 
     @classmethod
     def _get_cached_graph(cls, key: str) -> Any | None:
@@ -156,26 +197,25 @@ class WorkflowEngine:
                     if last_msg and hasattr(last_msg, "tool_calls") and last_msg.tool_calls:
                         return "tools"
                     return _agent_id + "__next"
-                next_nodes = [e.target for e in edges if e.source == _agent_id and e.target in node_ids]
+
+                next_nodes = [e.target for e in edges if e.source == agent_id and e.target in node_ids]
                 if not next_nodes:
                     next_nodes = [END]
-                routing_map = {"tools": "tools"}
+                # Always register __next so route_to_tools return value is valid
+                # whether there is one or many successors (next_nodes defaults to [END]).
+                routing_map: dict[str, Any] = {"tools": "tools"}
                 for n in next_nodes:
                     routing_map[n] = n
-                if len(next_nodes) == 1:
-                    graph.add_conditional_edges(
-                        _agent_id,
-                        route_to_tools,
-                        routing_map,
-                    )
-                else:
-                    routing_map[_agent_id + "__next"] = next_nodes[0]
-                    graph.add_conditional_edges(
-                        _agent_id,
-                        route_to_tools,
-                        routing_map,
-                    )
-            graph.add_edge("tools", agent_nodes[0])
+                routing_map[agent_id + "__next"] = next_nodes[0]
+                graph.add_conditional_edges(agent_id, route_to_tools, routing_map)
+
+            if len(agent_nodes) == 1:
+                graph.add_edge("tools", agent_nodes[0])
+            else:
+                # Multi-agent: ideally return to the agent that issued tool_calls.
+                # Messages currently lack reliable agent-node attribution, so fall
+                # back to the first agent (same as historical behavior).
+                graph.add_edge("tools", agent_nodes[0])
 
         for edge in edges:
             if edge.source not in node_ids or edge.target not in node_ids:
@@ -344,6 +384,7 @@ class WorkflowEngine:
         logger.info(f"[THINKING] Workflow execution starting: subject={subject} nodes={[n.id for n in nodes]} require_approval={require_approval}")
         graph = self.build_graph(nodes, edges, require_approval=require_approval)
         tid = thread_id or str(uuid.uuid4())
+        self._remember_thread(tid, require_approval=require_approval, nodes=nodes, edges=edges)
         config = {"configurable": {"thread_id": tid}}
         initial_state: WorkflowState = {
             "final_state": state,
@@ -382,6 +423,7 @@ class WorkflowEngine:
         logger.info(f"[THINKING] Workflow streaming starting: subject={subject} nodes={[n.id for n in nodes]} require_approval={require_approval}")
         graph = self.build_graph(nodes, edges, require_approval=require_approval)
         tid = thread_id or str(uuid.uuid4())
+        self._remember_thread(tid, require_approval=require_approval, nodes=nodes, edges=edges)
         config = {"configurable": {"thread_id": tid}}
         initial_state: WorkflowState = {
             "final_state": state,
@@ -445,6 +487,7 @@ class WorkflowEngine:
     ) -> AsyncIterator[SSEEvent]:
         graph = self.build_graph(nodes, edges, require_approval=require_approval)
         tid = thread_id or str(uuid.uuid4())
+        self._remember_thread(tid, require_approval=require_approval, nodes=nodes, edges=edges)
         config = {"configurable": {"thread_id": tid}}
         initial_state: WorkflowState = {
             "final_state": state,
@@ -524,12 +567,34 @@ class WorkflowEngine:
         resume_value: dict[str, Any] | None = None,
         nodes: list[Node] | None = None,
         edges: list[Edge] | None = None,
+        require_approval: bool | None = None,
     ) -> WorkflowResult:
-        """Resume an interrupted workflow using Command(resume=...)."""
-        if nodes is None or edges is None:
-            return WorkflowResult(ok=False, error="Cannot resume: original workflow layout not available. Provide nodes and edges.")
+        """Resume an interrupted workflow using Command(resume=...).
 
-        graph = self.build_graph(nodes, edges, require_approval=False)
+        Rebuilds the graph with the same require_approval flag used at start.
+        Prefers explicit args, then per-thread metadata saved during execute/stream.
+        When unknown, defaults require_approval=True because resume is used for
+        approval-gate interrupts.
+        """
+        meta = self._thread_meta.get(thread_id, {})
+        if nodes is None:
+            nodes = meta.get("nodes")
+        if edges is None:
+            edges = meta.get("edges")
+        if nodes is None or edges is None:
+            return WorkflowResult(
+                ok=False,
+                error="Cannot resume: original workflow layout not available. Provide nodes and edges.",
+            )
+
+        if require_approval is None:
+            if "require_approval" in meta:
+                require_approval = bool(meta["require_approval"])
+            else:
+                # Resume targets approval interrupts; keep approval_gate in the graph.
+                require_approval = True
+
+        graph = self.build_graph(nodes, edges, require_approval=require_approval)
         config = {"configurable": {"thread_id": thread_id}}
 
         try:

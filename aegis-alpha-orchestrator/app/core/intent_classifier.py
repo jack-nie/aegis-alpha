@@ -30,8 +30,8 @@ class IntentClassifier:
                 reason="Missing message or workflows",
             )
 
-        # Build tools for function calling
-        tools = self._build_tools(workflows)
+        # Build tools for function calling (and map fn name -> original workflowKey)
+        tools, function_name_map = self._build_tools(workflows)
 
         try:
             result = await self._llm_client.classify_intent(message, tools)
@@ -39,8 +39,8 @@ class IntentClassifier:
                 function_name = result.get("function", "")
                 ticker = result.get("ticker", "")
 
-                # Extract workflow key from function name
-                workflow_key = function_name.replace("run_", "").replace("_", "-")
+                # Look up original key; never reverse-munge underscores/hyphens
+                workflow_key = function_name_map.get(function_name)
 
                 # Find matching workflow to get confidence
                 matched_wf = next(
@@ -62,12 +62,26 @@ class IntentClassifier:
             logger.error(f"Intent classification failed: {e}")
             return self._keyword_fallback(message, workflows)
 
-    def _build_tools(self, workflows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Build OpenAI function calling tools from workflows."""
-        tools = []
+    def _build_tools(
+        self, workflows: list[dict[str, Any]]
+    ) -> tuple[list[dict[str, Any]], dict[str, str]]:
+        """Build OpenAI function calling tools and function_name -> workflowKey map."""
+        tools: list[dict[str, Any]] = []
+        function_name_map: dict[str, str] = {}
         for wf in workflows:
             key = wf.get("workflowKey", "unknown")
-            fn_name = "run_" + key.replace("-", "_")
+            fn_name = "run_" + str(key).replace("-", "_")
+            if fn_name in function_name_map:
+                existing = function_name_map[fn_name]
+                if existing != key:
+                    logger.warning(
+                        "Function name collision for %s: keeping %s, ignoring %s",
+                        fn_name,
+                        existing,
+                        key,
+                    )
+            else:
+                function_name_map[fn_name] = key
             tools.append(
                 {
                     "type": "function",
@@ -90,7 +104,7 @@ class IntentClassifier:
                     },
                 }
             )
-        return tools
+        return tools, function_name_map
 
     def _keyword_fallback(
         self, message: str, workflows: list[dict[str, Any]]

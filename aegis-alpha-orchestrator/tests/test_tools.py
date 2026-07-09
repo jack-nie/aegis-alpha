@@ -56,7 +56,7 @@ async def test_backend_client_get():
     mock_http_client.is_closed = False
     client._client = mock_http_client
     client._initialized = True
-    result = await client.get("/api/market-data/quote", {"symbol": "AAPL"})
+    result = await client.get("/_backend/market-data/quote", {"symbol": "AAPL"})
     assert result["symbol"] == "AAPL"
 
 
@@ -78,7 +78,7 @@ async def test_backend_client_error():
         mock_cls.return_value = mock_instance
         client._client = mock_instance
         client._client = mock_instance
-        result = await client.get("/api/market-data/quote", {"symbol": "FAIL"})
+        result = await client.get("/_backend/market-data/quote", {"symbol": "FAIL"})
         assert "error" in result
 
 

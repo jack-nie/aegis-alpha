@@ -31,11 +31,21 @@ import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorCompletionService;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 @Service
 public class MarketDataService {
     private static final long DEFAULT_TTL_MS = 60000L;
+    private static final long RACE_DEADLINE_MS = 8000L;
+    private static final long FINANCIALS_RACE_DEADLINE_MS = 8000L;
     private static final String USER_AGENT = "Aegis Alpha contact: local@aegis-alpha.local";
     private static final String CONTRACT_TIMEZONE = "Asia/Hong_Kong";
     private static final List<String> FINANCIAL_METRICS = Arrays.asList(
@@ -50,6 +60,15 @@ public class MarketDataService {
             "NetCashProvidedByUsedInOperatingActivities",
             "EarningsPerShareDiluted"
     );
+    private static final AtomicInteger RACE_THREAD_SEQUENCE = new AtomicInteger();
+    private static final ExecutorService RACE_EXECUTOR = Executors.newFixedThreadPool(10, new ThreadFactory() {
+        @Override
+        public Thread newThread(Runnable runnable) {
+            Thread thread = new Thread(runnable, "market-data-race-" + RACE_THREAD_SEQUENCE.incrementAndGet());
+            thread.setDaemon(true);
+            return thread;
+        }
+    });
 
     private final RestTemplate restTemplate;
     private final ObjectMapper objectMapper;
@@ -132,12 +151,12 @@ public class MarketDataService {
                 List<String> attempted = new ArrayList<String>();
 
                 // Build candidate providers based on ticker type and available API keys
-                List<java.util.concurrent.Callable<Map<String, Object>>> candidates =
-                        new ArrayList<java.util.concurrent.Callable<Map<String, Object>>>();
+                List<Callable<Map<String, Object>>> candidates =
+                        new ArrayList<Callable<Map<String, Object>>>();
 
                 if (isAShare(ticker)) {
                     attempted.add("tencent-finance");
-                    candidates.add(new java.util.concurrent.Callable<Map<String, Object>>() {
+                    candidates.add(new Callable<Map<String, Object>>() {
                         @Override
                         public Map<String, Object> call() throws Exception {
                             return quoteFromTencent(ticker);
@@ -147,7 +166,7 @@ public class MarketDataService {
 
                 if (!finnhubApiKey.isEmpty()) {
                     attempted.add("finnhub");
-                    candidates.add(new java.util.concurrent.Callable<Map<String, Object>>() {
+                    candidates.add(new Callable<Map<String, Object>>() {
                         @Override
                         public Map<String, Object> call() throws Exception {
                             return quoteFromFinnhub(ticker);
@@ -157,7 +176,7 @@ public class MarketDataService {
 
                 if (!alphaVantageApiKey.isEmpty()) {
                     attempted.add("alpha-vantage");
-                    candidates.add(new java.util.concurrent.Callable<Map<String, Object>>() {
+                    candidates.add(new Callable<Map<String, Object>>() {
                         @Override
                         public Map<String, Object> call() throws Exception {
                             return quoteFromAlphaVantage(ticker);
@@ -167,7 +186,7 @@ public class MarketDataService {
 
                 if (!fmpApiKey.isEmpty()) {
                     attempted.add("fmp");
-                    candidates.add(new java.util.concurrent.Callable<Map<String, Object>>() {
+                    candidates.add(new Callable<Map<String, Object>>() {
                         @Override
                         public Map<String, Object> call() throws Exception {
                             return quoteFromFmp(ticker);
@@ -177,7 +196,7 @@ public class MarketDataService {
 
                 // Always add free providers as fallback
                 attempted.add("yahoo-chart");
-                candidates.add(new java.util.concurrent.Callable<Map<String, Object>>() {
+                candidates.add(new Callable<Map<String, Object>>() {
                     @Override
                     public Map<String, Object> call() throws Exception {
                         return quoteFromYahoo(ticker);
@@ -185,7 +204,7 @@ public class MarketDataService {
                 });
 
                 attempted.add("stooq");
-                candidates.add(new java.util.concurrent.Callable<Map<String, Object>>() {
+                candidates.add(new Callable<Map<String, Object>>() {
                     @Override
                     public Map<String, Object> call() throws Exception {
                         return quoteFromStooq(ticker);
@@ -199,11 +218,11 @@ public class MarketDataService {
     }
 
     /**
-     * Race multiple candidates concurrently. Return the first successful result.
-     * If all fail, return unavailable with all errors.
+     * Race multiple candidates concurrently. Return the first successful result (ok==true).
+     * If all fail or the deadline elapses, return unavailable with the last error.
      */
     private Map<String, Object> race(
-            List<java.util.concurrent.Callable<Map<String, Object>>> candidates,
+            List<Callable<Map<String, Object>>> candidates,
             List<String> attempted,
             String ticker) {
         if (candidates.isEmpty()) {
@@ -217,58 +236,14 @@ public class MarketDataService {
             }
         }
 
-        java.util.concurrent.ExecutorService executor = java.util.concurrent.Executors.newFixedThreadPool(
-                Math.min(candidates.size(), 6));
-        try {
-            List<java.util.concurrent.Future<Map<String, Object>>> futures =
-                    new ArrayList<java.util.concurrent.Future<Map<String, Object>>>();
-            for (java.util.concurrent.Callable<Map<String, Object>> candidate : candidates) {
-                futures.add(executor.submit(candidate));
-            }
-
-            // Wait for first success or all failures
-            List<Exception> errors = new ArrayList<Exception>();
-            long deadline = System.currentTimeMillis() + 8000; // 8s total timeout
-
-            for (int i = 0; i < futures.size(); i++) {
-                long remaining = deadline - System.currentTimeMillis();
-                if (remaining <= 0) {
-                    break;
-                }
-                try {
-                    Map<String, Object> result = futures.get(i).get(Math.min(remaining, 3000),
-                            java.util.concurrent.TimeUnit.MILLISECONDS);
-                    if (result != null && Boolean.TRUE.equals(result.get("ok"))) {
-                        // Cancel remaining futures
-                        for (int j = i + 1; j < futures.size(); j++) {
-                            futures.get(j).cancel(true);
-                        }
-                        return result;
-                    }
-                } catch (Exception ex) {
-                    errors.add(ex);
-                }
-            }
-
-            // Check remaining futures that might have completed
-            for (java.util.concurrent.Future<Map<String, Object>> future : futures) {
-                if (future.isDone() && !future.isCancelled()) {
-                    try {
-                        Map<String, Object> result = future.get(0, java.util.concurrent.TimeUnit.MILLISECONDS);
-                        if (result != null && Boolean.TRUE.equals(result.get("ok"))) {
-                            return result;
-                        }
-                    } catch (Exception ex) {
-                        // Ignore
-                    }
-                }
-            }
-
-            Exception lastError = errors.isEmpty() ? new IllegalStateException("All providers timed out") : errors.get(errors.size() - 1);
-            return unavailable("quote", ticker, attempted, lastError);
-        } finally {
-            executor.shutdownNow();
+        RaceOutcome outcome = raceProviders(candidates, RACE_DEADLINE_MS, null);
+        if (outcome.winner != null) {
+            return outcome.winner;
         }
+        Exception lastError = outcome.lastError != null
+                ? outcome.lastError
+                : new IllegalStateException("All providers timed out");
+        return unavailable("quote", ticker, attempted, lastError);
     }
 
     public Map<String, Object> financials(String symbol) {
@@ -277,14 +252,33 @@ public class MarketDataService {
             @Override
             public Map<String, Object> get() {
                 List<String> attempted = new ArrayList<String>();
+
+                // For A-shares, race between Tencent and EastMoney
                 if (isAShare(ticker)) {
                     attempted.add("tencent-finance");
-                    try {
-                        return financialsFromTencent(ticker);
-                    } catch (Exception ignored) {
-                        // Continue to free providers.
-                    }
+                    attempted.add("eastmoney");
+
+                    List<Callable<Map<String, Object>>> candidates =
+                            new ArrayList<Callable<Map<String, Object>>>();
+
+                    candidates.add(new Callable<Map<String, Object>>() {
+                        @Override
+                        public Map<String, Object> call() throws Exception {
+                            return financialsFromTencent(ticker);
+                        }
+                    });
+
+                    candidates.add(new Callable<Map<String, Object>>() {
+                        @Override
+                        public Map<String, Object> call() throws Exception {
+                            return financialsFromEastMoney(ticker);
+                        }
+                    });
+
+                    return raceFinancials(candidates, attempted, ticker);
                 }
+
+                // For US stocks, use SEC and other providers
                 attempted.add("sec-companyfacts");
                 try {
                     return financialsFromSec(ticker);
@@ -311,6 +305,123 @@ public class MarketDataService {
         }, 300000L);
     }
 
+    /**
+     * Race financial candidates. Prefer EastMoney when available within the deadline;
+     * otherwise return the first ok==true result. Shared completion-service race.
+     */
+    private Map<String, Object> raceFinancials(
+            List<Callable<Map<String, Object>>> candidates,
+            List<String> attempted,
+            String ticker) {
+        if (candidates.isEmpty()) {
+            return unavailable("financials", ticker, attempted, new IllegalStateException("No providers available"));
+        }
+        if (candidates.size() == 1) {
+            try {
+                return candidates.get(0).call();
+            } catch (Exception ex) {
+                return unavailable("financials", ticker, attempted, ex);
+            }
+        }
+
+        RaceOutcome outcome = raceProviders(candidates, FINANCIALS_RACE_DEADLINE_MS, "eastmoney");
+        if (outcome.winner != null) {
+            return outcome.winner;
+        }
+        Exception lastError = outcome.lastError != null
+                ? outcome.lastError
+                : new IllegalStateException("All providers failed");
+        return unavailable("financials", ticker, attempted, lastError);
+    }
+
+    /**
+     * Submit all candidates to the shared pool and observe completions in finish order.
+     * Returns the first ok==true result, or preferredProvider if it arrives within the deadline
+     * after an earlier non-preferred success. Cancels remaining tasks when done.
+     */
+    private RaceOutcome raceProviders(
+            List<Callable<Map<String, Object>>> candidates,
+            long deadlineMs,
+            String preferredProvider) {
+        ExecutorCompletionService<Map<String, Object>> completionService =
+                new ExecutorCompletionService<Map<String, Object>>(RACE_EXECUTOR);
+        List<Future<Map<String, Object>>> futures = new ArrayList<Future<Map<String, Object>>>();
+        for (Callable<Map<String, Object>> candidate : candidates) {
+            futures.add(completionService.submit(candidate));
+        }
+
+        Map<String, Object> firstSuccess = null;
+        Map<String, Object> preferredSuccess = null;
+        Exception lastError = null;
+        long deadline = System.currentTimeMillis() + deadlineMs;
+        int pending = futures.size();
+
+        try {
+            while (pending > 0) {
+                long remainingMs = deadline - System.currentTimeMillis();
+                if (remainingMs <= 0) {
+                    break;
+                }
+                Future<Map<String, Object>> completed;
+                try {
+                    completed = completionService.poll(remainingMs, TimeUnit.MILLISECONDS);
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    lastError = interrupted;
+                    break;
+                }
+                if (completed == null) {
+                    break;
+                }
+                pending--;
+                try {
+                    Map<String, Object> result = completed.get();
+                    if (result != null && Boolean.TRUE.equals(result.get("ok"))) {
+                        if (preferredProvider != null && preferredProvider.equals(result.get("provider"))) {
+                            preferredSuccess = result;
+                            break;
+                        }
+                        if (firstSuccess == null) {
+                            firstSuccess = result;
+                            if (preferredProvider == null) {
+                                break;
+                            }
+                            // Keep waiting for preferred provider while time remains.
+                        }
+                    } else if (result != null && result.get("error") != null) {
+                        lastError = new IllegalStateException(String.valueOf(result.get("error")));
+                    }
+                } catch (Exception ex) {
+                    lastError = unwrapExecutionException(ex);
+                }
+            }
+        } finally {
+            for (Future<Map<String, Object>> future : futures) {
+                if (!future.isDone()) {
+                    future.cancel(true);
+                }
+            }
+        }
+
+        RaceOutcome outcome = new RaceOutcome();
+        outcome.winner = preferredSuccess != null ? preferredSuccess : firstSuccess;
+        outcome.lastError = lastError;
+        return outcome;
+    }
+
+    private Exception unwrapExecutionException(Exception ex) {
+        Throwable cause = ex.getCause();
+        if (cause instanceof Exception) {
+            return (Exception) cause;
+        }
+        return ex;
+    }
+
+    private static final class RaceOutcome {
+        private Map<String, Object> winner;
+        private Exception lastError;
+    }
+
     public Map<String, Object> news(String symbol) {
         final String ticker = normalizeSymbol(symbol);
         return cached("news:" + ticker, new SupplierMap() {
@@ -318,9 +429,9 @@ public class MarketDataService {
             public Map<String, Object> get() {
                 List<String> attempted = new ArrayList<String>();
                 if (isAShare(ticker)) {
-                    attempted.add("eastmoney");
+                    attempted.add("sina-finance");
                     try {
-                        return newsFromEastMoney(ticker);
+                        return newsFromSinaFinance(ticker);
                     } catch (Exception ignored) {
                         // Continue to free providers.
                     }
@@ -984,7 +1095,7 @@ public class MarketDataService {
         quote.put("sources", Collections.singletonList(source("Tencent Finance", url, "quote")));
         return quote;
     }
-    private Map<String, Object> newsFromEastMoney(String ticker) throws Exception {
+    private Map<String, Object> newsFromSinaFinance(String ticker) throws Exception {
         String code = ticker.replaceAll("[^0-9]", "");
         String url = "https://feed.mix.sina.com.cn/api/roll/get?pageid=153&lid=2516&k=" + code + "&num=8&page=1";
         byte[] rawBytes = getBytes(url);
@@ -1069,12 +1180,119 @@ public class MarketDataService {
         metrics.add(metric);
     }
 
+    /**
+     * Fetch detailed financials from EastMoney (东方财富) for A-shares.
+     * Returns revenue, net income, EPS, ROE etc. from latest financial reports.
+     */
+    private Map<String, Object> financialsFromEastMoney(String ticker) throws Exception {
+        String code = ticker.replaceAll("[^0-9]", "");
+        String prefix = ticker.toUpperCase().endsWith(".SH") ? "SH" : "SZ";
+        // EastMoney API for key financial indicators
+        String url = "https://emweb.securities.eastmoney.com/PC_HSF10/NewFinanceAnalysis/ZYZBAjaxNew?type=0&code=" + prefix + code;
+        String raw = get(url);
+        if (raw == null || raw.trim().isEmpty()) {
+            throw new IllegalStateException("EastMoney returned no financials for " + ticker);
+        }
+
+        JsonNode root = objectMapper.readTree(raw);
+        JsonNode data = root.path("data");
+        if (!data.isArray() || data.size() == 0) {
+            throw new IllegalStateException("EastMoney returned empty financials for " + ticker);
+        }
+
+        // Get the latest report
+        JsonNode latest = data.get(0);
+        Map<String, Object> payload = base("financials", ticker, "eastmoney");
+        payload.put("companyName", text(latest.path("SECURITY_NAME_ABBR"), ticker));
+
+        List<Map<String, Object>> metrics = new ArrayList<Map<String, Object>>();
+
+        // Include present/parseable values (zero and negatives are valid; skip only missing/NaN).
+        // Revenue / net income from EastMoney are in yuan; expose as 亿元.
+        addEastMoneyMetricIfPresent(metrics, "revenue", "Revenue", latest.path("TOTALOPERATEREVE"), 100000000.0, "CNY (亿)");
+        addEastMoneyMetricIfPresent(metrics, "netIncome", "Net Income", latest.path("PARENTNETPROFIT"), 100000000.0, "CNY (亿)");
+        addEastMoneyMetricIfPresent(metrics, "eps", "EPS", latest.path("EPSJB"), 1.0, "CNY/share");
+        addEastMoneyMetricIfPresent(metrics, "roe", "ROE", latest.path("ROEJQ"), 1.0, "%");
+        addEastMoneyMetricIfPresent(metrics, "grossMargin", "Gross Margin", latest.path("XSMLL"), 1.0, "%");
+        addEastMoneyMetricIfPresent(metrics, "netMargin", "Net Margin", latest.path("XSJLL"), 1.0, "%");
+        addEastMoneyMetricIfPresent(metrics, "debtRatio", "Debt/Asset Ratio", latest.path("ZCFZL"), 1.0, "%");
+        addEastMoneyMetricIfPresent(metrics, "revenueGrowth", "Revenue YoY Growth", latest.path("TOTALOPERATEREVETZ"), 1.0, "%");
+        addEastMoneyMetricIfPresent(metrics, "netIncomeGrowth", "Net Income YoY Growth", latest.path("PARENTNETPROFITTZ"), 1.0, "%");
+        addEastMoneyMetricIfPresent(metrics, "bps", "Book Value Per Share", latest.path("BPS"), 1.0, "CNY/share");
+
+        payload.put("metrics", metrics);
+        payload.put("reportDate", text(latest.path("REPORT_DATE"), ""));
+        payload.put("reportType", text(latest.path("REPORT_TYPE"), ""));
+        payload.put("asOf", text(latest.path("REPORT_DATE"), nowIso()));
+        payload.put("isRealtime", Boolean.FALSE);
+        payload.put("delayHint", "EastMoney financial data from latest published report.");
+        payload.put("sources", Collections.singletonList(source("EastMoney Financial Analysis", url, "financials")));
+        return payload;
+    }
+
+    private void addEastMoneyMetricIfPresent(
+            List<Map<String, Object>> metrics,
+            String key,
+            String label,
+            JsonNode node,
+            double scale,
+            String unit) {
+        Double value = numberOrNull(node);
+        if (value == null) {
+            return;
+        }
+        addEastMoneyMetric(metrics, key, label, value / scale, unit);
+    }
+
+    private void addEastMoneyMetric(List<Map<String, Object>> metrics, String key, String label, double value, String unit) {
+        Map<String, Object> metric = new LinkedHashMap<String, Object>();
+        metric.put("metric", key);
+        metric.put("label", label);
+        metric.put("value", round(value, 2));
+        metric.put("unit", unit);
+        metric.put("filed", "");
+        metric.put("end", "");
+        metric.put("form", "eastmoney-financials");
+        metrics.add(metric);
+    }
+
     private String trim(String value) {
         return value == null ? "" : value.trim();
     }
 
     private double number(JsonNode node) {
-        return node == null || !node.isNumber() ? 0 : node.asDouble();
+        Double value = numberOrNull(node);
+        return value == null ? 0 : value.doubleValue();
+    }
+
+    /**
+     * Parse a numeric JsonNode. Returns null for missing/null/non-numeric/NaN/infinite.
+     * Zero and negative values are valid and returned as-is.
+     */
+    private Double numberOrNull(JsonNode node) {
+        if (node == null || node.isMissingNode() || node.isNull()) {
+            return null;
+        }
+        double value;
+        if (node.isNumber()) {
+            value = node.asDouble();
+        } else if (node.isTextual()) {
+            String raw = node.asText();
+            if (raw == null || raw.trim().isEmpty()) {
+                return null;
+            }
+            try {
+                value = Double.parseDouble(raw.trim());
+            } catch (Exception ex) {
+                return null;
+            }
+        } else {
+            return null;
+        }
+        if (Double.isNaN(value) || Double.isInfinite(value)) {
+            return null;
+        }
+        return value;
     }
 
     private Number latestNumber(JsonNode values) {

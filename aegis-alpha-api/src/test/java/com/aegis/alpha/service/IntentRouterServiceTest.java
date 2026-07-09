@@ -109,6 +109,25 @@ class IntentRouterServiceTest {
     }
 
     @Test
+    void classifyByLlmAcceptsSnakeCaseWorkflowKey() {
+        when(workflowMapper.findDefinitions()).thenReturn(Arrays.asList(
+                def("stock_analysis", "Stock Analysis", "stock")
+        ));
+
+        Map<String, Object> llmResult = new HashMap<>();
+        llmResult.put("workflow_key", "stock_analysis");
+        llmResult.put("ticker", "AAPL");
+        llmResult.put("confidence", 0.9);
+        when(langChainGateway.classifyIntent(any(), any())).thenReturn(llmResult);
+
+        IntentRouterService.IntentResult result = service.classify("analyze AAPL");
+
+        assertThat(result.getWorkflowKey()).isEqualTo("stock_analysis");
+        assertThat(result.getTicker()).isEqualTo("AAPL");
+        assertThat(result.getSource()).isEqualTo("llm");
+    }
+
+    @Test
     void classifyLlmReturnsNullKeyFallsBackToKeywords() {
         when(workflowMapper.findDefinitions()).thenReturn(Arrays.asList(
                 def("daily", "Daily", "daily")
