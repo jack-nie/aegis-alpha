@@ -96,3 +96,74 @@ def tool_names_for_roles(roles: list[str]) -> list[str]:
     """Return tool names allowed for the given roles (no live tool instances)."""
     role_set = set(roles)
     return [name for name, spec in TOOL_SPECS.items() if spec.roles & role_set]
+
+
+# Longer role tokens first so "fundamentals" wins over accidental substring noise.
+_ROLE_TOKEN_ORDER: tuple[str, ...] = (
+    "fundamentals",
+    "valuation",
+    "portfolio",
+    "supervisor",
+    "general",
+    "news",
+    "risk",
+)
+
+
+def _node_data_fields(node: Any) -> tuple[str, str]:
+    """Extract (agent_id, handler) from a Node model or dict-like node."""
+    data = getattr(node, "data", None)
+    if data is None and isinstance(node, dict):
+        data = node.get("data") or {}
+        agent_id = data.get("agent_id") or data.get("agentId") or ""
+        handler = data.get("handler") or ""
+        return str(agent_id or ""), str(handler or "")
+
+    if data is None:
+        return "", ""
+
+    if isinstance(data, dict):
+        agent_id = data.get("agent_id") or data.get("agentId") or ""
+        handler = data.get("handler") or ""
+        return str(agent_id or ""), str(handler or "")
+
+    agent_id = getattr(data, "agent_id", None) or ""
+    handler = getattr(data, "handler", None) or ""
+    return str(agent_id or ""), str(handler or "")
+
+
+def resolve_agent_roles(node: Any) -> list[str]:
+    """Map a workflow node to tool roles via agent_id or handler heuristics.
+
+    Preference:
+    1. agent_id / agentId tokens (e.g. specialist_fundamentals → fundamentals)
+    2. handler heuristics (industry_news→news, fundamental→fundamentals, ...)
+    3. default ["general"]
+    """
+    agent_id, handler = _node_data_fields(node)
+    agent_id_lower = agent_id.lower()
+    handler_lower = handler.lower()
+
+    matched: list[str] = []
+    for role in _ROLE_TOKEN_ORDER:
+        if role in agent_id_lower and role in TOOL_ROLES:
+            matched.append(role)
+    if matched:
+        return matched
+
+    if "industry_news" in handler_lower:
+        return ["news"]
+    if "fundamental" in handler_lower:
+        return ["fundamentals"]
+    if "valuation" in handler_lower:
+        return ["valuation"]
+    if "risk" in handler_lower:
+        return ["risk"]
+    if "portfolio" in handler_lower:
+        return ["portfolio"]
+    if "supervisor" in handler_lower:
+        return ["supervisor"]
+    if "general.agent" in handler_lower or handler_lower == "general.agent":
+        return ["general"]
+
+    return ["general"]

@@ -26,10 +26,15 @@ from ..models.workflow import Node, Edge, TraceEntry
 from ..models.responses import NodeResult, WorkflowResult, SSEEvent
 from .memory_store import MemoryStoreManager
 from .node_executor import NodeExecutor
+from .tool_registry import resolve_agent_roles, tools_for_roles
 
 logger = logging.getLogger(__name__)
 
 _GRAPH_CACHE_MAX = 100
+
+
+def _is_tools_node_name(name: str) -> bool:
+    return name == "tools" or name.startswith("tools__")
 
 
 def deep_merge(current: dict, update: dict) -> dict:
@@ -66,14 +71,20 @@ class WorkflowEngine:
         tools: list | None = None,
         store: BaseStore | None = None,
         checkpointer: Any | None = None,
+        tool_registry: dict[str, Any] | None = None,
     ):
         self._node_executor = node_executor
         self._checkpointer = checkpointer
         self._tools = tools or []
+        self._tool_registry = tool_registry
         self._store = store
+        # Shared ToolNode for backward-compatible single-tools-list mode.
         self._tool_node = ToolNode(self._tools) if self._tools else None
         # Persist layout/flags per thread so resume rebuilds the same graph.
         self._thread_meta: dict[str, dict[str, Any]] = {}
+
+    def _has_tools_capability(self) -> bool:
+        return bool(self._tools) or bool(self._tool_registry)
 
     @classmethod
     def _node_content_fingerprint(cls, node: Node) -> dict[str, Any]:
@@ -140,7 +151,10 @@ class WorkflowEngine:
     def build_graph(self, nodes: list[Node], edges: list[Edge], require_approval: bool = False) -> Any:
         """Build and compile a LangGraph StateGraph with caching."""
         topo_hash = self._topology_hash(nodes, edges)
-        cache_key = f"{topo_hash}:{require_approval}:{bool(self._tools)}"
+        cache_key = (
+            f"{topo_hash}:{require_approval}:"
+            f"{bool(self._tools)}:{bool(self._tool_registry)}"
+        )
         cached = self._get_cached_graph(cache_key)
         if cached is not None:
             return cached
@@ -150,7 +164,10 @@ class WorkflowEngine:
         node_ids = {n.id for n in nodes}
         incoming: dict[str, list[str]] = defaultdict(list)
         outgoing: dict[str, list[str]] = defaultdict(list)
+        # agent node id -> tools graph node id ("tools" or "tools__{agent_id}")
+        agent_tools_node_ids: dict[str, str] = {}
         agent_nodes: list[str] = []
+        use_per_agent_tools = bool(self._tool_registry)
 
         for edge in edges:
             if edge.source in node_ids and edge.target in node_ids:
@@ -159,11 +176,27 @@ class WorkflowEngine:
 
         for node in nodes:
             graph.add_node(node.id, self._make_node_fn(node))
-            if node.data.handler == "general.agent" and self._tool_node:
-                agent_nodes.append(node.id)
 
-        if self._tool_node:
+        if use_per_agent_tools:
+            # Per-agent ToolNode with role-filtered tools; unique id tools__{agent_id}.
+            for node in nodes:
+                if node.data.handler != "general.agent":
+                    continue
+                roles = resolve_agent_roles(node)
+                filtered = tools_for_roles(self._tool_registry, roles)
+                if not filtered:
+                    continue
+                tools_node_id = f"tools__{node.id}"
+                graph.add_node(tools_node_id, ToolNode(filtered))
+                agent_tools_node_ids[node.id] = tools_node_id
+                agent_nodes.append(node.id)
+        elif self._tool_node:
+            # Backward compatible: single shared tools node for all agents.
             graph.add_node("tools", self._tool_node)
+            for node in nodes:
+                if node.data.handler == "general.agent":
+                    agent_tools_node_ids[node.id] = "tools"
+                    agent_nodes.append(node.id)
 
         aggregate_node = next(
             (n for n in nodes if n.data.handler == "finance.stock_recommendation_aggregate"),
@@ -189,13 +222,19 @@ class WorkflowEngine:
             if not incoming[node.id]:
                 graph.add_edge(START, node.id)
 
-        if agent_nodes and self._tool_node:
+        if agent_nodes and agent_tools_node_ids:
             for agent_id in agent_nodes:
-                def route_to_tools(state: WorkflowState, _agent_id: str = agent_id) -> str:
+                tools_target = agent_tools_node_ids[agent_id]
+
+                def route_to_tools(
+                    state: WorkflowState,
+                    _agent_id: str = agent_id,
+                    _tools_target: str = tools_target,
+                ) -> str:
                     messages = state.get("messages", [])
                     last_msg = messages[-1] if messages else None
                     if last_msg and hasattr(last_msg, "tool_calls") and last_msg.tool_calls:
-                        return "tools"
+                        return _tools_target
                     return _agent_id + "__next"
 
                 next_nodes = [e.target for e in edges if e.source == agent_id and e.target in node_ids]
@@ -203,26 +242,31 @@ class WorkflowEngine:
                     next_nodes = [END]
                 # Always register __next so route_to_tools return value is valid
                 # whether there is one or many successors (next_nodes defaults to [END]).
-                routing_map: dict[str, Any] = {"tools": "tools"}
+                routing_map: dict[str, Any] = {tools_target: tools_target}
                 for n in next_nodes:
                     routing_map[n] = n
                 routing_map[agent_id + "__next"] = next_nodes[0]
                 graph.add_conditional_edges(agent_id, route_to_tools, routing_map)
 
-            # Route tools back to the agent that last ran (final_state.last_agent_id).
-            def route_after_tools(state: WorkflowState, _agents: list[str] = list(agent_nodes)) -> str:
-                last = (state.get("final_state") or {}).get("last_agent_id")
-                if last in _agents:
-                    return last
-                return _agents[0]
+            if use_per_agent_tools:
+                # Unique tools node per agent: tools__{agent_id} always returns to that agent.
+                for agent_id, tools_node_id in agent_tools_node_ids.items():
+                    graph.add_edge(tools_node_id, agent_id)
+            else:
+                # Shared tools node: route back via final_state.last_agent_id.
+                def route_after_tools(state: WorkflowState, _agents: list[str] = list(agent_nodes)) -> str:
+                    last = (state.get("final_state") or {}).get("last_agent_id")
+                    if last in _agents:
+                        return last
+                    return _agents[0]
 
-            tools_routing = {agent_id: agent_id for agent_id in agent_nodes}
-            graph.add_conditional_edges("tools", route_after_tools, tools_routing)
+                tools_routing = {aid: aid for aid in agent_nodes}
+                graph.add_conditional_edges("tools", route_after_tools, tools_routing)
 
         for edge in edges:
             if edge.source not in node_ids or edge.target not in node_ids:
                 continue
-            if edge.source in agent_nodes and self._tool_node:
+            if edge.source in agent_nodes:
                 continue
 
             target = edge.target
@@ -272,7 +316,7 @@ class WorkflowEngine:
     def _make_node_fn(self, node: Node):
         """Create async function for a graph node."""
         handler = node.data.handler or node.data.function_name or "logic"
-        is_agent_with_tools = handler == "general.agent" and bool(self._tools)
+        is_agent_with_tools = handler == "general.agent" and self._has_tools_capability()
 
         async def node_fn(state: WorkflowState, *, store: BaseStore | None = None) -> dict:
             started_at = datetime.now(timezone.utc).isoformat()
@@ -450,11 +494,11 @@ class WorkflowEngine:
                         )
                         continue
                     trace_entry = (update.get("trace") or [{}])[0]
-                    if node_name == "tools":
+                    if _is_tools_node_name(str(node_name)):
                         yield SSEEvent(
                             event="tool_call",
                             data={
-                                "nodeId": "tools",
+                                "nodeId": node_name,
                                 "nodeName": "Tool Execution",
                                 "handler": "tool",
                                 "status": "completed",
@@ -554,11 +598,11 @@ class WorkflowEngine:
                                 )
                             continue
 
-                    if node_name == "tools":
+                    if _is_tools_node_name(str(node_name)):
                         yield SSEEvent(
                             event="tool_call",
                             data={
-                                "nodeId": "tools",
+                                "nodeId": node_name,
                                 "nodeName": "Tool Execution",
                                 "handler": "tool",
                                 "status": "completed",

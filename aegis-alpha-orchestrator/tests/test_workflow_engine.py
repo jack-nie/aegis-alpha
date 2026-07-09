@@ -166,6 +166,97 @@ def test_agent_single_successor_routing_map_includes_next(mock_node_executor):
     assert path_map.get("agent__next") == "next_node"
 
 
+def test_build_graph_with_general_agent_and_registry(mock_node_executor):
+    """Per-role registry mode: general.agent builds without crashing."""
+    from app.config import Settings
+    from app.core.tool_registry import create_tool_registry
+    from app.core.workflow_engine import WorkflowEngine
+    from langgraph.graph import StateGraph
+
+    WorkflowEngine._graph_cache.clear()
+    registry = create_tool_registry(Settings(AEGIS_ALPHA_LANGCHAIN_API_KEY="test"))
+
+    captured = []
+    original = StateGraph.add_conditional_edges
+
+    def wrapper(self, source, path, path_map=None, **kwargs):
+        if path_map is not None:
+            captured.append({"source": source, "path_map": dict(path_map)})
+            return original(self, source, path, path_map, **kwargs)
+        return original(self, source, path, **kwargs)
+
+    engine = WorkflowEngine(mock_node_executor, tool_registry=registry)
+    nodes = [
+        Node(
+            id="agent",
+            data=NodeData(
+                handler="general.agent",
+                nodeType="agent",
+                agentId="specialist_fundamentals",
+            ),
+        ),
+        Node(id="next_node", data=NodeData(handler="end", nodeType="end")),
+    ]
+    edges = [Edge(source="agent", target="next_node")]
+
+    with patch.object(StateGraph, "add_conditional_edges", wrapper):
+        graph = engine.build_graph(nodes, edges)
+        assert graph is not None
+
+    agent_entries = [c for c in captured if c["source"] == "agent"]
+    assert len(agent_entries) == 1
+    path_map = agent_entries[0]["path_map"]
+    assert path_map.get("tools__agent") == "tools__agent"
+    assert path_map.get("agent__next") == "next_node"
+    assert "tools" not in path_map
+
+
+def test_per_agent_tools_nodes_for_multiple_specialists(mock_node_executor):
+    """Two specialists get distinct tools__{id} routing targets."""
+    from app.config import Settings
+    from app.core.tool_registry import create_tool_registry
+    from app.core.workflow_engine import WorkflowEngine
+    from langgraph.graph import StateGraph
+
+    WorkflowEngine._graph_cache.clear()
+    registry = create_tool_registry(Settings(AEGIS_ALPHA_LANGCHAIN_API_KEY="test"))
+
+    captured = []
+    original = StateGraph.add_conditional_edges
+
+    def wrapper(self, source, path, path_map=None, **kwargs):
+        if path_map is not None:
+            captured.append({"source": source, "path_map": dict(path_map)})
+            return original(self, source, path, path_map, **kwargs)
+        return original(self, source, path, **kwargs)
+
+    engine = WorkflowEngine(mock_node_executor, tool_registry=registry)
+    nodes = [
+        Node(
+            id="fund_agent",
+            data=NodeData(handler="general.agent", agentId="specialist_fundamentals"),
+        ),
+        Node(
+            id="news_agent",
+            data=NodeData(handler="general.agent", agentId="specialist_news"),
+        ),
+        Node(id="end", data=NodeData(handler="end", nodeType="end")),
+    ]
+    edges = [
+        Edge(source="fund_agent", target="news_agent"),
+        Edge(source="news_agent", target="end"),
+    ]
+
+    with patch.object(StateGraph, "add_conditional_edges", wrapper):
+        graph = engine.build_graph(nodes, edges)
+        assert graph is not None
+
+    fund_map = next(c["path_map"] for c in captured if c["source"] == "fund_agent")
+    news_map = next(c["path_map"] for c in captured if c["source"] == "news_agent")
+    assert fund_map.get("tools__fund_agent") == "tools__fund_agent"
+    assert news_map.get("tools__news_agent") == "tools__news_agent"
+
+
 def test_topological_sort(mock_node_executor):
     from app.core.workflow_engine import WorkflowEngine
     engine = WorkflowEngine(mock_node_executor)

@@ -3,6 +3,7 @@ package com.aegis.alpha.controller;
 import com.aegis.alpha.domain.Portfolio;
 import com.aegis.alpha.service.AuthService;
 import com.aegis.alpha.service.PortfolioService;
+import com.aegis.alpha.service.TokenService;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -14,25 +15,38 @@ import java.util.Map;
 @RestController
 @RequestMapping("/_backend/portfolio")
 public class PortfolioController {
+    static final String SCOPE_PORTFOLIO_READ = "portfolio:read";
+
     private final AuthService authService;
     private final PortfolioService portfolioService;
+    private final TokenService tokenService;
     private final String nodeExecutionToken;
 
     public PortfolioController(AuthService authService,
                                PortfolioService portfolioService,
+                               TokenService tokenService,
                                @Value("${aegis.dify.node-execution-token:local-workflow-node-token}") String nodeExecutionToken) {
         this.authService = authService;
         this.portfolioService = portfolioService;
+        this.tokenService = tokenService;
         this.nodeExecutionToken = nodeExecutionToken;
     }
 
-    /** User token or internal service token (research agent read path). */
-    private boolean isReadAuthorized(String authorization) {
+    /**
+     * Read path auth (positions/summary):
+     * 1) user Bearer token (authService.me)
+     * 2) service node-execution-token
+     * 3) run-scoped delegation token with portfolio:read
+     */
+    boolean isReadAuthorized(String authorization) {
         if (authorization == null) {
             return false;
         }
         String token = authorization.startsWith("Bearer ") ? authorization.substring(7) : authorization;
         if (nodeExecutionToken != null && nodeExecutionToken.equals(token)) {
+            return true;
+        }
+        if (tokenService.hasDelegationScope(token, SCOPE_PORTFOLIO_READ)) {
             return true;
         }
         return authService.me(authorization) != null;

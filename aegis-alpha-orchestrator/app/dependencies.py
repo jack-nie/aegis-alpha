@@ -31,6 +31,7 @@ except ImportError:
 workflow_engine = WorkflowEngine(
     node_executor,
     tools=tools,
+    tool_registry=tool_registry,
     store=memory_store_manager.store,
     checkpointer=_checkpointer,
 )

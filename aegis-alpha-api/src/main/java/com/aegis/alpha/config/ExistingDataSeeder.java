@@ -76,9 +76,9 @@ public class ExistingDataSeeder implements CommandLineRunner {
             workflow("sector-analyst-workflow", "Sector Analyst Workflow", 1, 15, 16,
                     "板块,行业,行业分析,sector,industry analysis,sector analyst",
                     "Analyze an industry sector including macro environment, industry chain, policy impact, competitive map, top players, tech trends, valuation band, sector sentiment, capital flow, sector risk, catalyst calendar, rotation signal, and sector recommendation");
-            workflow("stock_analysis", "Stock Analysis", 1, 9, 10,
+            workflow("stock_analysis", "Stock Analysis", 1, 7, 6,
                     "股票分析,综合分析,帮我分析,分析一下,stock analysis,comprehensive analysis",
-                    "Comprehensive stock analysis covering fundamental, technical, valuation, money flow, sentiment, risk, and aggregate recommendation");
+                    "Single-name multi-specialist research: fundamentals, industry news, valuation, risk assessment, and recommendation aggregate");
 
             WorkflowRun run = new WorkflowRun();
             run.setRunId(UUID.randomUUID().toString());
@@ -96,14 +96,14 @@ public class ExistingDataSeeder implements CommandLineRunner {
         }
         /* Phase 1 research workflows — idempotent by workflow_key */
         if (workflowMapper.findDefinition("earnings_reaction") == null) {
-            workflow("earnings_reaction", "Earnings Reaction", 1, 10, 10,
+            workflow("earnings_reaction", "Earnings Reaction", 1, 6, 5,
                     "earnings,财报,业绩,季报,earnings reaction,earnings call,业绩会,财报解读",
-                    "Analyze post-earnings market reaction for a ticker: parse results vs expectations, price/volume reaction, news & sentiment pulse, peer relative move, risk flags, and a concise reaction call / next catalyst watchlist");
+                    "Post-earnings research: market reaction, earnings interpretation, industry & guidance news, and recommendation aggregate");
         }
         if (workflowMapper.findDefinition("watchlist_digest") == null) {
-            workflow("watchlist_digest", "Watchlist Morning Digest", 1, 8, 8,
+            workflow("watchlist_digest", "Watchlist Morning Digest", 1, 5, 4,
                     "digest,早报,自选,watchlist,morning digest,自选股,晨间摘要,watchlist digest",
-                    "Generate a change-driven morning digest for the user's watchlist: overnight market context, news highlights, sentiment shifts, notable movers, and prioritized action items for the session");
+                    "Lightweight morning digest: market snapshot, industry news, and short risk summary for a watchlist name");
         }
     }
 

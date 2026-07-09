@@ -6,6 +6,7 @@ import com.aegis.alpha.domain.WorkflowRun;
 import com.aegis.alpha.domain.WorkflowRunEvent;
 import com.aegis.alpha.domain.WorkflowVersion;
 import com.aegis.alpha.service.AuthService;
+import com.aegis.alpha.service.TokenService;
 import com.aegis.alpha.service.WorkflowNodeExecutionService;
 import com.aegis.alpha.service.WorkflowService;
 import org.springframework.http.HttpStatus;
@@ -13,6 +14,8 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
+import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
@@ -20,14 +23,24 @@ import java.util.concurrent.CompletableFuture;
 @RestController
 @RequestMapping("/_backend")
 public class WorkflowController {
+    /** Default delegated portfolio:read token lifetime (15 minutes). */
+    static final long DEFAULT_DELEGATION_TTL_MS = 15L * 60L * 1000L;
+    /** Cap optional client-requested TTL at 1 hour. */
+    static final long MAX_DELEGATION_TTL_MS = 60L * 60L * 1000L;
+
     private final AuthService authService;
     private final WorkflowService workflowService;
     private final WorkflowNodeExecutionService workflowNodeExecutionService;
+    private final TokenService tokenService;
 
-    public WorkflowController(AuthService authService, WorkflowService workflowService, WorkflowNodeExecutionService workflowNodeExecutionService) {
+    public WorkflowController(AuthService authService,
+                              WorkflowService workflowService,
+                              WorkflowNodeExecutionService workflowNodeExecutionService,
+                              TokenService tokenService) {
         this.authService = authService;
         this.workflowService = workflowService;
         this.workflowNodeExecutionService = workflowNodeExecutionService;
+        this.tokenService = tokenService;
     }
 
     @GetMapping("/workflows")
@@ -240,6 +253,56 @@ public class WorkflowController {
             return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build();
         }
         return ResponseEntity.ok(workflowNodeExecutionService.execute(body == null ? new java.util.LinkedHashMap<String, Object>() : body));
+    }
+
+    /**
+     * Issue a short-lived run-scoped portfolio:read delegation token for the authenticated user.
+     * Preferred path for end-to-end agent portfolio reads without sharing the user session token.
+     *
+     * POST /_backend/workflow-runs/{runId}/delegated-token
+     * Optional body: { "ttlMs": 600000 }
+     */
+    @PostMapping("/workflow-runs/{runId}/delegated-token")
+    public ResponseEntity<Map<String, Object>> issueDelegatedToken(
+            @RequestHeader(value = "Authorization", required = false) String authorization,
+            @PathVariable String runId,
+            @RequestBody(required = false) Map<String, Object> body) {
+        Map<String, Object> me = authService.me(authorization);
+        if (me == null) {
+            return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build();
+        }
+        if (runId == null || runId.trim().isEmpty()) {
+            return ResponseEntity.badRequest().build();
+        }
+        WorkflowRun run = workflowService.run(runId);
+        if (run == null) {
+            return ResponseEntity.notFound().build();
+        }
+
+        long ttlMs = DEFAULT_DELEGATION_TTL_MS;
+        if (body != null && body.get("ttlMs") instanceof Number) {
+            long requested = ((Number) body.get("ttlMs")).longValue();
+            if (requested > 0L) {
+                ttlMs = Math.min(requested, MAX_DELEGATION_TTL_MS);
+            }
+        }
+
+        List<String> scopes = Collections.singletonList(PortfolioController.SCOPE_PORTFOLIO_READ);
+        String token = tokenService.issueServiceDelegation(
+                runId,
+                String.valueOf(me.get("user_id")),
+                String.valueOf(me.get("tenant_id")),
+                scopes,
+                ttlMs);
+
+        Map<String, Object> response = new LinkedHashMap<String, Object>();
+        response.put("access_token", token);
+        response.put("token_type", "bearer");
+        response.put("expires_in", ttlMs / 1000L);
+        response.put("runId", runId);
+        response.put("scopes", scopes);
+        response.put("typ", "delegation");
+        return ResponseEntity.ok(response);
     }
 
     @SuppressWarnings("unchecked")
