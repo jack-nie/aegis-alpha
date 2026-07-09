@@ -128,16 +128,17 @@ async def execute_workflow(request: Request, body: WorkflowRequest) -> WorkflowR
 async def execute_node(body: NodeRequest) -> NodeResult:
     """Execute a single workflow node."""
     try:
-        return await node_executor.execute(
-            node=body.node,
-            state=body.state,
-            subject=body.subject or "",
-            agent=body.agent,
-            api_key=body.api_key,
-            base_url=body.base_url,
-            provider=body.provider,
-            model=body.model,
-        )
+        with _authorization_context(body.delegated_token):
+            return await node_executor.execute(
+                node=body.node,
+                state=body.state,
+                subject=body.subject or "",
+                agent=body.agent,
+                api_key=body.api_key,
+                base_url=body.base_url,
+                provider=body.provider,
+                model=body.model,
+            )
     except Exception as e:
         return NodeResult(
             ok=False,
@@ -153,16 +154,17 @@ async def execute_node(body: NodeRequest) -> NodeResult:
 async def execute_agent(body: NodeRequest) -> NodeResult:
     """Execute a single agent node."""
     try:
-        result = await node_executor.execute(
-            node=body.node,
-            state=body.state,
-            subject=body.subject or "",
-            agent=body.agent,
-            api_key=body.api_key,
-            base_url=body.base_url,
-            provider=body.provider,
-            model=body.model,
-        )
+        with _authorization_context(body.delegated_token):
+            result = await node_executor.execute(
+                node=body.node,
+                state=body.state,
+                subject=body.subject or "",
+                agent=body.agent,
+                api_key=body.api_key,
+                base_url=body.base_url,
+                provider=body.provider,
+                model=body.model,
+            )
         # Add agent metadata
         if body.agent:
             result.data["agentId"] = body.agent.agent_id

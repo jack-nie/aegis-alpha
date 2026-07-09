@@ -96,6 +96,7 @@ jobs:
         shell: bash
         env:
           AEGIS_ALPHA_NODE_EXECUTION_TOKEN: local-workflow-node-token
+          AEGIS_ALPHA_LANGCHAIN_MOCK: "true"
         run: |
           set -euo pipefail
           curl -fsS http://127.0.0.1:8787/health
@@ -116,7 +117,35 @@ jobs:
             echo "Unexpected 401 with valid service token for /classify-intent"
             exit 1
           fi
-          echo "Smoke test passed (health + service auth)"
+          # Mock E2E: mini workflow execute with service token + delegatedToken field accepted
+          code=$(curl -s -o /tmp/e2e-wf.json -w "%{http_code}" -X POST http://127.0.0.1:8787/execute-workflow \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer local-workflow-node-token" \
+            -d '{
+              "subject": "AAPL",
+              "state": {"ticker": "AAPL"},
+              "delegatedToken": "smoke-delegation",
+              "nodes": [
+                {"id": "start", "data": {"handler": "start", "label": "Start", "nodeType": "start"}},
+                {"id": "risk", "data": {"handler": "finance.risk_assessment", "label": "Risk"}},
+                {"id": "end", "data": {"handler": "end", "label": "End", "nodeType": "end"}}
+              ],
+              "edges": [
+                {"source": "start", "target": "risk"},
+                {"source": "risk", "target": "end"}
+              ]
+            }')
+          if [ "$code" = "401" ] || [ "$code" = "403" ]; then
+            echo "execute-workflow unauthorized: $code"
+            cat /tmp/e2e-wf.json || true
+            exit 1
+          fi
+          if [ "$code" != "200" ]; then
+            echo "execute-workflow unexpected status: $code"
+            cat /tmp/e2e-wf.json || true
+            exit 1
+          fi
+          echo "Smoke test passed (health + service auth + mock execute-workflow)"
 
   deploy:
     name: Deploy to production

@@ -4,8 +4,18 @@ from __future__ import annotations
 
 from app.config import Settings
 from app.core.tools import ToolBackendClient, use_authorization
-from app.models.requests import WorkflowRequest
+from app.models.requests import NodeRequest, WorkflowRequest
 from app.routers.workflow import _authorization_context
+
+
+def test_node_request_accepts_delegated_token_camel_case():
+    req = NodeRequest.model_validate(
+        {
+            "node": {"id": "n1", "data": {"handler": "start"}},
+            "delegatedToken": "node-run-token",
+        }
+    )
+    assert req.delegated_token == "node-run-token"
 
 
 def test_workflow_request_accepts_delegated_token_camel_case():
