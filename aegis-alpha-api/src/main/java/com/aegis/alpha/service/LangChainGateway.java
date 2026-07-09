@@ -80,13 +80,18 @@ public class LangChainGateway {
     }
 
     public Map<String, Object> runAgent(AgentTemplate agent, Map<String, Object> state, Map<String, Object> node, String subject) {
-        return withLegacyContent(executeNode(agent, state, node, subject));
+        return withLegacyContent(executeNode(agent, state, node, subject, null));
     }
 
     public Map<String, Object> executeNode(AgentTemplate agent, Map<String, Object> state, Map<String, Object> node, String subject) {
+        return executeNode(agent, state, node, subject, null);
+    }
+
+    public Map<String, Object> executeNode(AgentTemplate agent, Map<String, Object> state, Map<String, Object> node,
+                                          String subject, String delegatedToken) {
         if (enabled) {
             try {
-                return callLangGraph(agent, state, node, subject, "/execute-node");
+                return callLangGraph(agent, state, node, subject, "/execute-node", delegatedToken);
             } catch (Exception ex) {
                 String handler = handler(node);
                 log.warn("[LangChainGateway] Orchestrator call failed for handler={}, subject={}, error={}", handler, subject, ex.getMessage());
@@ -119,7 +124,14 @@ public class LangChainGateway {
     }
 
     @SuppressWarnings("unchecked")
-    private Map<String, Object> callLangGraph(AgentTemplate agent, Map<String, Object> state, Map<String, Object> node, String subject, String path) {
+    private Map<String, Object> callLangGraph(AgentTemplate agent, Map<String, Object> state, Map<String, Object> node,
+                                             String subject, String path) {
+        return callLangGraph(agent, state, node, subject, path, null);
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> callLangGraph(AgentTemplate agent, Map<String, Object> state, Map<String, Object> node,
+                                             String subject, String path, String delegatedToken) {
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("provider", provider);
         if (apiKey != null && !apiKey.trim().isEmpty()) {
@@ -133,6 +145,9 @@ public class LangChainGateway {
         body.put("state", state);
         body.put("node", node);
         body.put("subject", subject);
+        if (delegatedToken != null && !delegatedToken.trim().isEmpty()) {
+            body.put("delegatedToken", delegatedToken.trim());
+        }
 
         HttpHeaders headers = new HttpHeaders();
         headers.setContentType(MediaType.APPLICATION_JSON);

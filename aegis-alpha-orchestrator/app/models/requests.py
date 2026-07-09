@@ -39,6 +39,7 @@ class NodeRequest(BaseModel):
     base_url: str | None = Field(default=None, alias="baseUrl")
     provider: str | None = None
     model: str | None = None
+    delegated_token: str | None = Field(default=None, alias="delegatedToken")
 
     class Config:
         populate_by_name = True

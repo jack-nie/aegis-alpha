@@ -768,6 +768,8 @@ public class WorkflowService {
         state.put("workflowKey", run.getWorkflowKey());
         state.put("runId", run.getRunId());
         state.put("subject", run.getSubject());
+        // Sync path: same portfolio:read delegation as streaming (fail soft)
+        String delegatedToken = issueDelegatedPortfolioReadToken(run.getRunId(), null, null, inputs);
 
         int index = 0;
         for (Map<String, Object> node : orderedNodes) {
@@ -802,7 +804,7 @@ public class WorkflowService {
 
                 try {
                     long started = System.currentTimeMillis();
-                    Map<String, Object> output = executeNode(node, state, run);
+                    Map<String, Object> output = executeNode(node, state, run, delegatedToken);
                     long elapsed = System.currentTimeMillis() - started;
                     if (timeoutMs > 0 && elapsed > timeoutMs) {
                         throw new IllegalStateException("Node timed out after " + elapsed + "ms; timeout=" + timeoutMs + "ms");
@@ -955,6 +957,11 @@ public class WorkflowService {
     }
 
     private Map<String, Object> executeNode(Map<String, Object> node, Map<String, Object> state, WorkflowRun run) {
+        return executeNode(node, state, run, null);
+    }
+
+    private Map<String, Object> executeNode(Map<String, Object> node, Map<String, Object> state, WorkflowRun run,
+                                           String delegatedToken) {
         String type = nodeType(node);
         String handler = handler(node);
         if (isControlFlowNode(type, handler)) {
@@ -967,7 +974,7 @@ public class WorkflowService {
             return result;
         }
         AgentTemplate agent = resolveAgent(node);
-        return langChainGateway.executeNode(agent, state, node, run.getSubject());
+        return langChainGateway.executeNode(agent, state, node, run.getSubject(), delegatedToken);
     }
 
     private boolean isControlFlowNode(String type, String handler) {

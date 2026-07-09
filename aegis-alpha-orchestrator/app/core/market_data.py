@@ -73,11 +73,19 @@ class MarketDataService:
 
         try:
             await self.start()
+            # Prefer run-scoped override when present (same as tools)
+            from .tools import authorization_override
+
+            auth = authorization_override.get()
+            if auth:
+                authorization = auth if auth.lower().startswith("bearer ") else f"Bearer {auth}"
+            else:
+                authorization = f"Bearer {self._config.node_execution_token}"
             response = await self._client.get(
                 f"{backend_url}/_backend/market-data/quote",
                 params={"symbol": ticker},
                 headers={
-                    "Authorization": f"Bearer {self._config.node_execution_token}",
+                    "Authorization": authorization,
                     "X-Node-Id": node.get("id", "unknown"),
                 },
             )
