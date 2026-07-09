@@ -37,9 +37,10 @@ class WorkflowNodeExecutionServiceTest {
     }
 
     @Test
-    void authorizedWithEmptyToken() {
-        assertThat(service.authorized("")).isTrue();
-        assertThat(service.authorized(null)).isTrue();
+    void authorizedWithEmptyConfigTokenIsRejected() {
+        assertThat(service.authorized("")).isFalse();
+        assertThat(service.authorized(null)).isFalse();
+        assertThat(service.authorized("any")).isFalse();
     }
 
     @Test
@@ -47,6 +48,8 @@ class WorkflowNodeExecutionServiceTest {
         WorkflowNodeExecutionService secured = new WorkflowNodeExecutionService("secret", marketDataService, portfolioService);
         assertThat(secured.authorized("secret")).isTrue();
         assertThat(secured.authorized("wrong")).isFalse();
+        assertThat(secured.authorized(null)).isFalse();
+        assertThat(secured.authorized("")).isFalse();
     }
 
     @Test

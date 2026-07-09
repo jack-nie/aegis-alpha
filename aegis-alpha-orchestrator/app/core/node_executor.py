@@ -118,7 +118,7 @@ class NodeExecutor:
                     await asyncio.sleep(delay)
 
         logger.error(f"[THINKING] Node execution failed after all retries: id={node.id} handler={handler} label={node_label} error={last_error}")
-        fallback = self._fallback_result(node, handler, subject, state, started_at, str(last_error))
+        return self._fallback_result(node, handler, subject, state, started_at, str(last_error))
 
     @staticmethod
     def _normalize_signal(s) -> dict:

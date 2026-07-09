@@ -3,6 +3,8 @@ package com.aegis.alpha.service;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
@@ -25,8 +27,17 @@ public class WorkflowNodeExecutionService {
         this.portfolioService = portfolioService;
     }
 
+    /** Fail-closed: blank configured token rejects all callers. Non-empty requires exact match. */
     public boolean authorized(String token) {
-        return executionToken == null || executionToken.trim().isEmpty() || executionToken.equals(token);
+        if (executionToken == null || executionToken.trim().isEmpty()) {
+            return false;
+        }
+        if (token == null) {
+            return false;
+        }
+        return MessageDigest.isEqual(
+                executionToken.getBytes(StandardCharsets.UTF_8),
+                token.getBytes(StandardCharsets.UTF_8));
     }
 
     public Map<String, Object> execute(Map<String, Object> request) {

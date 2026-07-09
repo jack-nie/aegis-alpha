@@ -30,9 +30,9 @@ public class ChatService {
     private static final Pattern SECTOR_ANALYSIS_PATTERN =
             Pattern.compile("分析.{0,20}(?:板块|行业)|(?:板块|行业).{0,10}分析");
 
-    /* ---- the 6 valid workflow keys seeded in ExistingDataSeeder ---- */
+    /* Seeded keys from ExistingDataSeeder (+ stock_recommendation_research add-on) */
     private static final Set<String> VALID_WORKFLOW_KEYS = Collections.unmodifiableSet(new HashSet<String>(Arrays.asList(
-            "daily", "deep_dive", "stock_recommendation_research", "exit_workflow",
+            "daily", "deep_dive", "stock_analysis", "stock_recommendation_research", "exit_workflow",
             "portfolio_workflow", "position_workflow", "sector-analyst-workflow"
     )));
 

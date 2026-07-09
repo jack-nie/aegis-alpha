@@ -2115,14 +2115,20 @@ function WorkflowComposer({ api, token }) {
       const reader = resp.body.getReader();
       const decoder = new TextDecoder();
       let buffer = "";
+      // Persist event type across stream chunks (event: and data: may arrive separately)
+      let currentEvent = "";
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
         buffer += decoder.decode(value, { stream: true });
         const parts = buffer.split(String.fromCharCode(10));
         buffer = parts.pop() || "";
-        let currentEvent = "";
         for (const part of parts) {
+          // SSE blank line delimits one complete event
+          if (part === "") {
+            currentEvent = "";
+            continue;
+          }
           if (part.startsWith("event:")) {
             currentEvent = part.slice(6).trim();
           } else if (part.startsWith("data:")) {

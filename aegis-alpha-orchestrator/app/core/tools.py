@@ -67,7 +67,7 @@ def create_tools(config: Settings) -> list:
         Args:
             symbol: Stock ticker symbol (e.g., 'AAPL', 'MSFT', '600519.SH')
         """
-        return await client.get("/api/market-data/quote", {"symbol": symbol})
+        return await client.get("/_backend/market-data/quote", {"symbol": symbol})
 
     @tool
     async def get_financials(symbol: str) -> dict[str, Any]:
@@ -76,7 +76,7 @@ def create_tools(config: Settings) -> list:
         Args:
             symbol: Stock ticker symbol (e.g., 'AAPL', 'MSFT')
         """
-        return await client.get("/api/market-data/financials", {"symbol": symbol})
+        return await client.get("/_backend/market-data/financials", {"symbol": symbol})
 
     @tool
     async def get_news(symbol: str) -> dict[str, Any]:
@@ -85,7 +85,7 @@ def create_tools(config: Settings) -> list:
         Args:
             symbol: Stock ticker symbol (e.g., 'AAPL', 'MSFT')
         """
-        return await client.get("/api/market-data/news", {"symbol": symbol})
+        return await client.get("/_backend/market-data/news", {"symbol": symbol})
 
     @tool
     async def get_company_overview(symbol: str) -> dict[str, Any]:
@@ -94,7 +94,7 @@ def create_tools(config: Settings) -> list:
         Args:
             symbol: Stock ticker symbol (e.g., 'AAPL', 'MSFT')
         """
-        return await client.get("/api/market-data/overview", {"symbol": symbol})
+        return await client.get("/_backend/market-data/overview", {"symbol": symbol})
 
     @tool
     async def get_portfolio_positions(portfolio_id: str) -> dict[str, Any]:
@@ -103,7 +103,8 @@ def create_tools(config: Settings) -> list:
         Args:
             portfolio_id: Portfolio ID (e.g., '1', '2')
         """
-        return await client.get(f"/api/portfolio/{portfolio_id}/positions")
+        # PortfolioController is under /_backend/portfolio; endpoints require user auth (authService.me).
+        return await client.get(f"/_backend/portfolio/{portfolio_id}/positions")
 
     @tool
     async def get_portfolio_summary(portfolio_id: str) -> dict[str, Any]:
@@ -112,7 +113,8 @@ def create_tools(config: Settings) -> list:
         Args:
             portfolio_id: Portfolio ID (e.g., '1', '2')
         """
-        return await client.get(f"/api/portfolio/{portfolio_id}/summary")
+        # PortfolioController is under /_backend/portfolio; endpoints require user auth (authService.me).
+        return await client.get(f"/_backend/portfolio/{portfolio_id}/summary")
 
     return [
         get_stock_quote,

@@ -64,7 +64,11 @@ public class IntentRouterService {
             if (result == null) {
                 return null;
             }
+            // Prefer camelCase (orchestrator alias); also accept snake_case
             String workflowKey = string(result.get("workflowKey"));
+            if (workflowKey.isEmpty()) {
+                workflowKey = string(result.get("workflow_key"));
+            }
             String ticker = string(result.get("ticker"));
             Object confidenceObj = result.get("confidence");
             double confidence = 0;

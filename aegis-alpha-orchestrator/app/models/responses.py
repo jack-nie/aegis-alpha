@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from typing import Any
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from .workflow import Signal, Source, TraceEntry
 
@@ -44,9 +44,14 @@ class WorkflowResult(BaseModel):
 
 
 class IntentResult(BaseModel):
-    """Intent classification result."""
+    """Intent classification result.
 
-    workflow_key: str | None = None
+    Serializes workflow_key as workflowKey for Java IntentRouterService.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, serialize_by_alias=True)
+
+    workflow_key: str | None = Field(default=None, alias="workflowKey")
     ticker: str | None = None
     confidence: float = 0.0
     source: str = ""
