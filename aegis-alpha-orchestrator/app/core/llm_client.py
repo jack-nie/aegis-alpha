@@ -7,7 +7,7 @@ import logging
 import re
 from typing import Any, AsyncIterator
 
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 
@@ -17,6 +17,33 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-flash"
 SUPPORTED_DEEPSEEK_MODELS = {"deepseek-v4-pro", "deepseek-v4-flash"}
+
+
+class AgentToolResult:
+    """Result of a single agent turn that may request tools."""
+
+    def __init__(
+        self,
+        ai_message: Any,
+        *,
+        has_tool_calls: bool = False,
+        llm_response: "LLMResponse | None" = None,
+        seed_human: HumanMessage | None = None,
+    ):
+        self.ai_message = ai_message
+        self.has_tool_calls = has_tool_calls
+        self.llm_response = llm_response
+        self.seed_human = seed_human
+
+    @property
+    def messages_to_append(self) -> list[Any]:
+        """New messages to append to WorkflowState.messages (reducer is concat)."""
+        out: list[Any] = []
+        if self.seed_human is not None:
+            out.append(self.seed_human)
+        if self.ai_message is not None:
+            out.append(self.ai_message)
+        return out
 
 
 class SignalModel(BaseModel):
@@ -187,6 +214,117 @@ class LLMClient:
         except Exception as e:
             logger.error(f"LLM invocation failed: {e}")
             raise
+
+    async def invoke_agent_with_tools(
+        self,
+        system: str,
+        prompt: str,
+        context: str = "",
+        tools: list | None = None,
+        prior_messages: list | None = None,
+        model: str | None = None,
+        temperature: float = 0.2,
+        timeout_ms: int | None = None,
+        force_final: bool = False,
+    ) -> AgentToolResult:
+        """One agent turn with optional tool binding.
+
+        Builds [System, Human?, *prior] and invokes the chat model. When tools are
+        bound and the model returns tool_calls, the raw AIMessage is returned so the
+        graph can route to ToolNode. Otherwise content is normalized to LLMResponse.
+        """
+        resolved_model = self._resolve_model(model)
+        effective_timeout = timeout_ms or self._config.timeout_ms
+        client = self._build_client(resolved_model, temperature, effective_timeout)
+
+        bindable = list(tools or [])
+        if bindable and not force_final:
+            client = client.bind_tools(bindable)
+
+        user_content = prompt
+        if context:
+            user_content = f"{prompt}\n\nWorkflow context:\n{context}"
+
+        prior = list(prior_messages or [])
+        seed_human: HumanMessage | None = None
+        chat: list[BaseMessage] = [SystemMessage(content=system)]
+
+        if prior:
+            # Continue mid-loop conversation (Human + AI(tool_calls) + ToolMessages).
+            has_human = any(
+                type(m).__name__ == "HumanMessage"
+                or getattr(m, "type", None) in ("human", "user")
+                for m in prior
+            )
+            if not has_human:
+                # Provider-safe restatement; not appended to graph state (already mid-loop).
+                chat.append(HumanMessage(content=user_content))
+            chat.extend(prior)
+        else:
+            seed_human = HumanMessage(content=user_content)
+            chat.append(seed_human)
+
+        try:
+            response = await client.ainvoke(chat)
+        except Exception as e:
+            logger.error(f"Agent tool-loop invocation failed: {e}")
+            raise
+
+        # Ensure we always work with an AIMessage-like object for ToolNode routing.
+        if not isinstance(response, AIMessage):
+            content = getattr(response, "content", None)
+            tool_calls = getattr(response, "tool_calls", None) or []
+            response = AIMessage(
+                content=content if content is not None else str(response),
+                tool_calls=list(tool_calls) if tool_calls else [],
+            )
+
+        tool_calls = getattr(response, "tool_calls", None) or []
+        # Some providers put tool_calls only in additional_kwargs
+        if not tool_calls:
+            extra = getattr(response, "additional_kwargs", None) or {}
+            raw_calls = extra.get("tool_calls") or []
+            if raw_calls:
+                tool_calls = raw_calls
+
+        if tool_calls and not force_final:
+            # Normalize tool_calls onto the message for route_to_tools / ToolNode.
+            if not getattr(response, "tool_calls", None):
+                ai_kwargs: dict[str, Any] = {
+                    "content": response.content or "",
+                    "tool_calls": tool_calls,
+                    "additional_kwargs": getattr(response, "additional_kwargs", {}) or {},
+                }
+                msg_id = getattr(response, "id", None)
+                if msg_id is not None:
+                    ai_kwargs["id"] = msg_id
+                response = AIMessage(**ai_kwargs)
+            return AgentToolResult(
+                response,
+                has_tool_calls=True,
+                seed_human=seed_human,
+            )
+
+        content = response.content if hasattr(response, "content") else str(response)
+        if isinstance(content, list):
+            # Multimodal content blocks → join text parts
+            parts = []
+            for block in content:
+                if isinstance(block, str):
+                    parts.append(block)
+                elif isinstance(block, dict) and block.get("type") == "text":
+                    parts.append(str(block.get("text", "")))
+                else:
+                    parts.append(str(block))
+            content = "\n".join(parts)
+        usage = getattr(response, "usage_metadata", None)
+        llm_response = self._normalize_content(str(content or ""), usage)
+        return AgentToolResult(
+            response,
+            has_tool_calls=False,
+            llm_response=llm_response,
+            seed_human=seed_human,
+        )
 
     async def invoke_stream(
         self,

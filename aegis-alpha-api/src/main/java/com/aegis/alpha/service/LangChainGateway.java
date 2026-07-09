@@ -153,6 +153,15 @@ public class LangChainGateway {
     }
 
     public String buildStreamBody(Map<String, Object> layout, String subject, Map<String, Object> inputs) {
+        return buildStreamBody(layout, subject, inputs, null);
+    }
+
+    /**
+     * Build orchestrator /stream-workflow JSON body.
+     * Optional {@code delegatedToken} is a short-lived portfolio:read delegation for tool calls.
+     */
+    public String buildStreamBody(Map<String, Object> layout, String subject, Map<String, Object> inputs,
+                                  String delegatedToken) {
         Map<String, Object> body = new LinkedHashMap<>();
         if (apiKey != null && !apiKey.trim().isEmpty()) {
             body.put("apiKey", apiKey);
@@ -165,9 +174,12 @@ public class LangChainGateway {
         body.put("nodes", layout.get("nodes"));
         body.put("edges", layout.get("edges"));
         body.put("subject", subject);
-        Map<String, Object> state = new LinkedHashMap<>(inputs);
+        Map<String, Object> state = new LinkedHashMap<>(inputs == null ? new LinkedHashMap<String, Object>() : inputs);
         state.put("subject", subject);
         body.put("state", state);
+        if (delegatedToken != null && !delegatedToken.trim().isEmpty()) {
+            body.put("delegatedToken", delegatedToken.trim());
+        }
         try {
             return objectMapper.writeValueAsString(body);
         } catch (Exception ex) {

@@ -84,14 +84,22 @@ class Source(BaseModel):
 
 
 class TraceEntry(BaseModel):
-    """Node execution trace entry."""
+    """Node execution trace entry.
 
-    node_id: str
-    node_name: str
+    Accepts both snake_case and camelCase keys (workflow engine emits camelCase
+    for SSE / Java consumers).
+    """
+
+    node_id: str = Field(default="", alias="nodeId")
+    node_name: str = Field(default="", alias="nodeName")
     handler: str = ""
     status: str = ""
     ok: bool = False
     degraded: bool = False
-    started_at: str = ""
-    completed_at: str = ""
-    duration_ms: int = 0
+    started_at: str = Field(default="", alias="startedAt")
+    completed_at: str = Field(default="", alias="completedAt")
+    duration_ms: int = Field(default=0, alias="durationMs")
+
+    class Config:
+        extra = "allow"
+        populate_by_name = True

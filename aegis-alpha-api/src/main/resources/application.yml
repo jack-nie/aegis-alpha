@@ -37,6 +37,10 @@ mybatis:
 aegis:
   seed-enabled: ${AEGIS_ALPHA_SEED_ENABLED:true}
   token-secret: ${AEGIS_ALPHA_TOKEN_SECRET:local-aegis-demo-secret}
+  workflow:
+    # When true, stale research layouts (layoutVersion < 2) are async-written back to DB after read-path refresh.
+    # Read-path version check always applies for research keys regardless of this flag.
+    refresh-default-layouts: ${AEGIS_ALPHA_REFRESH_DEFAULT_LAYOUTS:false}
   langchain:
     enabled: ${AEGIS_ALPHA_LANGCHAIN_ENABLED:true}
     engine-url: ${AEGIS_ALPHA_LANGCHAIN_ENGINE_URL:http://127.0.0.1:8787}

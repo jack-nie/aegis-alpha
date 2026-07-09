@@ -192,17 +192,20 @@ public class WorkflowController {
     public SseEmitter streamWorkflow(@RequestHeader(value = "Authorization", required = false) String authorization,
                                       @PathVariable String workflowKey,
                                       @RequestBody(required = false) Map<String, Object> body) {
-        if (authService.me(authorization) == null) {
+        Map<String, Object> me = authService.me(authorization);
+        if (me == null) {
             SseEmitter rejected = new SseEmitter();
             rejected.completeWithError(new RuntimeException("Unauthorized"));
             return rejected;
         }
         String subject = body == null ? null : string(body.get("subject"));
         Map<String, Object> inputs = body == null ? null : objectMap(body.get("inputs"));
+        final String userId = me.get("user_id") == null ? null : String.valueOf(me.get("user_id"));
+        final String tenantId = me.get("tenant_id") == null ? null : String.valueOf(me.get("tenant_id"));
         SseEmitter emitter = new SseEmitter(300000L);
         CompletableFuture.runAsync(() -> {
             try {
-                workflowService.startWithStreaming(workflowKey, subject, inputs, emitter);
+                workflowService.startWithStreaming(workflowKey, subject, inputs, emitter, userId, tenantId);
             } catch (Exception ex) {
                 try { emitter.completeWithError(ex); } catch (Exception ignored) {}
             }

@@ -13,7 +13,7 @@ from ..models.workflow import Node, AgentTemplate
 from ..models.responses import NodeResult
 from ..prompts import PromptManager
 from .critique import critique_recommendation_draft
-from .llm_client import LLMClient
+from .llm_client import AgentToolResult, LLMClient, LLMResponse
 from .market_data import MarketDataService
 from .recommendation_policy import enforce_recommendation_policy
 
@@ -453,6 +453,156 @@ class NodeExecutor:
             degraded=True,
             provider=self._config.provider,
             model=self._config.model,
+        )
+
+    async def invoke_agent_with_tools(
+        self,
+        node: Node,
+        state: dict[str, Any],
+        subject: str = "",
+        tools: list | None = None,
+        prior_messages: list | None = None,
+        force_final: bool = False,
+        agent: AgentTemplate | None = None,
+        model: str | None = None,
+    ) -> AgentToolResult:
+        """One general.agent turn with bound tools (true tool-calling loop).
+
+        Does not run finance.* hydrate paths beyond optional market context for
+        general.agent. Returns AgentToolResult with either tool_calls or a final
+        LLMResponse suitable for NodeResult conversion.
+        """
+        started_at = datetime.now(timezone.utc).isoformat()
+        handler = self._resolve_handler(node)
+        data = node.data
+        node_label = data.label or data.title or node.id
+
+        effective_provider = self._config.provider
+        if effective_provider not in ("openai", "deepseek"):
+            # Unsupported provider: synthesize a final degraded text result.
+            mock = self._unsupported_provider_result(node, handler, subject, started_at)
+            return AgentToolResult(
+                None,
+                has_tool_calls=False,
+                llm_response=LLMResponse(
+                    summary=mock.summary,
+                    confidence=mock.confidence,
+                    data=mock.data,
+                    content=mock.summary,
+                ),
+            )
+
+        effective_api_key = self._config.effective_api_key
+        is_mock = self._config.is_mock_mode and not effective_api_key
+        if is_mock:
+            mock = self._mock_result(node, handler, subject, state, started_at)
+            return AgentToolResult(
+                None,
+                has_tool_calls=False,
+                llm_response=LLMResponse(
+                    summary=mock.summary,
+                    signals=[],
+                    sources=[],
+                    confidence=mock.confidence,
+                    data=mock.data or {},
+                    content=mock.summary,
+                ),
+            )
+
+        agent_name = (
+            (agent.name if agent else None)
+            or data.label
+            or data.title
+            or "Aegis Alpha Agent"
+        )
+        prompt = (
+            data.prompt
+            or (agent.prompt if agent else None)
+            or PromptManager.get_prompt(handler)
+        ).format(
+            subject=subject,
+            agent_name=agent_name,
+        )
+
+        max_context = 12000
+        full_context = json.dumps(state, ensure_ascii=False, default=str)
+        if len(full_context) <= max_context:
+            context = full_context
+        else:
+            truncated = full_context[:max_context]
+            last_brace = truncated.rfind("}")
+            context = truncated[: last_brace + 1] if last_brace > 0 else truncated
+
+        system = (
+            f"You are {agent_name}. "
+            "You may call tools when you need live market, financial, news, or portfolio data. "
+            "When you have enough evidence, return only JSON (no markdown) with shape "
+            '{"summary":"string","signals":[...],"sources":[...],"confidence":0.5,"data":{}}.'
+        )
+        if force_final:
+            system += (
+                " You have reached the tool-call limit. Do not call tools. "
+                "Answer now using the tool results already in the conversation."
+            )
+
+        logger.info(
+            f"[THINKING] Agent tool-loop turn: id={node.id} label={node_label} "
+            f"force_final={force_final} tools={len(tools or [])} "
+            f"prior_messages={len(prior_messages or [])}"
+        )
+
+        return await self._llm_client.invoke_agent_with_tools(
+            system=system,
+            prompt=prompt,
+            context=context,
+            tools=tools if not force_final else None,
+            prior_messages=prior_messages,
+            model=model,
+            temperature=0.2,
+            timeout_ms=self._config.timeout_ms,
+            force_final=force_final,
+        )
+
+    def agent_tool_result_to_node_result(
+        self,
+        node: Node,
+        subject: str,
+        agent_result: AgentToolResult,
+        started_at: str,
+        model: str | None = None,
+    ) -> NodeResult:
+        """Convert a final (no tool_calls) AgentToolResult into NodeResult."""
+        handler = self._resolve_handler(node)
+        data = node.data
+        response = agent_result.llm_response or LLMResponse(
+            summary="No response from agent",
+            confidence=0.5,
+        )
+        duration_ms = int(
+            (datetime.now(timezone.utc) - datetime.fromisoformat(started_at)).total_seconds()
+            * 1000
+        )
+        sources = [
+            s if isinstance(s, dict) else {"title": str(s), "url": "", "type": "llm"}
+            for s in response.sources
+        ]
+        return NodeResult(
+            ok=True,
+            status="completed",
+            handler=handler,
+            node_id=node.id,
+            node_name=data.label or data.title or node.id,
+            subject=subject,
+            summary=response.summary,
+            signals=[self._normalize_signal(s) for s in response.signals],
+            sources=sources,
+            confidence=response.confidence,
+            data=dict(response.data or {}),
+            duration_ms=duration_ms,
+            content=response.content,
+            degraded=False,
+            provider=self._config.provider,
+            model=model or self._config.model,
         )
 
     async def invoke_stream(

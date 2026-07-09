@@ -11,6 +11,9 @@ import com.aegis.alpha.domain.WorkflowRunEvent;
 import com.aegis.alpha.domain.WorkflowVersion;
 import com.aegis.alpha.mapper.AgentMapper;
 import com.aegis.alpha.mapper.WorkflowMapper;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.time.Duration;
@@ -20,6 +23,7 @@ import java.util.ArrayDeque;
 import java.util.concurrent.CompletableFuture;
 import com.fasterxml.jackson.databind.JsonNode;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -32,6 +36,20 @@ import java.util.UUID;
 
 @Service
 public class WorkflowService {
+    private static final Logger log = LoggerFactory.getLogger(WorkflowService.class);
+
+    /** Bump when research default graphs change so stale DB layouts are skipped on read. */
+    static final int CURRENT_RESEARCH_LAYOUT_VERSION = 2;
+    /** Short-lived portfolio:read delegation for orchestrator tool calls (15 minutes). */
+    static final long DELEGATED_PORTFOLIO_READ_TTL_MS = 15L * 60L * 1000L;
+    static final String SCOPE_PORTFOLIO_READ = "portfolio:read";
+
+    private static final Set<String> RESEARCH_LAYOUT_KEYS = Collections.unmodifiableSet(new HashSet<String>(Arrays.asList(
+            "stock_analysis",
+            "earnings_reaction",
+            "watchlist_digest"
+    )));
+
     private final WorkflowMapper mapper;
     private final AgentMapper agentMapper;
     private final ObjectMapper objectMapper;
@@ -40,6 +58,9 @@ public class WorkflowService {
     private final AgentTraceService agentTraceService;
     private final WorkflowValidationService validationService;
     private final LangChainGateway langChainGateway;
+    private final TokenService tokenService;
+    /** When true, read-path refresh also async-writes the code default back to workflow_layout. */
+    private final boolean refreshDefaultLayouts;
 
     public WorkflowService(WorkflowMapper mapper,
                            AgentMapper agentMapper,
@@ -48,7 +69,9 @@ public class WorkflowService {
                             CacheService cacheService,
                             BacktestService backtestService,
                             AgentTraceService agentTraceService,
-                            WorkflowValidationService validationService) {
+                            WorkflowValidationService validationService,
+                            TokenService tokenService,
+                            @Value("${aegis.workflow.refresh-default-layouts:false}") boolean refreshDefaultLayouts) {
         this.mapper = mapper;
         this.agentMapper = agentMapper;
         this.objectMapper = objectMapper;
@@ -57,6 +80,8 @@ public class WorkflowService {
         this.backtestService = backtestService;
         this.agentTraceService = agentTraceService;
         this.validationService = validationService;
+        this.tokenService = tokenService;
+        this.refreshDefaultLayouts = refreshDefaultLayouts;
     }
 
     public List<WorkflowDefinition> definitions() {
@@ -229,6 +254,13 @@ public class WorkflowService {
         }
         try {
             Map<String, Object> parsed = objectMapper.readValue(layout.getLayoutJson(), new TypeReference<Map<String, Object>>() {});
+            if (shouldRefreshResearchLayout(workflowKey, parsed)) {
+                WorkflowDefinition definition = mapper.findDefinition(workflowKey);
+                Map<String, Object> refreshed = definition == null ? emptyLayout(workflowKey) : defaultLayout(definition);
+                refreshed.put("updatedAt", layout.getUpdatedAt());
+                maybePersistRefreshedLayout(workflowKey, refreshed);
+                return refreshed;
+            }
             parsed.put("workflowKey", workflowKey);
             parsed.put("updatedAt", layout.getUpdatedAt());
             return parsed;
@@ -256,6 +288,7 @@ public class WorkflowService {
         if (!layout.containsKey("engine")) {
             layout.put("engine", "langgraph");
         }
+        ensureLayoutVersionMetadata(layout, workflowKey);
         validationService.validateLayout(layout);
         int nodeCount = countList(layout.get("nodes"));
         int edgeCount = countList(layout.get("edges"));
@@ -378,6 +411,12 @@ public class WorkflowService {
 
     public WorkflowRun startWithStreaming(String workflowKey, String subject, Map<String, Object> inputs,
                                           org.springframework.web.servlet.mvc.method.annotation.SseEmitter emitter) {
+        return startWithStreaming(workflowKey, subject, inputs, emitter, null, null);
+    }
+
+    public WorkflowRun startWithStreaming(String workflowKey, String subject, Map<String, Object> inputs,
+                                          org.springframework.web.servlet.mvc.method.annotation.SseEmitter emitter,
+                                          String userId, String tenantId) {
         String key = workflowKey == null || workflowKey.trim().isEmpty() ? "daily" : workflowKey.trim();
         WorkflowVersion version = mapper.findLatestVersion(key);
         Map<String, Object> runLayout = layoutForRun(key, version);
@@ -399,7 +438,8 @@ public class WorkflowService {
         mapper.insertRun(run);
         recordRunEvent(run, "RUN_CREATED", null, null, "RUNNING", "Workflow run created (streaming).", null, 0);
         String streamUrl = langChainGateway.streamWorkflowUrl();
-        String streamBody = langChainGateway.buildStreamBody(runLayout, subject, safeInputs);
+        String delegatedToken = issueDelegatedPortfolioReadToken(run.getRunId(), userId, tenantId, safeInputs);
+        String streamBody = langChainGateway.buildStreamBody(runLayout, subject, safeInputs, delegatedToken);
         final String runId = run.getRunId();
         SseStreamReader.readSse(streamUrl, streamBody, langChainGateway.serviceAuthorizationHeader(),
                 new SseStreamReader.SseEventHandler() {
@@ -532,6 +572,41 @@ public class WorkflowService {
                 // isolation: materialize failure must not affect streaming client completion
             }
         }
+    }
+
+    /**
+     * Issue short-lived portfolio:read delegation for orchestrator tools.
+     * Fail soft: returns null on any error so market tools still run.
+     * userId: param → inputs.userId → "system"; tenantId: param → inputs.tenantId → "default".
+     */
+    String issueDelegatedPortfolioReadToken(String runId, String userId, String tenantId, Map<String, Object> inputs) {
+        if (tokenService == null) {
+            return null;
+        }
+        try {
+            String resolvedUserId = firstNonBlank(userId, text(inputs, "userId", null), "system");
+            String resolvedTenantId = firstNonBlank(tenantId, text(inputs, "tenantId", null), "default");
+            return tokenService.issueServiceDelegation(
+                    runId,
+                    resolvedUserId,
+                    resolvedTenantId,
+                    Collections.singletonList(SCOPE_PORTFOLIO_READ),
+                    DELEGATED_PORTFOLIO_READ_TTL_MS);
+        } catch (Exception ex) {
+            log.warn("[WorkflowService] Failed to issue portfolio:read delegation for runId={}: {}",
+                    runId, ex.getMessage());
+            return null;
+        }
+    }
+
+    private String firstNonBlank(String first, String second, String fallback) {
+        if (first != null && !first.trim().isEmpty()) {
+            return first.trim();
+        }
+        if (second != null && !second.trim().isEmpty()) {
+            return second.trim();
+        }
+        return fallback;
     }
 
     @SuppressWarnings("unchecked")
@@ -839,6 +914,11 @@ public class WorkflowService {
         }
         try {
             Map<String, Object> parsed = objectMapper.readValue(version.getLayoutJson(), new TypeReference<Map<String, Object>>() {});
+            if (shouldRefreshResearchLayout(workflowKey, parsed)) {
+                Map<String, Object> refreshed = layout(workflowKey);
+                refreshed.put("workflowVersionId", version.getVersionId());
+                return refreshed;
+            }
             parsed.put("workflowKey", workflowKey);
             parsed.put("workflowVersionId", version.getVersionId());
             return parsed;
@@ -1016,6 +1096,7 @@ public class WorkflowService {
         if ("stock_analysis".equals(definition.getWorkflowKey())) {
             layout.put("nodes", stockAnalysisNodes());
             layout.put("edges", stockAnalysisEdges());
+            attachResearchLayoutMetadata(layout, "fan_in_aggregate");
             return layout;
         }
         if ("daily".equals(definition.getWorkflowKey())) {
@@ -1056,11 +1137,13 @@ public class WorkflowService {
         if ("earnings_reaction".equals(definition.getWorkflowKey())) {
             layout.put("nodes", earningsReactionNodes());
             layout.put("edges", earningsReactionEdges());
+            attachResearchLayoutMetadata(layout, "earnings_reaction");
             return layout;
         }
         if ("watchlist_digest".equals(definition.getWorkflowKey())) {
             layout.put("nodes", watchlistDigestNodes());
             layout.put("edges", watchlistDigestEdges());
+            attachResearchLayoutMetadata(layout, "watchlist_digest");
             return layout;
         }
         List<Map<String, Object>> nodes = new ArrayList<>();
@@ -1075,6 +1158,104 @@ public class WorkflowService {
         layout.put("nodes", nodes);
         layout.put("edges", edges);
         return layout;
+    }
+
+    private void attachResearchLayoutMetadata(Map<String, Object> layout, String pattern) {
+        Map<String, Object> metadata = new LinkedHashMap<>();
+        metadata.put("layoutVersion", CURRENT_RESEARCH_LAYOUT_VERSION);
+        metadata.put("pattern", pattern);
+        metadata.put("custom", false);
+        layout.put("metadata", metadata);
+    }
+
+    private boolean isResearchLayoutKey(String workflowKey) {
+        return workflowKey != null && RESEARCH_LAYOUT_KEYS.contains(workflowKey.trim());
+    }
+
+    /**
+     * Research keys without layoutVersion / with version &lt; CURRENT are treated as stale
+     * code defaults. User-marked custom layouts and version-stamped saves are never auto-refreshed.
+     */
+    @SuppressWarnings("unchecked")
+    private boolean shouldRefreshResearchLayout(String workflowKey, Map<String, Object> layout) {
+        if (!isResearchLayoutKey(workflowKey) || layout == null) {
+            return false;
+        }
+        Object metaObj = layout.get("metadata");
+        if (!(metaObj instanceof Map)) {
+            return true;
+        }
+        Map<String, Object> metadata = (Map<String, Object>) metaObj;
+        if (isCustomLayout(metadata)) {
+            return false;
+        }
+        return layoutVersionOf(metadata) < CURRENT_RESEARCH_LAYOUT_VERSION;
+    }
+
+    private boolean isCustomLayout(Map<String, Object> metadata) {
+        Object custom = metadata.get("custom");
+        if (custom instanceof Boolean) {
+            return Boolean.TRUE.equals(custom);
+        }
+        return custom != null && "true".equalsIgnoreCase(String.valueOf(custom).trim());
+    }
+
+    private int layoutVersionOf(Map<String, Object> metadata) {
+        Object version = metadata.get("layoutVersion");
+        if (version == null) {
+            return 0;
+        }
+        if (version instanceof Number) {
+            return ((Number) version).intValue();
+        }
+        try {
+            return Integer.parseInt(String.valueOf(version).trim());
+        } catch (NumberFormatException ex) {
+            return 0;
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private void ensureLayoutVersionMetadata(Map<String, Object> layout, String workflowKey) {
+        Object metaObj = layout.get("metadata");
+        Map<String, Object> metadata;
+        if (metaObj instanceof Map) {
+            metadata = new LinkedHashMap<>((Map<String, Object>) metaObj);
+        } else {
+            metadata = new LinkedHashMap<>();
+        }
+        metadata.put("layoutVersion", CURRENT_RESEARCH_LAYOUT_VERSION);
+        if (isResearchLayoutKey(workflowKey) && !metadata.containsKey("pattern")) {
+            metadata.put("pattern", researchPattern(workflowKey));
+        }
+        layout.put("metadata", metadata);
+    }
+
+    private String researchPattern(String workflowKey) {
+        if ("stock_analysis".equals(workflowKey)) {
+            return "fan_in_aggregate";
+        }
+        if ("earnings_reaction".equals(workflowKey)) {
+            return "earnings_reaction";
+        }
+        if ("watchlist_digest".equals(workflowKey)) {
+            return "watchlist_digest";
+        }
+        return workflowKey;
+    }
+
+    private void maybePersistRefreshedLayout(String workflowKey, Map<String, Object> refreshed) {
+        if (!refreshDefaultLayouts) {
+            return;
+        }
+        Map<String, Object> snapshot = new LinkedHashMap<>(refreshed);
+        CompletableFuture.runAsync(() -> {
+            try {
+                saveLayout(workflowKey, snapshot);
+            } catch (Exception ignored) {
+                // best-effort write-back; read-path already returns the code default
+            }
+        });
     }
 
     private List<Map<String, Object>> stockRecommendationNodes() {

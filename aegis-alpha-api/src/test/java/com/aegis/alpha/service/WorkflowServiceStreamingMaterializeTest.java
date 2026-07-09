@@ -21,8 +21,12 @@ import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.argThat;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.isNull;
+import static org.mockito.ArgumentMatchers.nullable;
 import static org.mockito.Mockito.*;
 
 /**
@@ -37,6 +41,7 @@ class WorkflowServiceStreamingMaterializeTest {
     private BacktestService backtestService;
     private AgentTraceService agentTraceService;
     private WorkflowValidationService validationService;
+    private TokenService tokenService;
     private WorkflowService service;
     private HttpServer server;
     private final AtomicReference<WorkflowRun> storedRun = new AtomicReference<>();
@@ -51,9 +56,13 @@ class WorkflowServiceStreamingMaterializeTest {
         backtestService = mock(BacktestService.class);
         agentTraceService = mock(AgentTraceService.class);
         validationService = new WorkflowValidationService();
+        tokenService = mock(TokenService.class);
+        when(tokenService.issueServiceDelegation(anyString(), anyString(), anyString(), any(), anyLong()))
+                .thenReturn("delegated-test-token");
         service = new WorkflowService(
                 mapper, agentMapper, objectMapper, langChainGateway,
-                cacheService, backtestService, agentTraceService, validationService);
+                cacheService, backtestService, agentTraceService, validationService,
+                tokenService, false);
 
         when(mapper.findLatestVersion("daily")).thenReturn(null);
         WorkflowDefinition definition = new WorkflowDefinition();
@@ -110,7 +119,7 @@ class WorkflowServiceStreamingMaterializeTest {
 
         String streamUrl = "http://127.0.0.1:" + server.getAddress().getPort() + "/stream";
         when(langChainGateway.streamWorkflowUrl()).thenReturn(streamUrl);
-        when(langChainGateway.buildStreamBody(any(), any(), any())).thenReturn("{}");
+        when(langChainGateway.buildStreamBody(any(), any(), any(), nullable(String.class))).thenReturn("{}");
         when(langChainGateway.serviceAuthorizationHeader()).thenReturn(null);
 
         Map<String, Object> inputs = new HashMap<>();
@@ -150,7 +159,7 @@ class WorkflowServiceStreamingMaterializeTest {
 
         String streamUrl = "http://127.0.0.1:" + server.getAddress().getPort() + "/stream";
         when(langChainGateway.streamWorkflowUrl()).thenReturn(streamUrl);
-        when(langChainGateway.buildStreamBody(any(), any(), any())).thenReturn("{}");
+        when(langChainGateway.buildStreamBody(any(), any(), any(), nullable(String.class))).thenReturn("{}");
         when(langChainGateway.serviceAuthorizationHeader()).thenReturn(null);
 
         SseEmitter emitter = new SseEmitter(30_000L);
@@ -179,7 +188,7 @@ class WorkflowServiceStreamingMaterializeTest {
 
         String streamUrl = "http://127.0.0.1:" + server.getAddress().getPort() + "/stream";
         when(langChainGateway.streamWorkflowUrl()).thenReturn(streamUrl);
-        when(langChainGateway.buildStreamBody(any(), any(), any())).thenReturn("{}");
+        when(langChainGateway.buildStreamBody(any(), any(), any(), nullable(String.class))).thenReturn("{}");
         when(langChainGateway.serviceAuthorizationHeader()).thenReturn(null);
         when(backtestService.createFromWorkflowRun(any(), any()))
                 .thenThrow(new RuntimeException("materialize boom"));
@@ -210,7 +219,7 @@ class WorkflowServiceStreamingMaterializeTest {
 
         String streamUrl = "http://127.0.0.1:" + server.getAddress().getPort() + "/stream";
         when(langChainGateway.streamWorkflowUrl()).thenReturn(streamUrl);
-        when(langChainGateway.buildStreamBody(any(), any(), any())).thenReturn("{}");
+        when(langChainGateway.buildStreamBody(any(), any(), any(), nullable(String.class))).thenReturn("{}");
         when(langChainGateway.serviceAuthorizationHeader()).thenReturn(null);
 
         SseEmitter emitter = new SseEmitter(30_000L);
@@ -218,6 +227,72 @@ class WorkflowServiceStreamingMaterializeTest {
 
         assertThat(result.getStatus()).isEqualTo("PAUSED");
         verify(backtestService, never()).createFromWorkflowRun(any(), any());
+    }
+
+    @Test
+    void startWithStreamingIssuesDelegatedTokenAndPassesToStreamBody() throws Exception {
+        server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        String sseResponse = "event: workflow_complete\n"
+                + "data: {\"ok\":true}\n"
+                + "\n";
+        byte[] responseBytes = sseResponse.getBytes(StandardCharsets.UTF_8);
+        server.createContext("/stream", exchange -> {
+            exchange.getResponseHeaders().set("Content-Type", "text/event-stream");
+            exchange.sendResponseHeaders(200, responseBytes.length);
+            try (OutputStream os = exchange.getResponseBody()) {
+                os.write(responseBytes);
+            }
+        });
+        server.start();
+
+        String streamUrl = "http://127.0.0.1:" + server.getAddress().getPort() + "/stream";
+        when(langChainGateway.streamWorkflowUrl()).thenReturn(streamUrl);
+        when(langChainGateway.buildStreamBody(any(), any(), any(), any())).thenReturn("{}");
+        when(langChainGateway.serviceAuthorizationHeader()).thenReturn(null);
+
+        SseEmitter emitter = new SseEmitter(30_000L);
+        WorkflowRun result = service.startWithStreaming(
+                "daily", "delegated", new HashMap<>(), emitter, "user-42", "tenant-a");
+
+        assertThat(result.getStatus()).isEqualTo("COMPLETED");
+        verify(tokenService, times(1)).issueServiceDelegation(
+                eq(result.getRunId()),
+                eq("user-42"),
+                eq("tenant-a"),
+                argThat(scopes -> scopes != null && scopes.contains("portfolio:read")),
+                eq(WorkflowService.DELEGATED_PORTFOLIO_READ_TTL_MS));
+        verify(langChainGateway, times(1)).buildStreamBody(
+                any(), eq("delegated"), any(), eq("delegated-test-token"));
+    }
+
+    @Test
+    void startWithStreamingContinuesWhenDelegationIssueFails() throws Exception {
+        server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        String sseResponse = "event: workflow_complete\n"
+                + "data: {\"ok\":true}\n"
+                + "\n";
+        byte[] responseBytes = sseResponse.getBytes(StandardCharsets.UTF_8);
+        server.createContext("/stream", exchange -> {
+            exchange.getResponseHeaders().set("Content-Type", "text/event-stream");
+            exchange.sendResponseHeaders(200, responseBytes.length);
+            try (OutputStream os = exchange.getResponseBody()) {
+                os.write(responseBytes);
+            }
+        });
+        server.start();
+
+        when(tokenService.issueServiceDelegation(anyString(), anyString(), anyString(), any(), anyLong()))
+                .thenThrow(new IllegalStateException("cannot issue"));
+        String streamUrl = "http://127.0.0.1:" + server.getAddress().getPort() + "/stream";
+        when(langChainGateway.streamWorkflowUrl()).thenReturn(streamUrl);
+        when(langChainGateway.buildStreamBody(any(), any(), any(), nullable(String.class))).thenReturn("{}");
+        when(langChainGateway.serviceAuthorizationHeader()).thenReturn(null);
+
+        SseEmitter emitter = new SseEmitter(30_000L);
+        WorkflowRun result = service.startWithStreaming("daily", "soft-fail", new HashMap<>(), emitter, "u1", "t1");
+
+        assertThat(result.getStatus()).isEqualTo("COMPLETED");
+        verify(langChainGateway, times(1)).buildStreamBody(any(), eq("soft-fail"), any(), isNull());
     }
 
     private static WorkflowRun copyRun(WorkflowRun source) {
