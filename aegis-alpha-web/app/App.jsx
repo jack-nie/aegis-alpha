@@ -1186,7 +1186,9 @@ function AICopilot({ setCopilotOpen, api, promptRequest, onPromptHandled }) {
   const [thinkingEvents, setThinkingEvents] = useState([]);
   const messagesEndRef = useRef(null);
   const handledPromptIdRef = useRef(null);
-  useEffect(() => messagesEndRef.current?.scrollIntoView({ behavior: "smooth" }), [messages, thinkingEvents]);
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages, thinkingEvents]);
 
   const sendMessage = useCallback(
     async (rawText) => {
@@ -1310,7 +1312,8 @@ function AICopilot({ setCopilotOpen, api, promptRequest, onPromptHandled }) {
   useEffect(() => {
     if (!promptRequest?.id || handledPromptIdRef.current === promptRequest.id) return;
     handledPromptIdRef.current = promptRequest.id;
-    sendMessage(promptRequest.text);
+    // sendMessage is async; do not return its Promise from useEffect
+    void sendMessage(promptRequest.text);
     onPromptHandled?.();
   }, [promptRequest, sendMessage, onPromptHandled]);
 
@@ -2790,7 +2793,9 @@ function WorkflowNodeCard({ data }) {
 
 function NodeEditorDrawer({ node, agents, onCancel, onApply }) {
   const [draft, setDraft] = useState(node);
-  useEffect(() => setDraft(node), [node]);
+  useEffect(() => {
+    setDraft(node);
+  }, [node]);
   const patchData = (patch) => setDraft((current) => ({ ...current, data: { ...current.data, ...patch } }));
   return (
     <aside className="fixed inset-y-0 right-0 z-50 flex w-[560px] flex-col border-l border-slate-200 bg-white shadow-2xl">
@@ -4710,7 +4715,7 @@ function WorkflowRunCenterPage({ api, navigate, deepLinkRunId = "" }) {
     if (detail.open && String(currentId) === String(deepLinkRunId) && !detail.loading) return;
     const runHint = pendingRunHintRef.current;
     pendingRunHintRef.current = null;
-    openTraceById(deepLinkRunId, runHint);
+    void openTraceById(deepLinkRunId, runHint);
     // Only react to deep-link id changes; openTraceById is stable for a given runs snapshot.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [deepLinkRunId]);
@@ -5500,7 +5505,7 @@ function RecommendationHistoryPage({ api, navigate, deepLinkWorkflowRunId = "" }
     if (detail.open && String(currentId) === String(deepLinkWorkflowRunId) && !detail.loading) return;
     const rowHint = pendingRecommendationHintRef.current;
     pendingRecommendationHintRef.current = null;
-    openDetailById(deepLinkWorkflowRunId, rowHint);
+    void openDetailById(deepLinkWorkflowRunId, rowHint);
     // Only react to deep-link id changes.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [deepLinkWorkflowRunId]);
