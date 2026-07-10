@@ -44,9 +44,12 @@ import java.util.concurrent.atomic.AtomicInteger;
 @Service
 public class MarketDataService {
     private static final long DEFAULT_TTL_MS = 60000L;
-    private static final long RACE_DEADLINE_MS = 8000L;
+    /** Do not pin failed quotes for a full minute — providers recover quickly. */
+    private static final long UNAVAILABLE_TTL_MS = 5000L;
+    private static final long RACE_DEADLINE_MS = 10000L;
     private static final long FINANCIALS_RACE_DEADLINE_MS = 8000L;
-    private static final String USER_AGENT = "Aegis Alpha contact: local@aegis-alpha.local";
+    private static final String USER_AGENT =
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
     private static final String CONTRACT_TIMEZONE = "Asia/Hong_Kong";
     private static final List<String> FINANCIAL_METRICS = Arrays.asList(
             "Revenues",
@@ -108,9 +111,57 @@ public class MarketDataService {
 
     static RestTemplate defaultRestTemplate(int timeoutMs) {
         SimpleClientHttpRequestFactory factory = new SimpleClientHttpRequestFactory();
-        factory.setConnectTimeout(timeoutMs);
-        factory.setReadTimeout(timeoutMs);
+        // Market providers often need more than 4s when going through a local proxy.
+        int effectiveTimeout = Math.max(timeoutMs, 8000);
+        factory.setConnectTimeout(effectiveTimeout);
+        factory.setReadTimeout(effectiveTimeout);
+        java.net.Proxy proxy = resolveHttpProxy();
+        if (proxy != null) {
+            factory.setProxy(proxy);
+        }
         return new RestTemplate(factory);
+    }
+
+    /**
+     * Use process env HTTP(S)_PROXY / http_proxy / https_proxy / AEGIS_ALPHA_HTTP_PROXY
+     * so RestTemplate can reach Chinese market hosts behind a local proxy (e.g. Clash).
+     */
+    static java.net.Proxy resolveHttpProxy() {
+        String[] keys = new String[] {
+                "AEGIS_ALPHA_HTTP_PROXY",
+                "HTTPS_PROXY",
+                "https_proxy",
+                "HTTP_PROXY",
+                "http_proxy",
+                "ALL_PROXY",
+                "all_proxy"
+        };
+        String raw = null;
+        for (String key : keys) {
+            String value = System.getenv(key);
+            if (value != null && !value.trim().isEmpty()) {
+                raw = value.trim();
+                break;
+            }
+        }
+        if (raw == null || raw.isEmpty()) {
+            return null;
+        }
+        try {
+            // Accept host:port or http://host:port
+            if (!raw.contains("://")) {
+                raw = "http://" + raw;
+            }
+            java.net.URI uri = java.net.URI.create(raw);
+            String host = uri.getHost();
+            int port = uri.getPort() > 0 ? uri.getPort() : 80;
+            if (host == null || host.isEmpty()) {
+                return null;
+            }
+            return new java.net.Proxy(java.net.Proxy.Type.HTTP, new java.net.InetSocketAddress(host, port));
+        } catch (Exception ex) {
+            return null;
+        }
     }
 
     MarketDataService(RestTemplate restTemplate,
@@ -149,72 +200,97 @@ public class MarketDataService {
             @Override
             public Map<String, Object> get() {
                 List<String> attempted = new ArrayList<String>();
-
-                // Build candidate providers based on ticker type and available API keys
                 List<Callable<Map<String, Object>>> candidates =
                         new ArrayList<Callable<Map<String, Object>>>();
 
                 if (isAShare(ticker)) {
-                    attempted.add("tencent-finance");
-                    candidates.add(new Callable<Map<String, Object>>() {
+                    // A-share: race Chinese free endpoints only (yahoo/stooq rarely work and burn the deadline).
+                    addQuoteCandidate(candidates, attempted, "tencent-finance", new Callable<Map<String, Object>>() {
                         @Override
                         public Map<String, Object> call() throws Exception {
                             return quoteFromTencent(ticker);
                         }
                     });
+                    addQuoteCandidate(candidates, attempted, "sina-hq", new Callable<Map<String, Object>>() {
+                        @Override
+                        public Map<String, Object> call() throws Exception {
+                            return quoteFromSina(ticker);
+                        }
+                    });
+                    addQuoteCandidate(candidates, attempted, "eastmoney-push2", new Callable<Map<String, Object>>() {
+                        @Override
+                        public Map<String, Object> call() throws Exception {
+                            return quoteFromEastMoney(ticker);
+                        }
+                    });
+                    addQuoteCandidate(candidates, attempted, "netease-money", new Callable<Map<String, Object>>() {
+                        @Override
+                        public Map<String, Object> call() throws Exception {
+                            return quoteFromNetease(ticker);
+                        }
+                    });
+                    // Last resort: Yahoo may map some SH/SZ tickers via .SS suffix
+                    addQuoteCandidate(candidates, attempted, "yahoo-chart", new Callable<Map<String, Object>>() {
+                        @Override
+                        public Map<String, Object> call() throws Exception {
+                            Map<String, Object> quote = quoteFromYahoo(toYahooAShareSymbol(ticker));
+                            // Keep canonical A-share symbol (e.g. 600183.SH) for downstream nodes.
+                            quote.put("symbol", ticker);
+                            return quote;
+                        }
+                    });
+                    return race(candidates, attempted, ticker);
                 }
 
+                // US / international: key-based vendors first, then free fallbacks
                 if (!finnhubApiKey.isEmpty()) {
-                    attempted.add("finnhub");
-                    candidates.add(new Callable<Map<String, Object>>() {
+                    addQuoteCandidate(candidates, attempted, "finnhub", new Callable<Map<String, Object>>() {
                         @Override
                         public Map<String, Object> call() throws Exception {
                             return quoteFromFinnhub(ticker);
                         }
                     });
                 }
-
                 if (!alphaVantageApiKey.isEmpty()) {
-                    attempted.add("alpha-vantage");
-                    candidates.add(new Callable<Map<String, Object>>() {
+                    addQuoteCandidate(candidates, attempted, "alpha-vantage", new Callable<Map<String, Object>>() {
                         @Override
                         public Map<String, Object> call() throws Exception {
                             return quoteFromAlphaVantage(ticker);
                         }
                     });
                 }
-
                 if (!fmpApiKey.isEmpty()) {
-                    attempted.add("fmp");
-                    candidates.add(new Callable<Map<String, Object>>() {
+                    addQuoteCandidate(candidates, attempted, "fmp", new Callable<Map<String, Object>>() {
                         @Override
                         public Map<String, Object> call() throws Exception {
                             return quoteFromFmp(ticker);
                         }
                     });
                 }
-
-                // Always add free providers as fallback
-                attempted.add("yahoo-chart");
-                candidates.add(new Callable<Map<String, Object>>() {
+                addQuoteCandidate(candidates, attempted, "yahoo-chart", new Callable<Map<String, Object>>() {
                     @Override
                     public Map<String, Object> call() throws Exception {
                         return quoteFromYahoo(ticker);
                     }
                 });
-
-                attempted.add("stooq");
-                candidates.add(new Callable<Map<String, Object>>() {
+                addQuoteCandidate(candidates, attempted, "stooq", new Callable<Map<String, Object>>() {
                     @Override
                     public Map<String, Object> call() throws Exception {
                         return quoteFromStooq(ticker);
                     }
                 });
-
-                // Race: submit all candidates concurrently, return first success
                 return race(candidates, attempted, ticker);
             }
         }, DEFAULT_TTL_MS);
+    }
+
+    private void addQuoteCandidate(
+            List<Callable<Map<String, Object>>> candidates,
+            List<String> attempted,
+            String providerName,
+            Callable<Map<String, Object>> candidate) {
+        attempted.add(providerName);
+        candidates.add(candidate);
     }
 
     /**
@@ -376,7 +452,7 @@ public class MarketDataService {
                 pending--;
                 try {
                     Map<String, Object> result = completed.get();
-                    if (result != null && Boolean.TRUE.equals(result.get("ok"))) {
+                    if (isSuccessfulQuoteOrPayload(result)) {
                         if (preferredProvider != null && preferredProvider.equals(result.get("provider"))) {
                             preferredSuccess = result;
                             break;
@@ -390,6 +466,8 @@ public class MarketDataService {
                         }
                     } else if (result != null && result.get("error") != null) {
                         lastError = new IllegalStateException(String.valueOf(result.get("error")));
+                    } else if (result != null && Boolean.FALSE.equals(result.get("ok"))) {
+                        lastError = new IllegalStateException("provider returned ok=false: " + result.get("provider"));
                     }
                 } catch (Exception ex) {
                     lastError = unwrapExecutionException(ex);
@@ -415,6 +493,22 @@ public class MarketDataService {
             return (Exception) cause;
         }
         return ex;
+    }
+
+    /** Treat ok=true, or a usable price field, as a race winner. */
+    private boolean isSuccessfulQuoteOrPayload(Map<String, Object> result) {
+        if (result == null) {
+            return false;
+        }
+        if (Boolean.TRUE.equals(result.get("ok"))) {
+            Object price = result.get("price");
+            if (price instanceof Number && ((Number) price).doubleValue() > 0) {
+                return true;
+            }
+            // Non-quote payloads (financials/news) may only set ok.
+            return !"quote".equals(string(result.get("kind"))) || price != null;
+        }
+        return false;
     }
 
     private static final class RaceOutcome {
@@ -939,28 +1033,51 @@ public class MarketDataService {
             return new LinkedHashMap<String, Object>(entry.value);
         }
         Map<String, Object> value = enrichContract(supplier.get());
-        cache.put(key, new CacheEntry(new LinkedHashMap<String, Object>(value), now + ttlMs));
+        long effectiveTtl = ttlMs;
+        // Avoid caching 502/timeout failures for a full minute — retry other providers sooner.
+        if (value != null && Boolean.FALSE.equals(value.get("ok"))) {
+            effectiveTtl = Math.min(ttlMs, UNAVAILABLE_TTL_MS);
+        }
+        cache.put(key, new CacheEntry(new LinkedHashMap<String, Object>(value), now + effectiveTtl));
         return value;
     }
 
     private String get(String url) {
-        HttpHeaders headers = new HttpHeaders();
-        headers.set("User-Agent", USER_AGENT);
-        ResponseEntity<String> response = restTemplate.exchange(java.net.URI.create(url), HttpMethod.GET, new HttpEntity<String>(headers), String.class);
+        return get(url, null);
+    }
+
+    private String get(String url, String referer) {
+        HttpHeaders headers = marketDataHeaders(referer);
+        ResponseEntity<String> response = restTemplate.exchange(
+                java.net.URI.create(url), HttpMethod.GET, new HttpEntity<String>(headers), String.class);
         if (!response.getStatusCode().is2xxSuccessful() || response.getBody() == null) {
-            throw new IllegalStateException("HTTP request failed for " + url);
+            throw new IllegalStateException("HTTP " + response.getStatusCodeValue() + " for " + url);
         }
         return response.getBody();
     }
 
     private byte[] getBytes(String url) {
-        HttpHeaders headers = new HttpHeaders();
-        headers.set("User-Agent", USER_AGENT);
-        ResponseEntity<byte[]> response = restTemplate.exchange(java.net.URI.create(url), HttpMethod.GET, new HttpEntity<String>(headers), byte[].class);
+        return getBytes(url, null);
+    }
+
+    private byte[] getBytes(String url, String referer) {
+        HttpHeaders headers = marketDataHeaders(referer);
+        ResponseEntity<byte[]> response = restTemplate.exchange(
+                java.net.URI.create(url), HttpMethod.GET, new HttpEntity<String>(headers), byte[].class);
         if (!response.getStatusCode().is2xxSuccessful() || response.getBody() == null) {
-            throw new IllegalStateException("HTTP request failed for " + url);
+            throw new IllegalStateException("HTTP " + response.getStatusCodeValue() + " for " + url);
         }
         return response.getBody();
+    }
+
+    private HttpHeaders marketDataHeaders(String referer) {
+        HttpHeaders headers = new HttpHeaders();
+        headers.set("User-Agent", USER_AGENT);
+        headers.set("Accept", "*/*");
+        if (referer != null && !referer.trim().isEmpty()) {
+            headers.set("Referer", referer);
+        }
+        return headers;
     }
 
     private String expand(String pattern, String ticker) {
@@ -1045,7 +1162,11 @@ public class MarketDataService {
     }
 
     private String getGBK(String url) {
-        byte[] raw = getBytes(url);
+        return getGBK(url, null);
+    }
+
+    private String getGBK(String url, String referer) {
+        byte[] raw = getBytes(url, referer);
         try {
             return new String(raw, "GBK");
         } catch (Exception ex) {
@@ -1055,8 +1176,15 @@ public class MarketDataService {
 
     private Map<String, Object> quoteFromTencent(String ticker) throws Exception {
         String code = toTencentCode(ticker);
-        String url = "http://qt.gtimg.cn/q=" + code;
-        String raw = getGBK(url);
+        // Prefer HTTPS; fall back to HTTP if TLS path is blocked.
+        String url = "https://qt.gtimg.cn/q=" + code;
+        String raw;
+        try {
+            raw = getGBK(url, "https://finance.qq.com/");
+        } catch (Exception httpsError) {
+            url = "http://qt.gtimg.cn/q=" + code;
+            raw = getGBK(url, "https://finance.qq.com/");
+        }
         if (raw == null || raw.trim().isEmpty() || raw.contains("pv_none")) {
             throw new IllegalStateException("Tencent Finance returned no data for " + ticker);
         }
@@ -1067,10 +1195,13 @@ public class MarketDataService {
             data = data.substring(start + 1, end);
         }
         String[] parts = data.split("~");
-        if (parts.length < 45) {
+        if (parts.length < 35) {
             throw new IllegalStateException("Tencent Finance response too short for " + ticker);
         }
         double price = parseDouble(parts[3]);
+        if (price <= 0) {
+            throw new IllegalStateException("Tencent Finance returned non-positive price for " + ticker);
+        }
         double previous = parseDouble(parts[4]);
         double open = parseDouble(parts[5]);
         Long volumeObj = parseLong(parts[6]);
@@ -1083,17 +1214,204 @@ public class MarketDataService {
         quote.put("price", price);
         quote.put("open", open);
         quote.put("previousClose", previous);
-        quote.put("high", parseDouble(parts[33]));
-        quote.put("low", parseDouble(parts[34]));
+        quote.put("high", parts.length > 33 ? parseDouble(parts[33]) : null);
+        quote.put("low", parts.length > 34 ? parseDouble(parts[34]) : null);
         quote.put("volume", volume);
         quote.put("change", change);
         quote.put("changePct", changePct);
-        quote.put("marketCap", parts[44]);
-        quote.put("asOf", parts[30]);
+        if (parts.length > 44) {
+            quote.put("marketCap", parts[44]);
+        }
+        quote.put("asOf", parts.length > 30 ? parts[30] : nowIso());
         quote.put("isRealtime", Boolean.TRUE);
         quote.put("delayHint", "Tencent Finance real-time quote data.");
         quote.put("sources", Collections.singletonList(source("Tencent Finance", url, "quote")));
         return quote;
+    }
+
+    /**
+     * Sina real-time HQ: var hq_str_sh600183="name,open,prev,price,high,low,...";
+     */
+    private Map<String, Object> quoteFromSina(String ticker) throws Exception {
+        String code = toTencentCode(ticker); // sh600183 / sz000001
+        String url = "https://hq.sinajs.cn/list=" + code;
+        String raw;
+        try {
+            raw = getGBK(url, "https://finance.sina.com.cn/");
+        } catch (Exception first) {
+            url = "http://hq.sinajs.cn/list=" + code;
+            raw = getGBK(url, "https://finance.sina.com.cn/");
+        }
+        if (raw == null || raw.trim().isEmpty() || !raw.contains("=")) {
+            throw new IllegalStateException("Sina HQ empty for " + ticker);
+        }
+        int q1 = raw.indexOf('"');
+        int q2 = raw.lastIndexOf('"');
+        if (q1 < 0 || q2 <= q1) {
+            throw new IllegalStateException("Sina HQ malformed for " + ticker);
+        }
+        String[] parts = raw.substring(q1 + 1, q2).split(",");
+        if (parts.length < 10) {
+            throw new IllegalStateException("Sina HQ too short for " + ticker);
+        }
+        double open = parseDouble(parts[1]);
+        double previous = parseDouble(parts[2]);
+        double price = parseDouble(parts[3]);
+        if (price <= 0) {
+            throw new IllegalStateException("Sina HQ non-positive price for " + ticker);
+        }
+        double high = parseDouble(parts[4]);
+        double low = parseDouble(parts[5]);
+        Long volume = parseLong(parts[8]);
+        double change = round(price - previous, 4);
+        double changePct = previous == 0 ? 0 : round(change / previous * 100, 4);
+        String asOf = parts.length > 31 ? (parts[30] + " " + parts[31]).trim() : nowIso();
+
+        Map<String, Object> quote = base("quote", ticker, "sina-hq");
+        quote.put("name", parts[0]);
+        quote.put("price", price);
+        quote.put("open", open);
+        quote.put("previousClose", previous);
+        quote.put("high", high);
+        quote.put("low", low);
+        quote.put("volume", volume != null ? volume : 0L);
+        quote.put("change", change);
+        quote.put("changePct", changePct);
+        quote.put("asOf", asOf);
+        quote.put("isRealtime", Boolean.TRUE);
+        quote.put("delayHint", "Sina Finance real-time HQ.");
+        quote.put("sources", Collections.singletonList(source("Sina HQ", url, "quote")));
+        return quote;
+    }
+
+    /**
+     * East Money push2 quote. Prices are in fen (divide by 100).
+     * secid: 1.xxxxxx SH, 0.xxxxxx SZ.
+     */
+    private Map<String, Object> quoteFromEastMoney(String ticker) throws Exception {
+        String code = ticker.replaceAll("[^0-9]", "");
+        if (code.length() != 6) {
+            throw new IllegalStateException("EastMoney needs 6-digit code for " + ticker);
+        }
+        String market = ticker.toUpperCase().endsWith(".SZ") || code.startsWith("0") || code.startsWith("3")
+                ? "0" : "1";
+        if (ticker.toUpperCase().endsWith(".SH") || code.startsWith("6")) {
+            market = "1";
+        }
+        String fields = "f43,f44,f45,f46,f47,f48,f57,f58,f60,f169,f170,f116";
+        String url = "https://push2.eastmoney.com/api/qt/stock/get?secid=" + market + "." + code
+                + "&fields=" + fields;
+        String body = get(url, "https://quote.eastmoney.com/");
+        JsonNode data = objectMapper.readTree(body).path("data");
+        if (data.isMissingNode() || data.isNull()) {
+            throw new IllegalStateException("EastMoney push2 empty data for " + ticker);
+        }
+        double price = eastMoneyPrice(data.path("f43"));
+        if (price <= 0) {
+            throw new IllegalStateException("EastMoney push2 non-positive price for " + ticker);
+        }
+        double high = eastMoneyPrice(data.path("f44"));
+        double low = eastMoneyPrice(data.path("f45"));
+        double open = eastMoneyPrice(data.path("f46"));
+        double previous = eastMoneyPrice(data.path("f60"));
+        double change = data.path("f169").isNumber() ? data.path("f169").asDouble() / 100.0 : round(price - previous, 4);
+        double changePct = data.path("f170").isNumber() ? data.path("f170").asDouble() / 100.0
+                : (previous == 0 ? 0 : round(change / previous * 100, 4));
+        long volume = data.path("f47").isNumber() ? data.path("f47").asLong() : 0L;
+
+        Map<String, Object> quote = base("quote", ticker, "eastmoney-push2");
+        quote.put("name", text(data.path("f58"), ticker));
+        quote.put("price", price);
+        quote.put("open", open);
+        quote.put("previousClose", previous);
+        quote.put("high", high);
+        quote.put("low", low);
+        quote.put("volume", volume);
+        quote.put("change", round(change, 4));
+        quote.put("changePct", round(changePct, 4));
+        if (data.path("f116").isNumber()) {
+            quote.put("marketCap", data.path("f116").asDouble());
+        }
+        quote.put("asOf", nowIso());
+        quote.put("isRealtime", Boolean.TRUE);
+        quote.put("delayHint", "East Money push2 real-time quote.");
+        quote.put("sources", Collections.singletonList(source("East Money push2", url, "quote")));
+        return quote;
+    }
+
+    private double eastMoneyPrice(JsonNode node) {
+        if (node == null || !node.isNumber()) {
+            return 0;
+        }
+        // Fields like f43 are price * 100
+        return round(node.asDouble() / 100.0, 4);
+    }
+
+    /**
+     * NetEase money feed: https://api.money.126.net/data/feed/0{code} or 1{code}
+     */
+    private Map<String, Object> quoteFromNetease(String ticker) throws Exception {
+        String code = ticker.replaceAll("[^0-9]", "");
+        if (code.length() != 6) {
+            throw new IllegalStateException("Netease needs 6-digit code for " + ticker);
+        }
+        String prefix = (ticker.toUpperCase().endsWith(".SH") || code.startsWith("6")) ? "0" : "1";
+        String feedId = prefix + code;
+        String url = "https://api.money.126.net/data/feed/" + feedId + ",money.api";
+        String body = get(url, "https://money.163.com/");
+        // Response often wrapped as _ntes_quote_callback({...});
+        String json = body;
+        int brace = body.indexOf('{');
+        int last = body.lastIndexOf('}');
+        if (brace >= 0 && last > brace) {
+            json = body.substring(brace, last + 1);
+        }
+        JsonNode root = objectMapper.readTree(json);
+        JsonNode node = root.path(feedId);
+        if (node.isMissingNode() || node.isNull()) {
+            throw new IllegalStateException("Netease feed missing node for " + ticker);
+        }
+        double price = node.path("price").isNumber() ? node.path("price").asDouble() : parseDouble(text(node.path("price"), "0"));
+        if (price <= 0) {
+            throw new IllegalStateException("Netease non-positive price for " + ticker);
+        }
+        double open = node.path("open").isNumber() ? node.path("open").asDouble() : 0;
+        double previous = node.path("yestclose").isNumber() ? node.path("yestclose").asDouble() : 0;
+        double high = node.path("high").isNumber() ? node.path("high").asDouble() : 0;
+        double low = node.path("low").isNumber() ? node.path("low").asDouble() : 0;
+        long volume = node.path("volume").isNumber() ? node.path("volume").asLong() : 0L;
+        double change = round(price - previous, 4);
+        double changePct = previous == 0 ? 0 : round(change / previous * 100, 4);
+
+        Map<String, Object> quote = base("quote", ticker, "netease-money");
+        quote.put("name", text(node.path("name"), ticker));
+        quote.put("price", price);
+        quote.put("open", open);
+        quote.put("previousClose", previous);
+        quote.put("high", high);
+        quote.put("low", low);
+        quote.put("volume", volume);
+        quote.put("change", change);
+        quote.put("changePct", changePct);
+        quote.put("asOf", text(node.path("time"), nowIso()));
+        quote.put("isRealtime", Boolean.TRUE);
+        quote.put("delayHint", "NetEase money feed.");
+        quote.put("sources", Collections.singletonList(source("NetEase Money", url, "quote")));
+        return quote;
+    }
+
+    private String toYahooAShareSymbol(String ticker) {
+        String t = ticker.toUpperCase();
+        if (t.endsWith(".SH")) {
+            return t.substring(0, 6) + ".SS";
+        }
+        if (t.endsWith(".SZ")) {
+            return t.substring(0, 6) + ".SZ";
+        }
+        if (t.matches("\\d{6}")) {
+            return t.startsWith("6") ? t + ".SS" : t + ".SZ";
+        }
+        return t;
     }
     private Map<String, Object> newsFromSinaFinance(String ticker) throws Exception {
         String code = ticker.replaceAll("[^0-9]", "");
