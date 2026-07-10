@@ -19,6 +19,142 @@ import {
 
 const API_BASE = "/_backend";
 
+/** Max wait for chat-triggered workflow completion (multi-node LLM can exceed 90s). */
+const WORKFLOW_POLL_TIMEOUT_MS = 300000;
+const WORKFLOW_POLL_INTERVAL_MS = 2000;
+
+function parseRunResultJson(raw) {
+  if (raw == null || raw === "") return null;
+  if (typeof raw === "object") return raw;
+  if (typeof raw !== "string") return null;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+/** Build user-visible summary after polling a chat-routed workflow run. */
+function summarizeWorkflowRunResult(run, chatResult, runResult) {
+  const status = String(run?.status || "UNKNOWN").toUpperCase();
+  const runId = chatResult?.runId || run?.runId || "";
+  const workflowKey = chatResult?.workflowKey || run?.workflowKey || "";
+  const sep = String.fromCharCode(10);
+
+  if (status === "RUNNING" || status === "QUEUED") {
+    return (
+      `工作流 [${workflowKey}] 仍在执行中（已超过等待上限）。` +
+      sep +
+      `运行 ID: ${runId}` +
+      sep +
+      `请打开「运行中心」查看进度与节点输出：/runs/${runId}`
+    );
+  }
+  if (status === "FAILED" || status === "CANCELLED") {
+    return (
+      `工作流 [${workflowKey}] ${status === "FAILED" ? "执行失败" : "已取消"}。` +
+      sep +
+      `原因: ${run?.errorMessage || run?.error_message || "未知"}` +
+      sep +
+      `运行 ID: ${runId}`
+    );
+  }
+
+  if (runResult && typeof runResult === "object") {
+    const rec = runResult.recommendation || runResult["finance.stock_recommendation_aggregate"] || runResult.aggregate;
+    if (rec && typeof rec === "object") {
+      let text =
+        rec.summary ||
+        rec.content ||
+        (rec.data && typeof rec.data === "object" && (rec.data.summary || rec.data.content)) ||
+        "";
+      if (!text && rec.data && typeof rec.data === "object") {
+        const parts = Object.values(rec.data)
+          .filter((v) => typeof v === "string" && v.trim())
+          .join(sep);
+        if (parts) text = parts;
+      }
+      if (text && String(text).trim()) {
+        return String(text).trim();
+      }
+    }
+
+    const nodeEntries = Object.entries(runResult)
+      .filter(([, v]) => v && typeof v === "object" && (v.nodeId || v.handler || v.summary || v.content))
+      .map(([k, v]) => {
+        const label = v.nodeName || v.node_name || v.handler || k;
+        const summary =
+          v.summary ||
+          v.content ||
+          (v.data && v.data.summary) ||
+          (v.data && v.data.content) ||
+          "";
+        return { label, summary: String(summary || "").trim(), status: v.status || (v.ok === false ? "error" : "ok") };
+      })
+      .filter((n) => n.summary);
+
+    if (nodeEntries.length > 0) {
+      return nodeEntries.map((n) => `**${n.label}** (${n.status}): ${n.summary}`).join(sep + sep);
+    }
+
+    const nodeStatuses = Object.entries(runResult)
+      .filter(([, v]) => v && typeof v === "object" && (v.nodeId || v.handler))
+      .map(([, v]) => `- ${v.nodeName || v.nodeId || v.handler}: ${v.status || "done"}`)
+      .join(sep);
+    if (nodeStatuses) {
+      return `工作流 [${workflowKey}] 已完成。` + sep + nodeStatuses + sep + `运行 ID: ${runId}`;
+    }
+  }
+
+  if (status === "COMPLETED" || status === "DEGRADED" || status === "COMPLETED_DEGRADED") {
+    return (
+      `工作流 [${workflowKey}] 已完成，但未解析到可读摘要。` +
+      sep +
+      `运行 ID: ${runId}` +
+      sep +
+      `请打开运行中心查看节点详情：/runs/${runId}`
+    );
+  }
+
+  return (
+    `工作流 [${workflowKey}] 状态: ${status || "未知"}。` +
+    sep +
+    `运行 ID: ${runId}` +
+    sep +
+    `请打开运行中心：/runs/${runId}`
+  );
+}
+
+async function waitForWorkflowRun(api, runId, options = {}) {
+  const timeoutMs = options.timeoutMs ?? WORKFLOW_POLL_TIMEOUT_MS;
+  const intervalMs = options.intervalMs ?? WORKFLOW_POLL_INTERVAL_MS;
+  const onEvents = options.onEvents;
+  const pollStart = Date.now();
+  let run = await api(`/workflow/runs/${runId}`);
+  while (run?.status === "RUNNING" || run?.status === "QUEUED") {
+    if (Date.now() - pollStart > timeoutMs) break;
+    if (onEvents) {
+      try {
+        const events = await api(`/workflow/runs/${runId}/events`);
+        onEvents(Array.isArray(events) ? events : []);
+      } catch {
+        /* ignore event poll errors */
+      }
+    }
+    await new Promise((r) => setTimeout(r, intervalMs));
+    run = await api(`/workflow/runs/${runId}`);
+  }
+  if (onEvents) {
+    try {
+      const finalEvents = await api(`/workflow/runs/${runId}/events`);
+      onEvents(Array.isArray(finalEvents) ? finalEvents : []);
+    } catch {
+      /* ignore */
+    }
+  }
+  return run;
+}
+
 const KNOWN_APP_PATHS = new Set([
   "/",
   "/portfolio",
@@ -1199,98 +1335,86 @@ function AICopilot({ setCopilotOpen, api, promptRequest, onPromptHandled }) {
       try {
         const result = await api("/chat/messages", { method: "POST", body: JSON.stringify({ message: text }) });
         let content = result?.content || result?.message || "后端没有返回内容。";
+        let replyOk = result?.ok !== false;
         if (result?.routedToWorkflow && result?.runId) {
           try {
-            // Poll until workflow completes, fetching events for thinking process display
-            let run = await api(`/workflow/runs/${result.runId}`);
-            const pollStart = Date.now();
             setThinkingEvents([]);
-            while (run?.status === "RUNNING" || run?.status === "QUEUED") {
-              if (Date.now() - pollStart > 90000) break;
-              try {
-                const events = await api(`/workflow/runs/${result.runId}/events`);
-                const nodeEvents = (Array.isArray(events) ? events : []).filter(
+            // Show routing ack immediately while workflow runs
+            setMessages((prev) => [
+              ...prev,
+              {
+                role: "assistant",
+                content: content + String.fromCharCode(10) + "正在等待工作流执行结果…",
+                ok: true,
+                provider: "workflow-router",
+              },
+            ]);
+            const run = await waitForWorkflowRun(api, result.runId, {
+              onEvents: (events) => {
+                const nodeEvents = events.filter(
                   (e) => e.eventType && (e.eventType.startsWith("NODE_") || e.eventType === "RUN_COMPLETED"),
                 );
                 setThinkingEvents(nodeEvents);
-              } catch (_) {
-                /* ignore events fetch errors during polling */
-              }
-              await new Promise((r) => setTimeout(r, 2000));
-              run = await api(`/workflow/runs/${result.runId}`);
-            }
-            // Final events fetch
-            try {
-              const finalEvents = await api(`/workflow/runs/${result.runId}/events`);
-              const finalNodeEvents = (Array.isArray(finalEvents) ? finalEvents : []).filter(
-                (e) => e.eventType && (e.eventType.startsWith("NODE_") || e.eventType === "RUN_COMPLETED"),
-              );
-              setThinkingEvents(finalNodeEvents);
-            } catch (_) {
-              /* ignore */
-            }
-            const runResult = run?.resultJson ? JSON.parse(run.resultJson) : null;
-            if (runResult) {
-              // Try recommendation node first
-              const rec = runResult.recommendation;
-              if (rec) {
-                content =
-                  rec.summary ||
-                  rec.content ||
-                  (rec.data && typeof rec.data === "object" && (rec.data.summary || rec.data.content)) ||
-                  "";
-                if (rec.data && typeof rec.data === "object" && !content) {
-                  const textParts = Object.values(rec.data)
-                    .filter((v) => typeof v === "string" && v.trim())
-                    .join(String.fromCharCode(10));
-                  if (textParts) content = textParts;
+              },
+            });
+            let runResult = parseRunResultJson(run?.resultJson ?? run?.result_json);
+            // If still empty after COMPLETED, try node list as last resort
+            if (!runResult && String(run?.status || "").toUpperCase() === "COMPLETED") {
+              try {
+                const nodes = await api(`/workflow/runs/${result.runId}/nodes`);
+                const list = Array.isArray(nodes) ? nodes : nodes?.items || [];
+                if (list.length) {
+                  runResult = Object.fromEntries(
+                    list.map((n) => {
+                      const id = n.nodeId || n.node_id || n.id || "node";
+                      let output = n.outputJson ?? n.output_json;
+                      if (typeof output === "string") {
+                        try {
+                          output = JSON.parse(output);
+                        } catch {
+                          output = { summary: output };
+                        }
+                      }
+                      return [id, { ...(output || {}), nodeId: id, nodeName: n.nodeName || n.node_name || id, status: n.status }];
+                    }),
+                  );
                 }
-              }
-              // Collect summaries from all executed nodes
-              if (!content) {
-                const nodeEntries = Object.entries(runResult)
-                  .filter(([, v]) => v && typeof v === "object" && v.nodeId && v.status)
-                  .map(([k, v]) => {
-                    const label = v.nodeName || k;
-                    const summary =
-                      v.summary || v.content || (v.data && v.data.summary) || (v.data && v.data.content) || "";
-                    return { label, summary, ok: v.ok, status: v.status };
-                  })
-                  .filter((n) => n.summary.trim());
-                if (nodeEntries.length > 0) {
-                  content = nodeEntries
-                    .map((n) => "**" + n.label + "** (" + n.status + "): " + n.summary)
-                    .join(String.fromCharCode(10) + String.fromCharCode(10));
-                }
-              }
-              // Final fallback
-              if (!content) {
-                const sep = String.fromCharCode(10);
-                const nodeStatuses = Object.entries(runResult)
-                  .filter(([, v]) => v && typeof v === "object" && v.nodeId)
-                  .map(([, v]) => "- " + (v.nodeName || v.nodeId) + ": " + v.status)
-                  .join(sep);
-                const nodeCount = run.nodeCount || 0;
-                content =
-                  "工作流 " +
-                  (result.workflowKey || "") +
-                  " 已完成，" +
-                  nodeCount +
-                  " 个节点已执行：" +
-                  sep +
-                  nodeStatuses;
+              } catch {
+                /* ignore */
               }
             }
+            content = summarizeWorkflowRunResult(run, result, runResult);
+            const st = String(run?.status || "").toUpperCase();
+            replyOk = st === "COMPLETED" || st === "DEGRADED" || st === "COMPLETED_DEGRADED";
           } catch (fetchErr) {
             // eslint-disable-next-line no-console
             console.warn("Failed to fetch workflow run result:", fetchErr);
+            content =
+              (result?.content || "工作流已启动，但获取结果失败。") +
+              String.fromCharCode(10) +
+              `运行 ID: ${result.runId}` +
+              String.fromCharCode(10) +
+              (fetchErr?.message || String(fetchErr));
+            replyOk = false;
           }
         }
         setThinkingEvents([]);
-        setMessages((prev) => [
-          ...prev,
-          { role: "assistant", content, ok: result?.ok, provider: result?.provider, reason: result?.reason },
-        ]);
+        setMessages((prev) => {
+          // Drop the temporary "等待结果" bubble if we added one
+          const withoutPending = prev.filter(
+            (m) => !(m.role === "assistant" && m.provider === "workflow-router" && String(m.content || "").includes("正在等待工作流")),
+          );
+          return [
+            ...withoutPending,
+            {
+              role: "assistant",
+              content,
+              ok: replyOk,
+              provider: result?.provider || (result?.routedToWorkflow ? "workflow" : undefined),
+              reason: result?.reason,
+            },
+          ];
+        });
       } catch (error) {
         setThinkingEvents([]);
         setMessages((prev) => [
@@ -4421,16 +4545,13 @@ function Dashboard({ api }) {
       let content = result?.content || result?.message || "\u672a\u8fd4\u56de\u5206\u6790\u5185\u5bb9";
       if (result?.routedToWorkflow && result?.runId) {
         try {
-          const run = await api(`/workflow/runs/${result.runId}`);
-          const runResult = run?.resultJson ? JSON.parse(run.resultJson) : null;
-          if (runResult?.recommendation?.summary) {
-            content = runResult.recommendation.summary;
-          } else if (runResult?.recommendation?.content) {
-            content = runResult.recommendation.content;
-          }
+          const run = await waitForWorkflowRun(api, result.runId);
+          const runResult = parseRunResultJson(run?.resultJson ?? run?.result_json);
+          content = summarizeWorkflowRunResult(run, result, runResult);
         } catch (fetchErr) {
           // eslint-disable-next-line no-console
           console.warn("Failed to fetch workflow run result:", fetchErr);
+          content = `工作流已启动但获取结果失败: ${fetchErr?.message || fetchErr}`;
         }
       }
       setAnalysisResult(content);

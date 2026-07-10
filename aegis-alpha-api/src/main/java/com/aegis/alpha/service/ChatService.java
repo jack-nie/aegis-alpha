@@ -298,9 +298,14 @@ public class ChatService {
         }
         String msg = message == null ? "" : message;
 
+        // Resolve Chinese names inside free-text (e.g. "分析一下生益科技" -> 600183.SH)
         String chineseResolved = marketDataService.resolveAShareSymbolPublic(msg);
-        if (chineseResolved != null && !chineseResolved.equals(msg) && !chineseResolved.isEmpty()) {
-            return cleanTicker(chineseResolved);
+        if (chineseResolved != null && !chineseResolved.trim().isEmpty()
+                && !chineseResolved.trim().equals(msg.trim())) {
+            String cleaned = cleanTicker(chineseResolved);
+            if (!cleaned.isEmpty()) {
+                return cleaned;
+            }
         }
 
         String normalized = marketDataService.normalizeSymbolPublic(msg);
