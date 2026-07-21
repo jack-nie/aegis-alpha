@@ -1,0 +1,29 @@
+{
+  "id": "g07_degraded_forced_insufficient",
+  "description": "Degraded draft proposing SELL without quote/financials must force INSUFFICIENT_DATA.",
+  "draft": {
+    "recommendation": "SELL",
+    "confidence": 0.65,
+    "degraded": true,
+    "claims": [],
+    "sources": [],
+    "missingData": ["provider_timeout"]
+  },
+  "state": {
+    "symbol": "TSLA",
+    "marketDataContext": {
+      "quote": {
+        "degraded": true,
+        "provider": "stale-cache"
+      }
+    }
+  },
+  "expect": {
+    "recommendation": "INSUFFICIENT_DATA",
+    "ok": false,
+    "degraded": true,
+    "forcedInsufficient": true,
+    "missing_data_contains": ["degraded_source", "missing_financials", "missing_evidence"],
+    "notes_contains": ["policy_degraded", "actionable_label_failed_evidence_gates"]
+  }
+}

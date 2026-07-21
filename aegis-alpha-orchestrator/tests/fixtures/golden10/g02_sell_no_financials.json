@@ -1,0 +1,41 @@
+{
+  "id": "g02_sell_no_financials",
+  "description": "SELL with quote/source but without financials/evidence of financials must fail evidence gates.",
+  "draft": {
+    "recommendation": "SELL",
+    "confidence": 0.75,
+    "claims": [
+      {
+        "claimId": "c_last_price",
+        "field": "last_price",
+        "value": 50.0,
+        "evidenceId": "quote-only"
+      }
+    ],
+    "sources": [
+      {
+        "id": "quote-only",
+        "title": "quote",
+        "type": "market"
+      }
+    ]
+  },
+  "state": {
+    "symbol": "AAPL",
+    "marketDataContext": {
+      "quote": {
+        "price": 50.0,
+        "asOf": "2026-07-01",
+        "provider": "test"
+      }
+    }
+  },
+  "expect": {
+    "recommendation": "INSUFFICIENT_DATA",
+    "ok": false,
+    "degraded": true,
+    "forcedInsufficient": true,
+    "missing_data_contains": ["missing_financials"],
+    "conflicts_contains": ["label_gate:SELL->INSUFFICIENT_DATA"]
+  }
+}

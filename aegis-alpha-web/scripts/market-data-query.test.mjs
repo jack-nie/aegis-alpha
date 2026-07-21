@@ -1,10 +1,26 @@
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync, statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import assert from "node:assert/strict";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
-const source = readFileSync(join(root, "app", "App.jsx"), "utf8");
+
+function collectSourceFiles(dir, acc = []) {
+  for (const entry of readdirSync(dir)) {
+    const full = join(dir, entry);
+    const stat = statSync(full);
+    if (stat.isDirectory()) {
+      collectSourceFiles(full, acc);
+      continue;
+    }
+    if (/\.(jsx?|mjs)$/.test(entry)) acc.push(full);
+  }
+  return acc;
+}
+
+const source = collectSourceFiles(join(root, "app"))
+  .map((file) => readFileSync(file, "utf8"))
+  .join("\n");
 
 assert.match(
   source,
