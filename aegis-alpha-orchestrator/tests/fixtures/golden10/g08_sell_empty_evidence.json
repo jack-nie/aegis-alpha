@@ -1,0 +1,20 @@
+{
+  "id": "g08_sell_empty_evidence",
+  "description": "SELL with empty claims and sources and no market facts must not remain SELL.",
+  "draft": {
+    "recommendation": "SELL",
+    "confidence": 0.88,
+    "claims": [],
+    "sources": []
+  },
+  "state": {
+    "symbol": "AMD"
+  },
+  "expect": {
+    "recommendation": "INSUFFICIENT_DATA",
+    "ok": false,
+    "degraded": true,
+    "forcedInsufficient": true,
+    "missing_data_contains": ["missing_quote", "missing_financials", "missing_evidence"]
+  }
+}

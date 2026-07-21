@@ -1,0 +1,60 @@
+{
+  "id": "g03_buy_full_evidence",
+  "description": "BUY with quote, financials, bound claims, and sources may pass critique.",
+  "draft": {
+    "recommendation": "BUY",
+    "confidence": 0.82,
+    "claims": [
+      {
+        "claimId": "c_last_price",
+        "field": "last_price",
+        "value": 100.0,
+        "unit": "USD",
+        "asOf": "2026-07-01",
+        "evidenceId": "market-context"
+      },
+      {
+        "claimId": "c_revenue",
+        "field": "revenue",
+        "value": 1000000000,
+        "evidenceId": "market-context"
+      },
+      {
+        "claimId": "c_netIncome",
+        "field": "netIncome",
+        "value": 100000000,
+        "evidenceId": "market-context"
+      }
+    ],
+    "sources": [
+      {
+        "id": "market-context",
+        "title": "market",
+        "type": "market"
+      }
+    ]
+  },
+  "state": {
+    "symbol": "MSFT",
+    "marketDataContext": {
+      "quote": {
+        "ok": true,
+        "price": 100.0,
+        "asOf": "2026-07-01",
+        "provider": "test",
+        "currency": "USD"
+      },
+      "financials": {
+        "ok": true,
+        "revenue": 1000000000,
+        "netIncome": 100000000
+      }
+    }
+  },
+  "expect": {
+    "recommendation": "BUY",
+    "ok": true,
+    "degraded": false,
+    "forcedInsufficient": false
+  }
+}

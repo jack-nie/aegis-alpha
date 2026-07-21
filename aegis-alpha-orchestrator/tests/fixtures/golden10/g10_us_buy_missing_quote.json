@@ -1,0 +1,41 @@
+{
+  "id": "g10_us_buy_missing_quote",
+  "description": "US symbol BUY with financials/source but missing quote/price claim must fail.",
+  "draft": {
+    "recommendation": "BUY",
+    "confidence": 0.7,
+    "claims": [
+      {
+        "claimId": "c_revenue",
+        "field": "revenue",
+        "value": 900000000,
+        "evidenceId": "fin-only"
+      }
+    ],
+    "sources": [
+      {
+        "id": "fin-only",
+        "title": "financials",
+        "type": "financials"
+      }
+    ]
+  },
+  "state": {
+    "symbol": "GOOGL",
+    "marketDataContext": {
+      "financials": {
+        "ok": true,
+        "revenue": 900000000,
+        "netIncome": 120000000
+      }
+    }
+  },
+  "expect": {
+    "recommendation": "INSUFFICIENT_DATA",
+    "ok": false,
+    "degraded": true,
+    "forcedInsufficient": true,
+    "missing_data_contains": ["missing_quote"],
+    "notes_contains": ["missing_quote", "actionable_label_failed_evidence_gates"]
+  }
+}
