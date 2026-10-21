@@ -22,8 +22,8 @@ tool_registry = create_tool_registry(settings)
 tools = list(tool_registry.values())
 
 try:
-    from langgraph.checkpoint.sqlite import SqliteSaver
-    _checkpointer = SqliteSaver.from_conn_string(f"{settings.data_dir}/checkpoints.db")
+    from .core.checkpointer_lifecycle import open_checkpointer
+    _checkpointer = open_checkpointer(f"{settings.data_dir}/checkpoints.db")
 except ImportError:
     from langgraph.checkpoint.memory import MemorySaver
     _checkpointer = MemorySaver()

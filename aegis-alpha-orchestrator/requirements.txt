@@ -2,10 +2,11 @@ fastapi
 uvicorn[standard]
 pydantic
 pydantic-settings
-langgraph
+langgraph>=1.2
 langchain-openai
 langchain-core
 python-dotenv
 httpx
 aiosqlite
-langgraph-checkpoint-sqlite
+langgraph-checkpoint>=4.3
+langgraph-checkpoint-sqlite>=3.1

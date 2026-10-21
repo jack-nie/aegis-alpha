@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator
@@ -12,12 +11,32 @@ from ..config import Settings
 from ..models.workflow import Node, AgentTemplate
 from ..models.responses import NodeResult
 from ..prompts import PromptManager
+from .context_assembly import (
+    AGGREGATE_TOKEN_BUDGET,
+    DEFAULT_TOKEN_BUDGET,
+    assemble_model_context,
+)
 from .critique import critique_recommendation_draft
 from .llm_client import AgentToolResult, LLMClient, LLMResponse
 from .market_data import MarketDataService
 from .recommendation_policy import enforce_recommendation_policy
 
 logger = logging.getLogger(__name__)
+
+
+def _assemble_context(state: dict[str, Any], *, aggregate: bool = False) -> str:
+    """Budgeted prompt context. Aggregate keeps a larger budget; never a prefix cut."""
+    budget = AGGREGATE_TOKEN_BUDGET if aggregate else DEFAULT_TOKEN_BUDGET
+    return assemble_model_context(state, token_budget=budget)
+
+
+def _with_token_usage(result_data: dict[str, Any], response: LLMResponse) -> dict[str, Any]:
+    """Attach provider token usage without dropping existing result data keys."""
+    data = dict(result_data or {})
+    if response.token_usage is not None:
+        data["tokenUsage"] = response.token_usage
+    return data
+
 
 # Business handlers
 HANDLERS = {
@@ -194,16 +213,9 @@ class NodeExecutor:
             agent_name=agent_name,
         )
 
-        # Build context
+        # Build context (budgeted assembly, not a JSON prefix cut).
         is_aggregate = handler == "finance.stock_recommendation_aggregate"
-        max_context = 30000 if is_aggregate else 12000
-        full_context = json.dumps(state, ensure_ascii=False, default=str)
-        if len(full_context) <= max_context:
-            context = full_context
-        else:
-            truncated = full_context[:max_context]
-            last_brace = truncated.rfind('}')
-            context = truncated[:last_brace + 1] if last_brace > 0 else truncated
+        context = _assemble_context(state, aggregate=is_aggregate)
 
         # Build system prompt
         if is_aggregate:
@@ -254,7 +266,7 @@ class NodeExecutor:
                 *sources,
             ]
 
-        result_data = dict(response.data or {})
+        result_data = _with_token_usage(response.data or {}, response)
         summary = response.summary
         confidence = response.confidence
         degraded = False
@@ -524,14 +536,7 @@ class NodeExecutor:
             agent_name=agent_name,
         )
 
-        max_context = 12000
-        full_context = json.dumps(state, ensure_ascii=False, default=str)
-        if len(full_context) <= max_context:
-            context = full_context
-        else:
-            truncated = full_context[:max_context]
-            last_brace = truncated.rfind("}")
-            context = truncated[: last_brace + 1] if last_brace > 0 else truncated
+        context = _assemble_context(state, aggregate=False)
 
         system = (
             f"You are {agent_name}. "
@@ -597,7 +602,7 @@ class NodeExecutor:
             signals=[self._normalize_signal(s) for s in response.signals],
             sources=sources,
             confidence=response.confidence,
-            data=dict(response.data or {}),
+            data=_with_token_usage(response.data or {}, response),
             duration_ms=duration_ms,
             content=response.content,
             degraded=False,
@@ -646,14 +651,7 @@ class NodeExecutor:
             agent_name=agent_name,
         )
 
-        max_context = 30000
-        full_context = json.dumps(state, ensure_ascii=False, default=str)
-        if len(full_context) <= max_context:
-            context = full_context
-        else:
-            truncated = full_context[:max_context]
-            last_brace = truncated.rfind('}')
-            context = truncated[:last_brace + 1] if last_brace > 0 else truncated
+        context = _assemble_context(state, aggregate=True)
 
         system = (
             f"You are {agent_name}. Generate a comprehensive investment research report. "
