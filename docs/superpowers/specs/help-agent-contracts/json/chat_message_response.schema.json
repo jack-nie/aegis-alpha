@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aegis-alpha.local/schemas/chat_message_response.json",
+  "title": "ChatMessageResponse",
+  "type": "object",
+  "required": ["threadId", "content", "message", "ok", "domain", "routeAction"],
+  "properties": {
+    "threadId": { "type": "string" },
+    "content": { "type": "string" },
+    "message": { "type": "string" },
+    "ok": { "type": "boolean" },
+    "domain": {
+      "type": "string",
+      "enum": ["RESEARCH", "PRODUCT_HELP", "RUN_DIAGNOSIS", "CHITCHAT"]
+    },
+    "complexity": {
+      "type": "string",
+      "enum": ["L0", "L1", "L2"]
+    },
+    "routeAction": {
+      "type": "string",
+      "enum": [
+        "DISPATCH_WORKFLOW",
+        "PLAYBOOK",
+        "KNOWLEDGE_RAG",
+        "HELP_GRAPH",
+        "COPILOT",
+        "CLARIFY"
+      ]
+    },
+    "provider": { "type": "string" },
+    "routedToWorkflow": { "type": "boolean" },
+    "runId": { "type": ["string", "null"] },
+    "workflowKey": { "type": ["string", "null"] },
+    "runStatus": { "type": ["string", "null"] },
+    "needsClarification": { "type": "boolean" },
+    "clarificationPrompt": { "type": ["string", "null"] },
+    "escalateHuman": { "type": "boolean" },
+    "sourceRefs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["type", "id"],
+        "properties": {
+          "type": { "type": "string" },
+          "id": { "type": "string" },
+          "title": { "type": ["string", "null"] },
+          "path": { "type": ["string", "null"] }
+        }
+      }
+    },
+    "cacheHit": { "type": "boolean" },
+    "disclaimer": { "type": ["string", "null"] }
+  },
+  "additionalProperties": true
+}

@@ -1,15 +1,20 @@
 package com.aegis.alpha.service;
 
 import com.aegis.alpha.domain.AgentTemplate;
-import com.aegis.alpha.service.IntentRouterService.IntentResult;
 import com.aegis.alpha.domain.WorkflowRun;
 import com.aegis.alpha.mapper.ChatMapper;
+import com.aegis.alpha.service.help.HelpAnswerCacheService;
+import com.aegis.alpha.service.help.HelpIntent;
+import com.aegis.alpha.service.help.HelpRoutingService;
+import com.aegis.alpha.service.help.HelpService;
 import org.springframework.stereotype.Service;
 
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
@@ -41,18 +46,34 @@ public class ChatService {
     private final LangChainGateway langChainGateway;
     private final MarketDataService marketDataService;
     private final WorkflowService workflowService;
-    private final IntentRouterService intentRouterService;
+    private final HelpRoutingService helpRoutingService;
+    private final HelpService helpService;
+    private final HelpAnswerCacheService helpAnswerCacheService;
 
     public ChatService(ChatMapper mapper,
                        LangChainGateway langChainGateway,
                        MarketDataService marketDataService,
                        WorkflowService workflowService,
-                       IntentRouterService intentRouterService) {
+                       HelpRoutingService helpRoutingService,
+                       HelpService helpService,
+                       HelpAnswerCacheService helpAnswerCacheService) {
         this.mapper = mapper;
         this.langChainGateway = langChainGateway;
         this.marketDataService = marketDataService;
         this.workflowService = workflowService;
-        this.intentRouterService = intentRouterService;
+        this.helpRoutingService = helpRoutingService;
+        this.helpService = helpService;
+        this.helpAnswerCacheService = helpAnswerCacheService;
+    }
+
+    /** Backward-compatible constructor for older unit tests. */
+    public ChatService(ChatMapper mapper,
+                       LangChainGateway langChainGateway,
+                       MarketDataService marketDataService,
+                       WorkflowService workflowService,
+                       HelpRoutingService helpRoutingService,
+                       HelpService helpService) {
+        this(mapper, langChainGateway, marketDataService, workflowService, helpRoutingService, helpService, null);
     }
 
     public Object threads() {
@@ -61,28 +82,212 @@ public class ChatService {
 
     public Map<String, Object> reply(Map<String, Object> body) {
         String message = text(body, "message", "");
-        String threadId = UUID.randomUUID().toString();
+        String threadId = resolveThreadId(body);
         mapper.insertThread(threadId, title(message));
         mapper.insertMessage(UUID.randomUUID().toString(), threadId, "user", message);
 
-        /* ---- intent-based workflow routing via LLM + DB keywords ---- */
-        IntentResult intent = intentRouterService.classify(message);
-        String workflowKey = intent != null ? intent.getWorkflowKey() : null;
-        // explicit override from caller takes priority
-        String explicit = text(body, "workflowKey", "");
-        if (!explicit.isEmpty()) {
-            workflowKey = explicit;
-        }
-        if (workflowKey != null) {
-            return dispatchWorkflow(workflowKey, message, threadId, body);
+        HelpIntent.PageContext pageContext = HelpIntent.PageContext.fromMap(objectMap(body == null ? null : body.get("pageContext")));
+
+        /* Safety refusals first (no side effects) */
+        Map<String, Object> safety = helpService.safetyRefuse(threadId, message, null);
+        if (safety != null) {
+            mergeDomainIfMissing(safety, HelpIntent.Domain.PRODUCT_HELP, HelpIntent.RouteAction.PLAYBOOK);
+            persistAssistant(threadId, text(safety, "content", ""));
+            return safety;
         }
 
-        /* ---- default: copilot chat ---- */
-        return copilotReply(message, threadId, body);
+        /* Explicit workflowKey override takes priority */
+        String explicit = text(body, "workflowKey", "");
+        if (!explicit.isEmpty()) {
+            Map<String, Object> response = dispatchWorkflow(explicit, message, threadId, body);
+            decorateResearch(response, explicit);
+            return response;
+        }
+
+        HelpIntent.Result intent = helpRoutingService.classifyExtended(message, pageContext);
+        applyPreferredDomain(body, intent);
+
+        /* Public help answer cache (entity-gated; never private run/portfolio) */
+        if (helpAnswerCacheService != null) {
+            Map<String, Object> cached = helpAnswerCacheService.getIfAllowed(message, intent);
+            if (cached != null) {
+                cached.put("threadId", threadId);
+                cached.put("cacheHit", true);
+                persistAssistant(threadId, text(cached, "content", ""));
+                return cached;
+            }
+        }
+
+        List<String> roles = principalRoles(body);
+        Map<String, Object> helpResponse = null;
+
+        switch (intent.getRouteAction()) {
+            case DISPATCH_WORKFLOW:
+                if (intent.getWorkflowKey() != null && !intent.getWorkflowKey().isEmpty()) {
+                    Map<String, Object> response = dispatchWorkflow(intent.getWorkflowKey(), message, threadId, body);
+                    decorateFromIntent(response, intent);
+                    return response;
+                }
+                break;
+            case CLARIFY:
+                Map<String, Object> clarify = helpService.clarify(threadId, intent);
+                persistAssistant(threadId, text(clarify, "content", ""));
+                return clarify;
+            case PLAYBOOK: {
+                helpResponse = helpService.answerFromPlaybook(threadId, message, intent);
+                if (helpResponse == null) {
+                    helpResponse = helpService.answerFromKnowledge(threadId, message, intent, roles);
+                }
+                if (helpResponse == null) {
+                    helpResponse = helpService.answerFromHelpLoop(threadId, message, intent, roles);
+                }
+                break;
+            }
+            case HELP_GRAPH:
+                if (intent.getDomain() == HelpIntent.Domain.RUN_DIAGNOSIS) {
+                    Map<String, Object> diagnosis = helpService.diagnoseRun(threadId, message, intent);
+                    persistAssistant(threadId, text(diagnosis, "content", ""));
+                    return diagnosis;
+                }
+                helpResponse = helpService.answerFromPlaybook(threadId, message, intent);
+                if (helpResponse == null) {
+                    helpResponse = helpService.answerFromHelpLoop(threadId, message, intent, roles);
+                }
+                break;
+            case KNOWLEDGE_RAG:
+                helpResponse = helpService.answerFromKnowledge(threadId, message, intent, roles);
+                if (helpResponse == null) {
+                    helpResponse = helpService.answerFromHelpLoop(threadId, message, intent, roles);
+                }
+                break;
+            case COPILOT:
+            default:
+                break;
+        }
+
+        if (helpResponse != null) {
+            if (helpAnswerCacheService != null) {
+                helpAnswerCacheService.putIfAllowed(message, intent, helpResponse);
+            }
+            persistAssistant(threadId, text(helpResponse, "content", ""));
+            return helpResponse;
+        }
+
+        Map<String, Object> copilot = copilotReply(message, threadId, body);
+        decorateFromIntent(copilot, intent);
+        return copilot;
+    }
+
+    @SuppressWarnings("unchecked")
+    private List<String> principalRoles(Map<String, Object> body) {
+        if (body == null) {
+            return Collections.emptyList();
+        }
+        Object roles = body.get("roles");
+        if (roles instanceof List) {
+            List<String> out = new java.util.ArrayList<String>();
+            for (Object r : (List<?>) roles) {
+                if (r != null) {
+                    out.add(String.valueOf(r));
+                }
+            }
+            return out;
+        }
+        String single = text(body, "role", "");
+        if (!single.isEmpty()) {
+            return Collections.singletonList(single);
+        }
+        return Collections.emptyList();
+    }
+
+    private void applyPreferredDomain(Map<String, Object> body, HelpIntent.Result intent) {
+        String preferred = text(body, "preferredDomain", "");
+        if (preferred.isEmpty() || intent == null) {
+            return;
+        }
+        try {
+            HelpIntent.Domain domain = HelpIntent.Domain.valueOf(preferred.trim().toUpperCase(Locale.ROOT));
+            if (domain == HelpIntent.Domain.PRODUCT_HELP
+                    && intent.getRouteAction() == HelpIntent.RouteAction.COPILOT) {
+                intent.setDomain(domain);
+                intent.setRouteAction(HelpIntent.RouteAction.PLAYBOOK);
+            } else if (domain == HelpIntent.Domain.RUN_DIAGNOSIS
+                    && intent.getRouteAction() == HelpIntent.RouteAction.COPILOT) {
+                intent.setDomain(domain);
+                if (intent.getEntities() == null || intent.getEntities().getRunId() == null) {
+                    intent.setRouteAction(HelpIntent.RouteAction.CLARIFY);
+                    intent.setNeedsClarification(true);
+                    intent.setClarificationPrompt("请提供运行 ID（runId），或从「运行中心」打开对应 run 后再问我。");
+                } else {
+                    intent.setRouteAction(HelpIntent.RouteAction.HELP_GRAPH);
+                }
+            }
+        } catch (IllegalArgumentException ignored) {
+            // ignore invalid preferredDomain
+        }
+    }
+
+    private String resolveThreadId(Map<String, Object> body) {
+        String existing = text(body, "threadId", "");
+        if (!existing.isEmpty()) {
+            return existing;
+        }
+        return UUID.randomUUID().toString();
+    }
+
+    private void persistAssistant(String threadId, String content) {
+        mapper.insertMessage(UUID.randomUUID().toString(), threadId, "assistant",
+                content == null ? "" : content);
+    }
+
+    private void decorateFromIntent(Map<String, Object> response, HelpIntent.Result intent) {
+        if (response == null || intent == null) {
+            return;
+        }
+        Map<String, Object> envelope = intent.toEnvelopeFields();
+        for (Map.Entry<String, Object> entry : envelope.entrySet()) {
+            if (!response.containsKey(entry.getKey()) || response.get(entry.getKey()) == null) {
+                response.put(entry.getKey(), entry.getValue());
+            }
+        }
+        if (!response.containsKey("provider") || response.get("provider") == null) {
+            if (Boolean.TRUE.equals(response.get("routedToWorkflow"))) {
+                response.put("provider", "workflow-router");
+            } else {
+                response.put("provider", "copilot");
+            }
+        }
+    }
+
+    private void decorateResearch(Map<String, Object> response, String workflowKey) {
+        if (response == null) {
+            return;
+        }
+        response.put("domain", HelpIntent.Domain.RESEARCH.name());
+        response.put("complexity", HelpIntent.Complexity.L2.name());
+        response.put("routeAction", HelpIntent.RouteAction.DISPATCH_WORKFLOW.name());
+        response.put("provider", "workflow-router");
+        if (workflowKey != null) {
+            response.put("workflowKey", workflowKey);
+        }
+    }
+
+    private void mergeDomainIfMissing(Map<String, Object> response,
+                                      HelpIntent.Domain domain,
+                                      HelpIntent.RouteAction action) {
+        if (!response.containsKey("domain")) {
+            response.put("domain", domain.name());
+        }
+        if (!response.containsKey("routeAction")) {
+            response.put("routeAction", action.name());
+        }
+        if (!response.containsKey("complexity")) {
+            response.put("complexity", HelpIntent.Complexity.L0.name());
+        }
     }
 
     /* ================================================================ *
-     * Intent routing  –  only the 6 seeded keys are valid targets.
+     * Intent routing  –  only the seeded keys are valid targets.
      * ================================================================ */
 
     String resolveWorkflowKey(Map<String, Object> body, String message) {
@@ -176,13 +381,20 @@ public class ChatService {
         }
         Map<String, Object> extraState = objectMap(body == null ? null : body.get("state"));
         inputs.putAll(extraState);
+        Map<String, Object> pageContext = objectMap(body == null ? null : body.get("pageContext"));
+        if (!pageContext.isEmpty()) {
+            inputs.put("pageContext", pageContext);
+        }
 
         WorkflowRun run;
         try {
             run = workflowService.createRun(workflowKey, subject, inputs);
         } catch (Exception ex) {
             /* If workflow layout is not published or invalid, fall back to copilot */
-            return copilotReply(message, threadId, body);
+            Map<String, Object> fallback = copilotReply(message, threadId, body);
+            fallback.put("domain", HelpIntent.Domain.RESEARCH.name());
+            fallback.put("routeAction", HelpIntent.RouteAction.COPILOT.name());
+            return fallback;
         }
 
         final String runId = run.getRunId();
@@ -201,11 +413,19 @@ public class ChatService {
         response.put("runId", runId);
         response.put("runStatus", "RUNNING");
         response.put("routedToWorkflow", true);
+        response.put("ok", true);
+        response.put("domain", HelpIntent.Domain.RESEARCH.name());
+        response.put("complexity", HelpIntent.Complexity.L2.name());
+        response.put("routeAction", HelpIntent.RouteAction.DISPATCH_WORKFLOW.name());
+        response.put("provider", "workflow-router");
+        response.put("needsClarification", false);
+        response.put("escalateHuman", false);
+        response.put("cacheHit", false);
         return response;
     }
 
     /* ================================================================ *
-     * Default copilot chat (unchanged logic)
+     * Default copilot chat
      * ================================================================ */
 
     private Map<String, Object> copilotReply(String message, String threadId, Map<String, Object> body) {
@@ -244,11 +464,16 @@ public class ChatService {
         response.put("message", reply);
         response.put("content", reply);
         response.put("routedToWorkflow", false);
+        response.put("ok", true);
+        response.put("provider", "copilot");
+        response.put("needsClarification", false);
+        response.put("escalateHuman", false);
+        response.put("cacheHit", false);
         return response;
     }
 
     /* ================================================================ *
-     * Helpers (mostly unchanged from original)
+     * Helpers
      * ================================================================ */
 
     private Map<String, Object> marketOverview(String ticker) {
