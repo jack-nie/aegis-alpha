@@ -29,7 +29,7 @@ class Settings(BaseSettings):
 
     # Intent router (classification). Empty model -> fall back to the main model.
     router_model: str = Field(default="", alias="AEGIS_ALPHA_ROUTER_MODEL")
-    router_timeout_ms: int = Field(default=5000, alias="AEGIS_ALPHA_ROUTER_TIMEOUT_MS")
+    router_timeout_ms: int = Field(default=2500, alias="AEGIS_ALPHA_ROUTER_TIMEOUT_MS")
 
     # Backend
     backend_url: str = Field(default="http://127.0.0.1:5178", alias="AEGIS_ALPHA_BACKEND_URL")

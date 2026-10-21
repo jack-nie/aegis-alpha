@@ -55,6 +55,13 @@ aegis:
     # research-priority-confidence is the minimum to dispatch a workflow from chat.
     llm-min-confidence: ${AEGIS_ALPHA_ROUTER_LLM_MIN_CONFIDENCE:0.6}
     research-priority-confidence: ${AEGIS_ALPHA_ROUTER_RESEARCH_PRIORITY_CONFIDENCE:0.6}
+    # Java classify read timeout must exceed the orchestrator AEGIS_ALPHA_ROUTER_TIMEOUT_MS (2500ms).
+    classify-connect-timeout-ms: ${AEGIS_ALPHA_ROUTER_CLASSIFY_CONNECT_TIMEOUT_MS:1000}
+    classify-read-timeout-ms: ${AEGIS_ALPHA_ROUTER_CLASSIFY_READ_TIMEOUT_MS:4000}
+    cache-ttl-ms: ${AEGIS_ALPHA_ROUTER_CACHE_TTL_MS:600000}
+    cache-max-entries: ${AEGIS_ALPHA_ROUTER_CACHE_MAX_ENTRIES:500}
+    breaker-failure-threshold: ${AEGIS_ALPHA_ROUTER_BREAKER_FAILURES:3}
+    breaker-open-ms: ${AEGIS_ALPHA_ROUTER_BREAKER_OPEN_MS:30000}
   dify:
     enabled: ${AEGIS_ALPHA_DIFY_ENABLED:false}
     base-url: ${AEGIS_ALPHA_DIFY_BASE_URL:https://api.dify.ai/v1}

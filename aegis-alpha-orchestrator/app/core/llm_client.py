@@ -396,7 +396,7 @@ class LLMClient:
         or the call failed. ``confidence`` is the model-provided value (may be ``None``).
         """
         resolved_model = self._resolve_model(getattr(self._config, "router_model", "") or None)
-        timeout_ms = int(getattr(self._config, "router_timeout_ms", 0) or 5000)
+        timeout_ms = int(getattr(self._config, "router_timeout_ms", 0) or 2500)
         client = self._build_client(resolved_model, temperature=0, timeout_ms=timeout_ms)
 
         messages: list[BaseMessage] = [SystemMessage(content=INTENT_CLASSIFIER_SYSTEM_PROMPT)]
