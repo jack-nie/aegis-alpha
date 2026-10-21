@@ -80,6 +80,17 @@ class WorkflowServiceHumanInterruptTest {
         when(mapper.findLayout("daily")).thenReturn(null);
 
         doInsertAndUpdate();
+        when(mapper.transitionControlStatus(anyString(), anyString(), anyString())).thenAnswer(invocation -> {
+            WorkflowRun current = storedRun.get();
+            if (current == null || !current.getRunId().equals(invocation.getArgument(0))
+                    || !((String) invocation.getArgument(1)).equals(current.getControlStatus())) {
+                return 0;
+            }
+            WorkflowRun moved = copyRun(current);
+            moved.setControlStatus((String) invocation.getArgument(2));
+            storedRun.set(moved);
+            return 1;
+        });
         when(mapper.findRun(anyString())).thenAnswer(invocation -> {
             WorkflowRun current = storedRun.get();
             if (current == null || !current.getRunId().equals(invocation.getArgument(0))) {
@@ -268,5 +279,84 @@ class WorkflowServiceHumanInterruptTest {
         copy.setPauseRequested(source.getPauseRequested());
         copy.setCancelRequested(source.getCancelRequested());
         return copy;
+    }
+
+    /* ---------------- P1-5: approval decision closure ---------------- */
+
+    @Test
+    void rejectionEndsRunAsRejectedAndAudits() {
+        WorkflowRun paused = pausedRun("run-reject");
+        storedRun.set(paused);
+        Map<String, Object> resume = new LinkedHashMap<>();
+        resume.put("ok", true);
+        when(langChainGateway.resumeWorkflow("run-reject", false)).thenReturn(resume);
+        com.aegis.alpha.security.AuthenticatedPrincipal desk = new com.aegis.alpha.security.AuthenticatedPrincipal(
+                "u-desk", "desk.lead", "t-1", java.util.Collections.singletonList("desk"));
+
+        WorkflowRun rejected = service.decideApproval("run-reject", false, "evidence too thin", desk);
+
+        assertThat(rejected.getStatus()).isEqualTo("REJECTED");
+        assertThat(rejected.getResultJson()).contains("\"approval\":\"rejected\"").contains("u-desk");
+        verify(mapper, org.mockito.Mockito.atLeastOnce()).insertRunEvent(org.mockito.ArgumentMatchers.argThat(
+                event -> "RUN_APPROVAL_DECISION".equals(event.getEventType())
+                        && event.getPayloadJson().contains("evidence too thin")));
+    }
+
+    @Test
+    void repeatedApprovalResumesOrchestratorOnlyOnce() {
+        storedRun.set(pausedRun("run-twice"));
+        Map<String, Object> resume = new LinkedHashMap<>();
+        resume.put("ok", true);
+        when(langChainGateway.resumeWorkflow("run-twice", true)).thenReturn(resume);
+
+        WorkflowRun first = service.decideApproval("run-twice", true);
+        WorkflowRun second = service.decideApproval("run-twice", true);
+
+        assertThat(first.getStatus()).isEqualTo("COMPLETED");
+        assertThat(second.getStatus()).isEqualTo("COMPLETED");
+        verify(langChainGateway, times(1)).resumeWorkflow(anyString(), anyBoolean());
+    }
+
+    @Test
+    void lostCompareAndSetDoesNotResume() {
+        storedRun.set(pausedRun("run-race"));
+        when(mapper.transitionControlStatus("run-race", "HUMAN_INTERRUPT", "APPROVAL_IN_PROGRESS")).thenReturn(0);
+
+        service.decideApproval("run-race", true);
+
+        verify(langChainGateway, never()).resumeWorkflow(anyString(), anyBoolean());
+    }
+
+    @Test
+    void failedResumeReturnsRunToHumanInterrupt() {
+        storedRun.set(pausedRun("run-fail"));
+        Map<String, Object> resume = new LinkedHashMap<>();
+        resume.put("ok", false);
+        resume.put("error", "orchestrator down");
+        when(langChainGateway.resumeWorkflow("run-fail", true)).thenReturn(resume);
+
+        WorkflowRun after = service.decideApproval("run-fail", true);
+
+        assertThat(after.getControlStatus()).isEqualTo("HUMAN_INTERRUPT");
+        assertThat(after.getStatus()).isEqualTo("PAUSED");
+    }
+
+    @Test
+    void approverRolesDefaultToDeskAndAdmin() {
+        assertThat(service.isApprover(new com.aegis.alpha.security.AuthenticatedPrincipal(
+                "u", "u", "t", java.util.Collections.singletonList("desk")))).isTrue();
+        assertThat(service.isApprover(new com.aegis.alpha.security.AuthenticatedPrincipal(
+                "u", "u", "t", java.util.Collections.singletonList("admin")))).isTrue();
+        assertThat(service.isApprover(new com.aegis.alpha.security.AuthenticatedPrincipal(
+                "u", "u", "t", java.util.Collections.singletonList("research_user")))).isFalse();
+    }
+
+    private static WorkflowRun pausedRun(String runId) {
+        WorkflowRun paused = new WorkflowRun();
+        paused.setRunId(runId);
+        paused.setStatus("PAUSED");
+        paused.setControlStatus("HUMAN_INTERRUPT");
+        paused.setPauseRequested(1);
+        return paused;
     }
 }

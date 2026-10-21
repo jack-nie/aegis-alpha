@@ -35,7 +35,8 @@ async def resume_workflow(body: ResumeRequest):
     try:
         result = await workflow_engine.resume_workflow(
             thread_id=body.thread_id,
-            resume_value=body.resume_value or {"approved": True},
+            # No default: a missing decision must never be treated as approval.
+            resume_value=body.resume_value,
         )
         return result
     except Exception as e:

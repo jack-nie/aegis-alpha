@@ -41,6 +41,9 @@ aegis:
     # When true, stale research layouts (layoutVersion < 2) are async-written back to DB after read-path refresh.
     # Read-path version check always applies for research keys regardless of this flag.
     refresh-default-layouts: ${AEGIS_ALPHA_REFRESH_DEFAULT_LAYOUTS:false}
+    # Roles allowed to approve/reject runs paused at the approval gate (待确认: seed users only have
+    # portfolio_manager/research_user; add e.g. portfolio_manager here if they should approve).
+    approver-roles: ${AEGIS_ALPHA_APPROVER_ROLES:desk,admin}
   langchain:
     enabled: ${AEGIS_ALPHA_LANGCHAIN_ENABLED:true}
     engine-url: ${AEGIS_ALPHA_LANGCHAIN_ENGINE_URL:http://127.0.0.1:8787}

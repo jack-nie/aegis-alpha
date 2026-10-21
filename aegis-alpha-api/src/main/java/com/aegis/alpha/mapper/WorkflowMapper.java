@@ -83,6 +83,12 @@ public interface WorkflowMapper {
     @Update("update workflow_run set status = #{status}, started_at = #{startedAt}, completed_at = #{completedAt}, result_json = #{resultJson}, error_message = #{errorMessage}, node_count = #{nodeCount}, control_status = #{controlStatus}, pause_requested = coalesce(#{pauseRequested}, 0), cancel_requested = coalesce(#{cancelRequested}, 0) where run_id = #{runId}")
     void updateRun(WorkflowRun run);
 
+    /** Compare-and-set on control_status; returns the number of rows changed (0 = lost the race). */
+    @Update("update workflow_run set control_status = #{toStatus} where run_id = #{runId} and control_status = #{fromStatus}")
+    int transitionControlStatus(@Param("runId") String runId,
+                                @Param("fromStatus") String fromStatus,
+                                @Param("toStatus") String toStatus);
+
     @Insert("insert into workflow_node_run(node_run_id, run_id, node_id, node_name, node_type, agent_id, status, input_json, output_json, error_message, started_at, completed_at, sort_order, attempt, max_attempts, retry_policy_json, timeout_ms) values(#{nodeRunId}, #{runId}, #{nodeId}, #{nodeName}, #{nodeType}, #{agentId}, #{status}, #{inputJson}, #{outputJson}, #{errorMessage}, #{startedAt}, #{completedAt}, #{sortOrder}, coalesce(#{attempt}, 1), coalesce(#{maxAttempts}, 1), #{retryPolicyJson}, #{timeoutMs})")
     void insertNodeRun(WorkflowNodeRun nodeRun);
 

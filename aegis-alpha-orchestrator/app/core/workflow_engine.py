@@ -99,6 +99,16 @@ class WorkflowState(TypedDict):
     messages: Annotated[list[Any], concat_lists]
 
 
+
+def is_valid_resume_value(value: Any) -> bool:
+    """A resume payload must carry an explicit boolean decision."""
+    return isinstance(value, dict) and isinstance(value.get("approved"), bool)
+
+
+def is_explicit_approval(value: Any) -> bool:
+    """Only ``{"approved": True}`` approves; anything else (missing, None, truthy strings) rejects."""
+    return is_valid_resume_value(value) and value.get("approved") is True
+
 class WorkflowEngine:
     """LangGraph-based workflow orchestration engine."""
 
@@ -434,9 +444,10 @@ class WorkflowEngine:
                         if k != "marketDataContext"
                     },
                 })
-                if response and not response.get("approved"):
-                    return {"final_state": {"approval_status": "rejected"}}
-                return {"final_state": {"approval_status": "approved"}}
+                # Fail closed: only an explicit boolean approval releases the aggregate node.
+                if is_explicit_approval(response):
+                    return {"final_state": {"approval_status": "approved"}}
+                return {"final_state": {"approval_status": "rejected"}}
 
             graph.add_node("approval_gate", approval_gate)
 
@@ -520,7 +531,15 @@ class WorkflowEngine:
                 graph.add_edge(edge.source, target)
 
         if require_approval and aggregate_node:
-            graph.add_edge("approval_gate", aggregate_node.id)
+            def route_after_approval(state: WorkflowState, _target: str = aggregate_node.id) -> str:
+                status = (state.get("final_state") or {}).get("approval_status")
+                return _target if status == "approved" else END
+
+            graph.add_conditional_edges(
+                "approval_gate",
+                route_after_approval,
+                {aggregate_node.id: aggregate_node.id, END: END},
+            )
 
         for node in nodes:
             if not outgoing[node.id] and node.id not in agent_nodes:
@@ -1115,6 +1134,12 @@ class WorkflowEngine:
         When unknown, defaults require_approval=True because resume is used for
         approval-gate interrupts.
         """
+        if not is_valid_resume_value(resume_value):
+            return WorkflowResult(
+                ok=False,
+                error="resume_value must be an object with a boolean 'approved' field",
+                final_state={},
+            )
         meta = dict(self._thread_meta.get(thread_id) or {})
         had_layout = bool(meta.get("nodes")) and bool(meta.get("edges"))
         if nodes is None:
@@ -1155,7 +1180,7 @@ class WorkflowEngine:
         try:
             from langgraph.types import Command as LgCommand
             final_state = await graph.ainvoke(
-                LgCommand(resume=resume_value or {"approved": True}),
+                LgCommand(resume=resume_value),
                 config=config,
                 **self._graph_run_kwargs(),
             )
