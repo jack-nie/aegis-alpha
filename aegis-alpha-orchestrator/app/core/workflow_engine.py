@@ -101,6 +101,68 @@ class WorkflowState(TypedDict):
 
 
 
+# Size cap for the final_state carried by the SSE workflow_complete event (JSON characters).
+STREAM_FINAL_STATE_MAX_CHARS = 16000
+_STREAM_SUMMARY_CHARS = 600
+_STREAM_SIGNALS_MAX = 5
+_STREAM_RECOMMENDATION_KEYS = (
+    "recommendation", "confidence", "missingData", "degraded", "forcedInsufficient", "claims",
+)
+
+
+def build_stream_final_state(
+    final_state: dict[str, Any] | None,
+    node_outputs: dict[str, Any] | None,
+    *,
+    max_chars: int = STREAM_FINAL_STATE_MAX_CHARS,
+) -> dict[str, Any]:
+    """Trimmed final_state for ``workflow_complete``: recommendation + per-node summary/signals.
+
+    Never the raw graph state (prompts, tool dumps, memory); bounded by ``max_chars`` of JSON.
+    """
+    final_state = final_state if isinstance(final_state, dict) else {}
+    node_outputs = node_outputs if isinstance(node_outputs, dict) else {}
+    nodes: dict[str, Any] = {}
+    recommendation: dict[str, Any] = {}
+    for node_id, payload in node_outputs.items():
+        if not isinstance(payload, dict):
+            continue
+        summary = payload.get("summary")
+        signals = payload.get("signals") if isinstance(payload.get("signals"), list) else []
+        nodes[str(node_id)] = {
+            "handler": payload.get("handler", ""),
+            "ok": payload.get("ok", True),
+            "degraded": bool(payload.get("degraded", False)),
+            "summary": (str(summary) if summary is not None else "")[:_STREAM_SUMMARY_CHARS],
+            "signals": signals[:_STREAM_SIGNALS_MAX],
+        }
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+        if payload.get("handler") == "finance.stock_recommendation_aggregate" or "recommendation" in data:
+            recommendation = {k: data[k] for k in _STREAM_RECOMMENDATION_KEYS if k in data}
+    evidence = final_state.get("evidence")
+    trimmed: dict[str, Any] = {
+        "ticker": final_state.get("ticker") or final_state.get("symbol"),
+        "subject": final_state.get("subject"),
+        "recommendation": recommendation,
+        "nodes": nodes,
+        "evidenceIds": sorted(str(k) for k in evidence) if isinstance(evidence, dict) else [],
+    }
+
+    def size(value: Any) -> int:
+        return len(json.dumps(value, ensure_ascii=False, default=str))
+
+    if size(trimmed) > max_chars:
+        recommendation.pop("claims", None)
+        for entry in nodes.values():
+            entry["summary"] = entry["summary"][:160]
+            entry["signals"] = entry["signals"][:2]
+        trimmed["truncated"] = True
+    while size(trimmed) > max_chars and nodes:
+        nodes.pop(next(iter(nodes)))
+        trimmed["truncated"] = True
+    return trimmed
+
+
 def is_valid_resume_value(value: Any) -> bool:
     """A resume payload must carry an explicit boolean decision."""
     return isinstance(value, dict) and isinstance(value.get("approved"), bool)
@@ -960,6 +1022,8 @@ class WorkflowEngine:
 
         degraded_reasons: list[str] = []
         saw_interrupt = False
+        streamed_state: dict[str, Any] = dict(state or {})
+        streamed_outputs: dict[str, Any] = {}
         try:
             async for chunk in graph.astream(
                 initial_state,
@@ -979,6 +1043,10 @@ class WorkflowEngine:
                         continue
                     if not isinstance(update, dict):
                         continue
+                    if isinstance(update.get("final_state"), dict):
+                        streamed_state = deep_merge(streamed_state, update["final_state"])
+                    if isinstance(update.get("node_outputs"), dict):
+                        streamed_outputs.update(update["node_outputs"])
                     trace_entry = (update.get("trace") or [{}])[0]
                     if _is_tools_node_name(str(node_name)):
                         yield SSEEvent(
@@ -1035,7 +1103,11 @@ class WorkflowEngine:
                 yield SSEEvent(event="degraded", data={"ok": True, "reasons": unique_reasons})
             yield SSEEvent(
                 event="workflow_complete",
-                data={"ok": True, "degraded": bool(degraded_reasons)},
+                data={
+                    "ok": True,
+                    "degraded": bool(degraded_reasons),
+                    "final_state": build_stream_final_state(streamed_state, streamed_outputs),
+                },
             )
         except GraphInterrupt:
             yield SSEEvent(
@@ -1076,6 +1148,8 @@ class WorkflowEngine:
         )
 
         saw_interrupt = False
+        streamed_state: dict[str, Any] = dict(state or {})
+        streamed_outputs: dict[str, Any] = {}
         try:
             async for chunk in graph.astream(
                 initial_state,
@@ -1095,6 +1169,10 @@ class WorkflowEngine:
                         continue
                     if not isinstance(update, dict):
                         continue
+                    if isinstance(update.get("final_state"), dict):
+                        streamed_state = deep_merge(streamed_state, update["final_state"])
+                    if isinstance(update.get("node_outputs"), dict):
+                        streamed_outputs.update(update["node_outputs"])
                     trace_entry = (update.get("trace") or [{}])[0]
 
                     if aggregate_node and node_name == aggregate_node.id:
@@ -1149,7 +1227,10 @@ class WorkflowEngine:
 
             if saw_interrupt:
                 return
-            yield SSEEvent(event="workflow_complete", data={"ok": True})
+            yield SSEEvent(
+                event="workflow_complete",
+                data={"ok": True, "final_state": build_stream_final_state(streamed_state, streamed_outputs)},
+            )
         except GraphInterrupt:
             yield SSEEvent(
                 event="human_interrupt",

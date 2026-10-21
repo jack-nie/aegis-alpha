@@ -1,0 +1,41 @@
+{
+  "description": "Shared SSE contract for /stream-workflow (Java WorkflowService.startWithStreaming <-> Python WorkflowEngine.stream_workflow). Python tests assert produced events carry these keys; Java tests replay these events.",
+  "maxFinalStateChars": 16000,
+  "nodeUpdateKeys": ["nodeId", "nodeName", "handler", "status", "ok", "degraded", "startedAt", "completedAt", "durationMs"],
+  "finalStateKeys": ["ticker", "subject", "recommendation", "nodes", "evidenceIds"],
+  "finalStateNodeKeys": ["handler", "ok", "degraded", "summary", "signals"],
+  "events": [
+    {
+      "event": "node_update",
+      "data": {"nodeId": "start", "nodeName": "start", "handler": "start", "status": "completed", "ok": true, "degraded": false,
+               "startedAt": "2026-10-21T01:00:00Z", "completedAt": "2026-10-21T01:00:00Z", "durationMs": 1}
+    },
+    {
+      "event": "node_update",
+      "data": {"nodeId": "market", "nodeName": "Market Analysis", "handler": "finance.market_analysis", "status": "completed", "ok": true, "degraded": false,
+               "startedAt": "2026-10-21T01:00:00Z", "completedAt": "2026-10-21T01:00:01Z", "durationMs": 120}
+    },
+    {
+      "event": "node_update",
+      "data": {"nodeId": "aggregate", "nodeName": "Report", "handler": "finance.stock_recommendation_aggregate", "status": "completed", "ok": true, "degraded": false,
+               "startedAt": "2026-10-21T01:00:01Z", "completedAt": "2026-10-21T01:00:02Z", "durationMs": 340}
+    },
+    {
+      "event": "workflow_complete",
+      "data": {
+        "ok": true,
+        "degraded": false,
+        "final_state": {
+          "ticker": "AAPL",
+          "subject": "AAPL analysis",
+          "recommendation": {"recommendation": "HOLD", "confidence": 0.55, "missingData": []},
+          "nodes": {
+            "market": {"handler": "finance.market_analysis", "ok": true, "degraded": false, "summary": "Price trend neutral", "signals": []},
+            "aggregate": {"handler": "finance.stock_recommendation_aggregate", "ok": true, "degraded": false, "summary": "HOLD AAPL", "signals": []}
+          },
+          "evidenceIds": ["ev-market-0123456789ab"]
+        }
+      }
+    }
+  ]
+}

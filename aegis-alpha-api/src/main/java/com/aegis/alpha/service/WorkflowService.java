@@ -37,6 +37,7 @@ import java.util.Queue;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.Executor;
+import java.util.concurrent.atomic.AtomicInteger;
 
 @Service
 public class WorkflowService {
@@ -601,25 +602,26 @@ public class WorkflowService {
         String streamBody = langChainGateway.buildStreamBody(
                 runLayout, subject, safeInputs, delegatedToken, run.getRunId(), requireApproval);
         final String runId = run.getRunId();
+        // P1-16: monotonic sort order for streamed node events; node_update upserts workflow_node_run.
+        final AtomicInteger streamSequence = new AtomicInteger(0);
+        final Map<String, WorkflowNodeRun> streamedNodeRuns = new LinkedHashMap<>();
+        final Map<String, Map<String, Object>> streamLayoutNodes = new LinkedHashMap<>();
+        for (Map<String, Object> layoutNode : castList(runLayout.get("nodes"))) {
+            streamLayoutNodes.put(nodeId(layoutNode), layoutNode);
+        }
         SseStreamReader.readSse(streamUrl, streamBody, langChainGateway.serviceAuthorizationHeader(),
                 new SseStreamReader.SseEventHandler() {
             @Override public void onEvent(String eventName, String data) {
                 try {
                     if ("node_update".equals(eventName)) {
-                        JsonNode nd = objectMapper.readTree(data);
-                        String nodeId = nd.has("nodeId") ? nd.get("nodeId").asText() : "unknown";
-                        String nodeName = nd.has("nodeName") ? nd.get("nodeName").asText() : nodeId;
-                        WorkflowRunEvent ev = new WorkflowRunEvent();
-                        ev.setEventId(UUID.randomUUID().toString());
-                        ev.setRunId(runId);
-                        ev.setEventType("NODE_COMPLETED");
-                        ev.setNodeId(nodeId);
-                        ev.setStatus("COMPLETED");
-                        ev.setMessage("Node completed: " + nodeName);
-                        ev.setPayloadJson(data);
-                        ev.setCreatedAt(now());
-                        ev.setSortOrder(0);
-                        mapper.insertRunEvent(ev);
+                        Map<String, Object> nodePayload = parseJsonMap(data);
+                        WorkflowNodeRun nodeRun = upsertStreamedNodeRun(run, nodePayload, streamedNodeRuns,
+                                streamLayoutNodes, streamSequence.incrementAndGet());
+                        boolean nodeOk = "COMPLETED".equals(nodeRun.getStatus());
+                        recordRunEvent(run, nodeOk ? "NODE_COMPLETED" : "NODE_FAILED", nodeRun, nodeRun.getNodeId(),
+                                nodeRun.getStatus(), (nodeOk ? "Node completed: " : "Node failed: ") + nodeRun.getNodeName(),
+                                nodePayload, nodeRun.getSortOrder() + 1);
+                        recordStreamedNodeSpan(run, nodeRun, nodePayload);
                         emitter.send(org.springframework.web.servlet.mvc.method.annotation.SseEmitter.event().name("node_update").data(data));
                     } else if ("degraded".equals(eventName)) {
                         Map<String, Object> payload = parseJsonMap(data);
@@ -650,6 +652,7 @@ public class WorkflowService {
                         run.setControlStatus("COMPLETED");
                         run.setPauseRequested(0);
                         run.setCancelRequested(0);
+                        run.setNodeCount(streamedNodeRuns.size());
                         Map<String, Object> result = buildStreamingCompleteResult(payload, degraded);
                         if (degraded) {
                             if (run.getErrorMessage() == null || run.getErrorMessage().trim().isEmpty()) {
@@ -712,6 +715,62 @@ public class WorkflowService {
             }
         });
         return mapper.findRun(runId);
+    }
+
+    /**
+     * Upsert one workflow_node_run per streamed node id (repeat updates, e.g. agent/tool loops, update the row).
+     * sortOrder = sequence * 100 so streamed rows/events keep the arrival order.
+     */
+    WorkflowNodeRun upsertStreamedNodeRun(WorkflowRun run, Map<String, Object> payload,
+                                          Map<String, WorkflowNodeRun> streamedNodeRuns,
+                                          Map<String, Map<String, Object>> layoutNodes, int sequence) {
+        String nodeId = firstNonBlank(string(payload.get("nodeId")), null, "unknown");
+        boolean ok = !Boolean.FALSE.equals(payload.get("ok"))
+                && !"failed".equalsIgnoreCase(String.valueOf(payload.get("status")));
+        WorkflowNodeRun nodeRun = streamedNodeRuns.get(nodeId);
+        boolean exists = nodeRun != null;
+        if (!exists) {
+            Map<String, Object> layoutNode = layoutNodes.get(nodeId);
+            nodeRun = new WorkflowNodeRun();
+            nodeRun.setNodeRunId(UUID.randomUUID().toString());
+            nodeRun.setRunId(run.getRunId());
+            nodeRun.setNodeId(nodeId);
+            String nodeName = string(payload.get("nodeName"));
+            nodeRun.setNodeName(nodeName == null || nodeName.isEmpty()
+                    ? (layoutNode == null ? nodeId : nodeName(layoutNode)) : nodeName);
+            nodeRun.setNodeType(layoutNode == null ? null : nodeType(layoutNode));
+            nodeRun.setAgentId(layoutNode == null ? null : agentId(layoutNode));
+            nodeRun.setAttempt(1);
+            nodeRun.setMaxAttempts(1);
+            nodeRun.setStartedAt(firstNonBlank(string(payload.get("startedAt")), null, now()));
+            nodeRun.setSortOrder(sequence * 100);
+        } else {
+            nodeRun.setAttempt((nodeRun.getAttempt() == null ? 1 : nodeRun.getAttempt()) + 1);
+        }
+        nodeRun.setStatus(ok ? "COMPLETED" : "FAILED");
+        nodeRun.setOutputJson(toJson(payload));
+        nodeRun.setCompletedAt(firstNonBlank(string(payload.get("completedAt")), null, now()));
+        if (exists) {
+            mapper.updateNodeRun(nodeRun);
+        } else {
+            mapper.insertNodeRun(nodeRun);
+            streamedNodeRuns.put(nodeId, nodeRun);
+        }
+        return nodeRun;
+    }
+
+    private void recordStreamedNodeSpan(WorkflowRun run, WorkflowNodeRun nodeRun, Map<String, Object> payload) {
+        if (agentTraceService == null) {
+            return;
+        }
+        try {
+            Map<String, Object> input = new LinkedHashMap<>();
+            input.put("nodeId", nodeRun.getNodeId());
+            input.put("source", "stream");
+            agentTraceService.recordNodeSpan(run, nodeRun, string(payload.get("handler")), input, payload);
+        } catch (Exception ignored) {
+            // span recording must never break the client stream
+        }
     }
 
     private void materializeStreamingCompletedRun(String runId, Map<String, Object> inputs) {
