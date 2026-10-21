@@ -91,7 +91,7 @@ class ChatServiceSecurityTest {
         when(workflowMapper.findRunEvents(anyString())).thenReturn(Collections.<WorkflowRunEvent>emptyList());
         when(workflowMapper.findNodeRuns(anyString())).thenReturn(Collections.<WorkflowNodeRun>emptyList());
         /* Mockito returns an empty Map for Map-returning mocks; a cache "hit" would short-circuit reply(). */
-        when(helpAnswerCacheService.getIfAllowed(anyString(), any())).thenReturn(null);
+        when(helpAnswerCacheService.getIfAllowed(anyString(), any(), any())).thenReturn(null);
         when(langChainGateway.runAgent(any(), any(), any(), any())).thenAnswer(invocation -> {
             Map<String, Object> result = new LinkedHashMap<String, Object>();
             result.put("content", "copilot reply");

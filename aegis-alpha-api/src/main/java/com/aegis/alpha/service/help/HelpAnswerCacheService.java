@@ -1,28 +1,42 @@
 package com.aegis.alpha.service.help;
 
+import com.aegis.alpha.security.AuthenticatedPrincipal;
 import com.aegis.alpha.service.CacheService;
 import org.springframework.stereotype.Service;
 
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.LongSupplier;
 
 /**
- * Layer-1 public help answer cache. Private entity queries must never get/put.
+ * Layer-1 help answer cache. Private entity queries must never get/put.
+ *
+ * <p>Entries are partitioned by tenant and by the caller's (sorted) role set, so an answer that
+ * was assembled from role-restricted documents can never be served to a caller with fewer roles.
+ * Answers built from known non-public sources are not cached at all. The in-process fallback
+ * layer is bounded (LRU) and honours the same TTL as Redis.</p>
  */
 @Service
 public class HelpAnswerCacheService {
     private static final Duration TTL = Duration.ofMinutes(30);
-    private static final String KEY_PREFIX = "help:answer:v1:";
+    private static final String KEY_PREFIX = "help:answer:v2:";
+    static final int LOCAL_MAX_ENTRIES = 1000;
+    /** Per-request diagnostics that must not be replayed to other callers. */
+    private static final List<String> DIAGNOSTIC_FIELDS = Arrays.asList(
+            "helpLoop", "knowledge", "appliedFilter", "threadId", "traceId");
 
     private final CacheService cacheService;
-    /** Local fallback when Redis unavailable (dev/tests). */
-    private final ConcurrentHashMap<String, Map<String, Object>> local =
-            new ConcurrentHashMap<String, Map<String, Object>>();
+    /** Local fallback when Redis unavailable (dev/tests): bounded LRU with TTL. */
+    private final LinkedHashMap<String, LocalEntry> local = new LinkedHashMap<String, LocalEntry>(16, 0.75f, true);
+    private LongSupplier clock = System::currentTimeMillis;
 
     public HelpAnswerCacheService(CacheService cacheService) {
         this.cacheService = cacheService;
@@ -35,19 +49,32 @@ public class HelpAnswerCacheService {
         return message.trim().toLowerCase(Locale.ROOT).replaceAll("\\s+", " ");
     }
 
-    public String cacheKey(String normalizedMessage) {
-        return KEY_PREFIX + sha256Hex(normalizedMessage);
+    /** Partitioned key: {@code help:answer:v2:{tenant}:{sha256(sorted roles)}:{sha256(message)}}. */
+    public String cacheKey(String normalizedMessage, AuthenticatedPrincipal principal) {
+        String tenant = principal == null || principal.getTenantId() == null || principal.getTenantId().trim().isEmpty()
+                ? "-"
+                : principal.getTenantId().trim();
+        List<String> roles = new ArrayList<String>();
+        if (principal != null && principal.getRoles() != null) {
+            for (String role : principal.getRoles()) {
+                if (role != null && !role.trim().isEmpty()) {
+                    roles.add(role.trim().toLowerCase(Locale.ROOT));
+                }
+            }
+        }
+        Collections.sort(roles);
+        return KEY_PREFIX + sha256Hex(tenant).substring(0, 16) + ":" + sha256Hex(String.join(",", roles)) + ":"
+                + sha256Hex(normalizedMessage);
     }
 
     /**
-     * @return cached chat response map or null
+     * @return cached chat response map for this caller's tenant/role partition, or null
      */
-    @SuppressWarnings("unchecked")
-    public Map<String, Object> getIfAllowed(String message, HelpIntent.Result intent) {
+    public Map<String, Object> getIfAllowed(String message, HelpIntent.Result intent, AuthenticatedPrincipal principal) {
         if (!isCacheable(intent, message)) {
             return null;
         }
-        String key = cacheKey(normalizeMessage(message));
+        String key = cacheKey(normalizeMessage(message), principal);
         try {
             Map<?, ?> fromRedis = cacheService.get(key, Map.class);
             if (fromRedis != null) {
@@ -56,11 +83,21 @@ public class HelpAnswerCacheService {
         } catch (Exception ignored) {
             // fall through to local
         }
-        Map<String, Object> localHit = local.get(key);
-        return localHit == null ? null : new LinkedHashMap<String, Object>(localHit);
+        synchronized (local) {
+            LocalEntry entry = local.get(key);
+            if (entry == null) {
+                return null;
+            }
+            if (clock.getAsLong() >= entry.expiresAt) {
+                local.remove(key);
+                return null;
+            }
+            return new LinkedHashMap<String, Object>(entry.value);
+        }
     }
 
-    public void putIfAllowed(String message, HelpIntent.Result intent, Map<String, Object> response) {
+    public void putIfAllowed(String message, HelpIntent.Result intent, Map<String, Object> response,
+                             AuthenticatedPrincipal principal) {
         if (!isCacheable(intent, message) || response == null) {
             return;
         }
@@ -71,15 +108,50 @@ public class HelpAnswerCacheService {
                 || "help-safety".equals(response.get("provider"))) {
             return;
         }
-        String key = cacheKey(normalizeMessage(message));
+        if (!publicSourcesOnly(response, principal)) {
+            return;
+        }
+        String key = cacheKey(normalizeMessage(message), principal);
         Map<String, Object> stored = new LinkedHashMap<String, Object>(response);
+        for (String field : DIAGNOSTIC_FIELDS) {
+            stored.remove(field);
+        }
         stored.put("cacheHit", true);
         try {
             cacheService.put(key, stored, TTL);
         } catch (Exception ignored) {
             // local only
         }
-        local.put(key, stored);
+        synchronized (local) {
+            local.put(key, new LocalEntry(stored, clock.getAsLong() + TTL.toMillis()));
+            while (local.size() > LOCAL_MAX_ENTRIES) {
+                local.remove(local.keySet().iterator().next());
+            }
+        }
+    }
+
+    /**
+     * True when the answer is known to come only from public material. Knowledge hits carry their
+     * visibility; a remote help-loop answer for a role-bearing caller has unknown provenance.
+     */
+    @SuppressWarnings("unchecked")
+    static boolean publicSourcesOnly(Map<String, Object> response, AuthenticatedPrincipal principal) {
+        Object knowledge = response.get("knowledge");
+        if (knowledge instanceof Map) {
+            Object hits = ((Map<String, Object>) knowledge).get("hits");
+            if (hits instanceof List) {
+                for (Object hit : (List<Object>) hits) {
+                    if (hit instanceof Map) {
+                        Object visibility = ((Map<String, Object>) hit).get("visibility");
+                        if (visibility != null && !"public".equalsIgnoreCase(String.valueOf(visibility).trim())) {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+        boolean elevated = principal != null && principal.getRoles() != null && !principal.getRoles().isEmpty();
+        return !(elevated && "help-loop-orch".equals(response.get("provider")));
     }
 
     public boolean isCacheable(HelpIntent.Result intent, String message) {
@@ -106,7 +178,29 @@ public class HelpAnswerCacheService {
 
     /** Test helper: clear local cache layer. */
     public void clearLocalForTest() {
-        local.clear();
+        synchronized (local) {
+            local.clear();
+        }
+    }
+
+    int localSizeForTest() {
+        synchronized (local) {
+            return local.size();
+        }
+    }
+
+    void setClock(LongSupplier clock) {
+        this.clock = clock;
+    }
+
+    private static final class LocalEntry {
+        private final Map<String, Object> value;
+        private final long expiresAt;
+
+        private LocalEntry(Map<String, Object> value, long expiresAt) {
+            this.value = value;
+            this.expiresAt = expiresAt;
+        }
     }
 
     private static boolean notEmpty(String value) {

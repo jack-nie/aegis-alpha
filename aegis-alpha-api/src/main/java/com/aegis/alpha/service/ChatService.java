@@ -183,7 +183,7 @@ public class ChatService {
 
         /* Public help answer cache (entity-gated; never private run/portfolio) */
         if (helpAnswerCacheService != null) {
-            Map<String, Object> cached = helpAnswerCacheService.getIfAllowed(message, intent);
+            Map<String, Object> cached = helpAnswerCacheService.getIfAllowed(message, intent, principal);
             if (cached != null) {
                 cached.put("threadId", threadId);
                 cached.put("cacheHit", true);
@@ -252,7 +252,7 @@ public class ChatService {
 
         if (helpResponse != null) {
             if (helpAnswerCacheService != null) {
-                helpAnswerCacheService.putIfAllowed(message, intent, helpResponse);
+                helpAnswerCacheService.putIfAllowed(message, intent, helpResponse, principal);
             }
             markTrace(trace, intent, text(helpResponse, "provider", "help"), false,
                     Boolean.TRUE.equals(helpResponse.get("escalateHuman")));
