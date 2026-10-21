@@ -49,13 +49,43 @@ def extract_market_facts(state: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def known_evidence_ids(state: dict[str, Any] | None) -> set[str] | None:
+    """Server-registered evidence ids from ``state['evidence']``.
+
+    ``None`` means the caller supplied no registry (legacy callers / fixtures without one); an
+    empty set means a registry exists and nothing is known, so every model-cited id is rejected.
+    """
+    if not isinstance(state, dict) or "evidence" not in state:
+        return None
+    registry = state.get("evidence")
+    ids: set[str] = set()
+    if isinstance(registry, dict):
+        ids = {str(key) for key in registry if str(key).strip()}
+    elif isinstance(registry, list):
+        for entry in registry:
+            if isinstance(entry, dict):
+                eid = entry.get("evidenceId") or entry.get("id")
+                if eid:
+                    ids.add(str(eid))
+            elif isinstance(entry, str) and entry.strip():
+                ids.add(entry.strip())
+    return ids
+
+
+def _market_evidence_id(state: dict[str, Any]) -> str:
+    ctx = state.get("marketDataContext") if isinstance(state, dict) else None
+    if isinstance(ctx, dict) and ctx.get("evidenceId"):
+        return str(ctx["evidenceId"])
+    return "market-context"
+
+
 def build_claims_from_state(state: dict[str, Any], evidence_ids: list[str] | None = None) -> list[dict[str, Any]]:
     """Create claim stubs from market context for traceability."""
     ctx = state.get("marketDataContext") or {}
     if not isinstance(ctx, dict):
         return []
     claims: list[dict[str, Any]] = []
-    evidence_id = (evidence_ids or ["market-context"])[0]
+    evidence_id = (evidence_ids or [_market_evidence_id(state)])[0]
     quote = ctx.get("quote") if isinstance(ctx.get("quote"), dict) else ctx
     if isinstance(quote, dict):
         price = quote.get("price", quote.get("last"))
@@ -110,8 +140,18 @@ def enforce_recommendation_policy(
     sources_list = _as_list(sources)
     facts = extract_market_facts(state)
 
+    known_ids = known_evidence_ids(state)
     if not claims_list:
+        # Server-built claims cite the hydrated snapshot, so their id is trusted.
         claims_list = build_claims_from_state(state)
+        if known_ids is not None:
+            known_ids = known_ids | {str(c.get("evidenceId")) for c in claims_list if c.get("evidenceId")}
+
+    def _bound(claim: dict[str, Any]) -> bool:
+        eid = claim.get("evidenceId")
+        if not eid:
+            return False
+        return known_ids is None or str(eid) in known_ids
 
     raw_label = (label or "").strip().upper().replace(" ", "_")
     if raw_label in ("STRONG_BUY", "STRONGBUY"):
@@ -132,9 +172,9 @@ def enforce_recommendation_policy(
         else:
             raw_label = "INSUFFICIENT_DATA"
 
-    has_price_claim = any(c.get("field") in ("last_price", "price") and c.get("evidenceId") for c in claims_list)
+    has_price_claim = any(c.get("field") in ("last_price", "price") and _bound(c) for c in claims_list)
     has_fin_claim = any(
-        c.get("field") in ("revenue", "netIncome", "eps", "financials") and c.get("evidenceId")
+        c.get("field") in ("revenue", "netIncome", "eps", "financials") and _bound(c)
         for c in claims_list
     )
     has_quote = facts["has_quote"] or has_price_claim
@@ -167,19 +207,27 @@ def enforce_recommendation_policy(
             forced_insufficient = True
             policy_degraded = True
 
-    # Unbound numeric claims (no evidenceId) are stripped
+    # Unbound claims (no evidenceId, or an id the server never issued) are stripped
     clean_claims: list[dict[str, Any]] = []
     stripped = 0
+    unknown = 0
     for claim in claims_list:
-        if claim.get("evidenceId"):
+        if _bound(claim):
             clean_claims.append(claim)
         else:
             stripped += 1
+            if claim.get("evidenceId"):
+                unknown += 1
     if stripped and raw_label in ACTIONABLE_LABELS:
         raw_label = "INSUFFICIENT_DATA"
         forced_insufficient = True
         policy_degraded = True
         missing_unique.append("claims_without_evidence")
+    if unknown:
+        # Cited ids the server never issued: always surfaced, whatever the label.
+        policy_degraded = True
+        if "claims_with_unknown_evidence" not in missing_unique:
+            missing_unique.append("claims_with_unknown_evidence")
 
     conf = float(confidence) if confidence is not None else 0.0
     if conf < 0:

@@ -245,3 +245,70 @@ async def test_aggregate_node_with_default_prompt_reaches_the_model(mock_node_ex
     )
     assert len(calls) == 1
     assert result.status != "model_failed"
+
+
+# ---------------- P1-13: server-issued evidence ids ----------------
+
+
+def test_register_market_evidence_is_stable_and_server_generated():
+    from app.core.node_executor import register_market_evidence
+
+    ctx = {"symbol": "AAPL", "quote": {"price": 1.0, "asOf": "2026-07-01"}}
+    first, entry = register_market_evidence(ctx)
+    again, _ = register_market_evidence(dict(ctx))
+    assert first["evidenceId"] == again["evidenceId"]
+    assert first["evidenceId"].startswith("ev-market-")
+    assert entry[first["evidenceId"]]["symbol"] == "AAPL"
+    assert register_market_evidence({"ok": False, "error": "x"})[1] == {}
+
+
+@pytest.mark.asyncio
+async def test_hydrated_node_reports_evidence_and_aggregate_rejects_forged_id(mock_node_executor):
+    from app.core.llm_client import LLMResponse
+
+    mock_node_executor._market_data.hydrate = AsyncMock(
+        return_value={"symbol": "AAPL", "quote": {"ok": True, "price": 10.0}, "financials": {"ok": True, "revenue": 5}}
+    )
+
+    async def _analyst(**kwargs):
+        return LLMResponse(summary="analyst", content="analyst")
+
+    mock_node_executor._llm_client.invoke = _analyst
+    analyst = await mock_node_executor.execute(
+        node=Node(id="m", data=NodeData(handler="finance.market_analysis")),
+        state={"ticker": "AAPL"},
+        subject="AAPL",
+    )
+    evidence = analyst.data.get("evidence")
+    assert isinstance(evidence, dict) and len(evidence) == 1
+    real_id = next(iter(evidence))
+
+    forged = (
+        'report\n```json\n{"recommendation":"BUY","confidence":0.9,'
+        '"claims":[{"field":"last_price","value":10.0,"evidenceId":"ev-forged"},'
+        '{"field":"revenue","value":5,"evidenceId":"ev-forged"}]}\n```'
+    )
+
+    async def _aggregate(**kwargs):
+        return LLMResponse(summary="report", content=forged)
+
+    mock_node_executor._llm_client.invoke = _aggregate
+    result = await mock_node_executor.execute(
+        node=Node(id="a", data=NodeData(handler="finance.stock_recommendation_aggregate")),
+        state={"ticker": "AAPL", "evidence": evidence},
+        subject="AAPL",
+    )
+    assert result.data.get("recommendation") == "INSUFFICIENT_DATA"
+
+    honest = forged.replace("ev-forged", real_id)
+
+    async def _aggregate_ok(**kwargs):
+        return LLMResponse(summary="report", content=honest)
+
+    mock_node_executor._llm_client.invoke = _aggregate_ok
+    ok = await mock_node_executor.execute(
+        node=Node(id="a", data=NodeData(handler="finance.stock_recommendation_aggregate")),
+        state={"ticker": "AAPL", "evidence": evidence},
+        subject="AAPL",
+    )
+    assert "claims_with_unknown_evidence" not in (ok.data.get("missingData") or [])

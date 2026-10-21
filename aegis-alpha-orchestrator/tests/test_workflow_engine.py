@@ -952,3 +952,16 @@ async def test_same_handler_different_prompt_does_not_hit_cache_and_hit_is_not_d
     finally:
         await manager.close()
         WorkflowEngine._graph_cache.clear()
+
+
+def test_merge_evidence_lifts_node_evidence_into_final_state():
+    from app.core.workflow_engine import WorkflowEngine, deep_merge
+    from app.models.responses import NodeResult
+
+    r1 = NodeResult(node_id="a", data={"evidence": {"ev-market-1": {"kind": "market_snapshot"}}})
+    r2 = NodeResult(node_id="b", data={"evidence": {"ev-market-2": {"kind": "market_snapshot"}}})
+    u1 = WorkflowEngine._merge_evidence({"a": {}}, r1)
+    u2 = WorkflowEngine._merge_evidence({"b": {}}, r2)
+    merged = deep_merge(deep_merge({}, u1), u2)
+    assert set(merged["evidence"]) == {"ev-market-1", "ev-market-2"}
+    assert "evidence" not in WorkflowEngine._merge_evidence({}, NodeResult(node_id="c"))
