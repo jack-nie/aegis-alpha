@@ -767,15 +767,13 @@ public class WorkflowService {
      * The orchestrator loads preferences from final_state.userId / user_id.
      * Streaming used to send inputs only, so an authenticated caller was dropped.
      */
-    private static void applyAuthenticatedUserId(Map<String, Object> safeInputs, String userId) {
+    static void applyAuthenticatedUserId(Map<String, Object> safeInputs, String userId) {
         if (userId == null || userId.trim().isEmpty() || safeInputs == null) {
             return;
         }
-        Object existingUserId = safeInputs.get("userId");
-        Object existingUserSnake = safeInputs.get("user_id");
-        if (hasText(existingUserId) || hasText(existingUserSnake)) {
-            return;
-        }
+        /* The authenticated id always wins: a client-supplied userId/user_id would otherwise select
+         * another user's memory and preferences in the orchestrator. */
+        safeInputs.remove("user_id");
         safeInputs.put("userId", userId.trim());
     }
 
