@@ -30,6 +30,7 @@ _SKIP_NODE_KEYS = frozenset(
         "tool_rounds",
         "last_agent_id",
         "approval_status",
+        "evidence",
     }
 )
 
@@ -237,6 +238,9 @@ def _render_protected(state: dict, cap_tokens: int) -> str:
     market = _render_market(state)
     tools = _render_latest_tools(state)
     memory = _render_memory(state)
+    evidence = _render_evidence_index(state)
+    if evidence:
+        memory = _join([evidence, memory])
     rendered = _join([market, tools, memory])
     if estimate_tokens(rendered) <= cap_tokens:
         return rendered
@@ -252,6 +256,25 @@ def _render_protected(state: dict, cap_tokens: int) -> str:
     if market:
         market = _render_market(state, compact=True)
     return _join([market, tools, memory])
+
+
+_EVIDENCE_INDEX_MAX = 20
+
+
+def _render_evidence_index(state: dict) -> str | None:
+    """Compact list of server-issued evidence ids the model may cite (others are rejected)."""
+    registry = state.get("evidence")
+    if not isinstance(registry, dict) or not registry:
+        return None
+    lines = ["## evidence (cite only these evidenceId values)"]
+    for eid, entry in list(registry.items())[:_EVIDENCE_INDEX_MAX]:
+        info = entry if isinstance(entry, dict) else {}
+        parts = [str(eid)]
+        for key in ("kind", "symbol", "asOf"):
+            if info.get(key):
+                parts.append(f"{key}={info[key]}")
+        lines.append("- " + " ".join(parts))
+    return "\n".join(lines)
 
 
 def _truncate_to_tokens(text: str, max_tokens: int) -> str:

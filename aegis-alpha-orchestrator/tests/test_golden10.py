@@ -89,7 +89,8 @@ FIXTURE_IDS = [str(f.get("id") or f"fixture_{i}") for i, f in enumerate(FIXTURES
 
 
 def test_golden10_fixture_count():
-    assert len(FIXTURES) == 10, f"Expected 10 golden fixtures, found {len(FIXTURES)} in {FIXTURES_DIR}"
+    # g11 (P1-13: forged evidenceId) extends the original golden-10 set.
+    assert len(FIXTURES) == 11, f"Expected 11 golden fixtures, found {len(FIXTURES)} in {FIXTURES_DIR}"
 
 
 @pytest.mark.parametrize("fixture", FIXTURES, ids=FIXTURE_IDS)
@@ -197,3 +198,25 @@ def test_golden10_actionable_without_full_evidence_cannot_pass():
             f"{fixture.get('id')}: incomplete evidence left actionable {policy['recommendation']}"
         )
         assert critique["ok"] is False, f"{fixture.get('id')}: incomplete evidence critique ok=True"
+
+
+def test_known_evidence_id_still_allows_buy():
+    """A BUY citing the server-issued id with quote + financial facts keeps its label."""
+    state = {
+        "symbol": "MSFT",
+        "evidence": {"ev-market-abc": {"kind": "market_snapshot"}},
+        "marketDataContext": {
+            "evidenceId": "ev-market-abc",
+            "quote": {"ok": True, "price": 100.0},
+            "financials": {"ok": True, "revenue": 1, "netIncome": 1},
+        },
+    }
+    claims = [
+        {"field": "last_price", "value": 100.0, "evidenceId": "ev-market-abc"},
+        {"field": "revenue", "value": 1, "evidenceId": "ev-market-abc"},
+    ]
+    policy = enforce_recommendation_policy(
+        label="BUY", confidence=0.8, state=state, claims=claims, sources=[{"id": "ev-market-abc"}]
+    )
+    assert policy["recommendation"] == "BUY"
+    assert policy["forcedInsufficient"] is False

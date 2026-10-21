@@ -303,6 +303,15 @@ class WorkflowEngine:
         return {**final_state, "memoryContext": memory_context}
 
     @staticmethod
+    def _merge_evidence(state_update: dict[str, Any], result: NodeResult) -> dict[str, Any]:
+        """Lift server-issued evidence ids from a node result into ``final_state.evidence``."""
+        data = result.data if isinstance(result.data, dict) else {}
+        evidence = data.get("evidence")
+        if isinstance(evidence, dict) and evidence:
+            state_update["evidence"] = {str(k): v for k, v in evidence.items()}
+        return state_update
+
+    @staticmethod
     def _annotate_trace(
         trace_entry: dict[str, Any],
         result_data: dict[str, Any] | None,
@@ -630,6 +639,7 @@ class WorkflowEngine:
                             state_update = {node.id: result.model_dump()}
                             if result.handler:
                                 state_update[result.handler] = result.model_dump()
+                            self._merge_evidence(state_update, result)
                             return {
                                 "final_state": state_update,
                                 "trace": [trace_entry],
@@ -716,6 +726,7 @@ class WorkflowEngine:
             state_update = {node.id: result.model_dump()}
             if result.handler:
                 state_update[result.handler] = result.model_dump()
+            self._merge_evidence(state_update, result)
             if is_agent_with_tools:
                 # Attribution for tools → agent return path
                 state_update["last_agent_id"] = node.id
@@ -864,6 +875,7 @@ class WorkflowEngine:
         }
         if result.handler:
             state_update[result.handler] = result.model_dump()
+        self._merge_evidence(state_update, result)
 
         out: dict[str, Any] = {
             "final_state": state_update,
