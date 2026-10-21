@@ -131,7 +131,8 @@ async def test_invoke_llm_assembles_budgeted_context_and_token_usage(mock_node_e
     assert "CONCLUSION_SENTINEL" in context
     assert "OLD_BLOB_SHOULD_BE_DROPPED" not in context
     assert "old-summary" in context
-    assert "[compressed]" in context
+    # P1-8: nodes no longer carry their raw payload, so the old node fits instead of being compressed.
+    assert context.count("## node:old_analysis") == 1
     assert "META_SHOULD_BE_SKIPPED" not in context
 
     full_json = json.dumps(state)
@@ -225,7 +226,6 @@ def test_estimate_tokens_and_direct_assembly_rules():
     assert "momentum" in text
     assert "ev-direct-1" in text
     assert "old-summary" in text
-    assert "[compressed]" in text
     assert "DROP_ME" not in text
     assert not json.dumps(fallback_state).startswith(text)
 
@@ -241,7 +241,9 @@ def test_estimate_tokens_and_direct_assembly_rules():
         token_budget=50,
     )
     assert "MARKET_KEEP" in forced
-    assert "M" * 8000 in forced
+    # P1-8: protected blocks are capped at 60% of the budget; market extras are truncated.
+    assert "M" * 8000 not in forced
+    assert "[truncated]" in forced
     assert "[compressed]" in forced
     assert "keep-summary-but-compress" in forced
     assert "should_hide_signal" not in forced
@@ -295,3 +297,54 @@ def test_small_memory_block_is_not_marked_truncated():
     block = ca._render_memory({"memoryContext": {"hitCount": 1, "snippets": [{"text": "prefers tech"}]}})
     assert "> prefers tech" in block
     assert ca.TRUNCATED_MARKER not in block
+
+
+# ---------------- P1-8: dedup, CJK token estimate, protected cap ----------------
+
+
+def test_node_stored_under_id_and_handler_is_rendered_once():
+    result = {"node_id": "n-tech", "handler": "technical", "summary": "TECH_ONCE", "signals": []}
+    state = {"n-tech": dict(result), "technical": dict(result)}
+    text = assemble_model_context(state)
+    assert text.count("TECH_ONCE") == 1
+    assert "## node:n-tech" in text
+    assert "## node:technical" not in text
+
+
+def test_full_node_renders_whitelisted_data_only():
+    state = {
+        "n1": {
+            "node_id": "n1",
+            "summary": "s",
+            "signals": [],
+            "data": {"recommendation": "HOLD", "rawToolDump": "SECRET_INTERNAL_DUMP"},
+            "provider": "PROVIDER_INTERNAL",
+        }
+    }
+    text = assemble_model_context(state)
+    assert "HOLD" in text
+    assert "SECRET_INTERNAL_DUMP" not in text
+    assert "PROVIDER_INTERNAL" not in text
+
+
+def test_estimate_tokens_counts_cjk_per_character():
+    assert estimate_tokens("中" * 2000) >= 2000
+    assert estimate_tokens("abcd" * 10) == 10
+
+
+def test_oversized_tool_result_is_truncated_and_quote_kept():
+    state = {
+        "marketDataContext": {
+            "symbol": "NVDA",
+            "price": 123.45,
+            "changePercent": 1.2,
+            "news": [{"title": f"news-{i}", "body": "N" * 500} for i in range(30)],
+        },
+        "latestToolResults": {"output": "T" * 50000},
+    }
+    text = assemble_model_context(state, token_budget=2000)
+    assert "[truncated]" in text
+    assert "T" * 50000 not in text
+    assert '"price": 123.45' in text
+    assert '"symbol": "NVDA"' in text
+    assert estimate_tokens(text) <= 2000
