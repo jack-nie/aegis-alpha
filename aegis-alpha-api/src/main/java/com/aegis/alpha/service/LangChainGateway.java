@@ -216,6 +216,42 @@ public class LangChainGateway {
         }
     }
 
+    /** True when the external LangGraph orchestrator is the configured execution engine. */
+    public boolean isEnabled() {
+        return enabled;
+    }
+
+    /**
+     * Run a whole workflow on the orchestrator ({@code POST /execute-workflow}) with the run id as the
+     * LangGraph thread id, so approval interrupts can later be resumed by {@link #resumeWorkflow}.
+     *
+     * @throws IllegalStateException when the orchestrator is disabled, unreachable or returns no body;
+     *         callers treat that as a run failure instead of fabricating node output.
+     */
+    @SuppressWarnings("unchecked")
+    public Map<String, Object> executeWorkflow(Map<String, Object> layout, String subject, Map<String, Object> state,
+                                               String delegatedToken, String threadId, boolean requireApproval) {
+        if (!enabled) {
+            throw new IllegalStateException("LangGraph orchestrator disabled");
+        }
+        String body = buildStreamBody(layout, subject, state, delegatedToken, threadId, requireApproval);
+        HttpHeaders headers = new HttpHeaders();
+        headers.setContentType(MediaType.APPLICATION_JSON);
+        applyServiceAuth(headers);
+        Object response;
+        try {
+            response = restTemplate.postForObject(
+                    trimSlash(engineUrl) + "/execute-workflow", new HttpEntity<String>(body, headers), Object.class);
+        } catch (Exception ex) {
+            log.warn("[LangChainGateway] execute-workflow failed: type={}", ex.getClass().getSimpleName());
+            throw new IllegalStateException("Orchestrator execute-workflow call failed: " + ex.getClass().getSimpleName(), ex);
+        }
+        if (!(response instanceof Map)) {
+            throw new IllegalStateException("Unexpected execute-workflow response");
+        }
+        return (Map<String, Object>) response;
+    }
+
     /**
      * Resume a paused approval thread. Does not throw: disabled or failed calls return ok=false.
      */
