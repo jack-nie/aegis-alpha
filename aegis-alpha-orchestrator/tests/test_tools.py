@@ -151,3 +151,78 @@ def test_set_extra_headers_authorization():
     assert headers["X-Trace"] == "1"
     client.clear_extra_headers()
     assert client._authorization_header() == "Bearer node-tok"
+
+# ---------------- P1-9: portfolio tools require delegation + numeric id ----------------
+
+
+def _portfolio_tools(delegated: str = ""):
+    from app.config import Settings
+    from app.core import tools as tools_mod
+
+    settings = Settings(
+        AEGIS_ALPHA_LANGCHAIN_API_KEY="test",
+        AEGIS_ALPHA_BACKEND_URL="http://localhost:5178",
+        AEGIS_ALPHA_NODE_EXECUTION_TOKEN="shared-node-token",
+        AEGIS_ALPHA_DELEGATED_TOKEN=delegated,
+    )
+    tools_mod._backend_client = None
+    built = {t.name: t for t in tools_mod.create_tools(settings)}
+    client = tools_mod.get_backend_client(settings)
+    response = MagicMock()
+    response.status_code = 200
+    response.json.return_value = {"positions": []}
+    http = AsyncMock()
+    http.get = AsyncMock(return_value=response)
+    http.is_closed = False
+    client._client = http
+    return tools_mod, built, http
+
+
+@pytest.mark.asyncio
+async def test_portfolio_tool_without_delegation_is_denied():
+    tools_mod, built, http = _portfolio_tools()
+    try:
+        for name in ("get_portfolio_positions", "get_portfolio_summary"):
+            result = await built[name].ainvoke({"portfolio_id": "1"})
+            assert result == {"error": "delegation_required", "status": "denied"}
+        http.get.assert_not_called()
+    finally:
+        tools_mod._backend_client = None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_id", ["1/../../admin", "abc", "", "1234567890123", "1?x=1"])
+async def test_portfolio_tool_rejects_invalid_id(bad_id):
+    tools_mod, built, http = _portfolio_tools()
+    try:
+        with tools_mod.use_authorization("delegation-token"):
+            result = await built["get_portfolio_positions"].ainvoke({"portfolio_id": bad_id})
+        assert result == {"error": "invalid_portfolio_id", "status": "denied"}
+        http.get.assert_not_called()
+    finally:
+        tools_mod._backend_client = None
+
+
+@pytest.mark.asyncio
+async def test_portfolio_tool_with_delegation_calls_backend():
+    tools_mod, built, http = _portfolio_tools()
+    try:
+        with tools_mod.use_authorization("delegation-token"):
+            result = await built["get_portfolio_summary"].ainvoke({"portfolio_id": "42"})
+        assert result == {"positions": []}
+        url = http.get.call_args.args[0]
+        assert url.endswith("/_backend/portfolio/42/summary")
+        assert http.get.call_args.kwargs["headers"]["Authorization"] == "Bearer delegation-token"
+    finally:
+        tools_mod._backend_client = None
+
+
+@pytest.mark.asyncio
+async def test_portfolio_tool_with_configured_delegated_token_calls_backend():
+    tools_mod, built, http = _portfolio_tools(delegated="env-delegation")
+    try:
+        result = await built["get_portfolio_positions"].ainvoke({"portfolio_id": "7"})
+        assert result == {"positions": []}
+        assert http.get.call_args.kwargs["headers"]["Authorization"] == "Bearer env-delegation"
+    finally:
+        tools_mod._backend_client = None
