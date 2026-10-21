@@ -11,6 +11,10 @@ import java.util.Map;
 /**
  * Workflow-first help loop: retrieve → grade → rewrite/re-retrieve (≤3) → draft or escalate.
  * Uses KnowledgeService with ACL pre-filter; does not invent run/portfolio facts.
+ *
+ * <p>Retrieval is the hybrid <b>lexical</b> pipeline of {@link KnowledgeService}
+ * (TF-IDF vector + keyword + RRF rerank, no neural embeddings). The mode actually used is carried
+ * into {@link LoopResult#retrievalMode} and surfaced by {@link LoopResult#toDiagnostics()}.</p>
  */
 @Service
 public class HelpLoopService {
@@ -29,10 +33,12 @@ public class HelpLoopService {
         Map<String, Object> lastFilter = new LinkedHashMap<String, Object>();
         String currentQuery = query;
         Grade lastGrade = Grade.fail("no_rounds");
+        String lastRetrievalMode = KnowledgeService.RETRIEVAL_MODE_HYBRID;
 
         for (int round = 1; round <= MAX_RETRIEVAL_ROUNDS; round++) {
             KnowledgeService.SearchResult search = knowledgeService.search(currentQuery, principalRoles, 5);
             lastFilter = search.getAppliedFilter();
+            lastRetrievalMode = search.getRetrievalMode();
             List<Map<String, Object>> chunks = new ArrayList<Map<String, Object>>();
             for (KnowledgeService.KnowledgeHit hit : search.getHits()) {
                 chunks.add(hit.toMap());
@@ -54,13 +60,13 @@ public class HelpLoopService {
 
             lastGrade = grade(query, allChunks);
             if (lastGrade.ok) {
-                return draftSuccess(query, allChunks, lastGrade, round, lastFilter);
+                return draftSuccess(query, allChunks, lastGrade, round, lastFilter, lastRetrievalMode);
             }
             if (round < MAX_RETRIEVAL_ROUNDS) {
                 currentQuery = rewriteQuery(query, currentQuery, round);
             }
         }
-        return escalate(query, allChunks, lastGrade, MAX_RETRIEVAL_ROUNDS, lastFilter);
+        return escalate(query, allChunks, lastGrade, MAX_RETRIEVAL_ROUNDS, lastFilter, lastRetrievalMode);
     }
 
     /**
@@ -114,7 +120,8 @@ public class HelpLoopService {
             List<Map<String, Object>> chunks,
             Grade grade,
             int rounds,
-            Map<String, Object> filter
+            Map<String, Object> filter,
+            String retrievalMode
     ) {
         StringBuilder sb = new StringBuilder();
         sb.append("## 知识库回答\n\n");
@@ -128,6 +135,7 @@ public class HelpLoopService {
             sb.append(string(chunk.get("excerpt"))).append("\n\n");
         }
         sb.append("_来源均经 ACL 预过滤后的公开/授权文档。私有 run/组合数据不会出现在知识索引中。_\n");
+        sb.append("_检索方式：词面向量（TF-IDF）+ 关键词 + RRF 融合（无神经嵌入，不含同义词/语义扩展）。_\n");
 
         LoopResult result = new LoopResult();
         result.ok = true;
@@ -137,6 +145,7 @@ public class HelpLoopService {
         result.grade = grade;
         result.chunks = chunks;
         result.appliedFilter = filter;
+        result.retrievalMode = retrievalMode;
         result.disclaimer = null;
         result.provider = "help-loop";
         return result;
@@ -147,7 +156,8 @@ public class HelpLoopService {
             List<Map<String, Object>> chunks,
             Grade grade,
             int rounds,
-            Map<String, Object> filter
+            Map<String, Object> filter,
+            String retrievalMode
     ) {
         LoopResult result = new LoopResult();
         result.ok = false;
@@ -157,6 +167,7 @@ public class HelpLoopService {
         result.grade = grade;
         result.chunks = chunks;
         result.appliedFilter = filter;
+        result.retrievalMode = retrievalMode;
         result.disclaimer = DEFAULT_DISCLAIMER;
         result.provider = "help-loop";
         return result;
@@ -230,6 +241,8 @@ public class HelpLoopService {
         public Grade grade;
         public List<Map<String, Object>> chunks;
         public Map<String, Object> appliedFilter;
+        /** Retrieval pipeline reported by the last {@link KnowledgeService.SearchResult}. */
+        public String retrievalMode;
         public String disclaimer;
         public String provider;
 
@@ -242,6 +255,7 @@ public class HelpLoopService {
             m.put("appliedFilter", appliedFilter);
             m.put("preFiltered", true);
             m.put("escalate", escalate);
+            m.put("retrievalMode", retrievalMode);
             return m;
         }
     }

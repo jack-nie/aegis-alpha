@@ -193,7 +193,7 @@ class ChatServiceHelpIntegrationTest {
 
         assertThat(response.get("provider")).isEqualTo("help-safety");
         assertThat(String.valueOf(response.get("content"))).contains("不能代为审批");
-        verify(workflowService, never()).createRun(anyString(), anyString(), any());
+        verify(workflowService, never()).createRun(anyString(), anyString(), any(), any());
         verify(langChainGateway, never()).runAgent(any(), any(), any(), any());
     }
 
@@ -201,7 +201,7 @@ class ChatServiceHelpIntegrationTest {
     void replyResearchWorkflowStillDispatches() {
         WorkflowRun run = new WorkflowRun();
         run.setRunId("cccccccc-dddd-eeee-ffff-000000000001");
-        when(workflowService.createRun(eq("daily"), anyString(), any())).thenReturn(run);
+        when(workflowService.createRun(eq("daily"), anyString(), any(), any())).thenReturn(run);
 
         Map<String, Object> response = chatService.reply(body("给我一份盘前日报", null));
 
@@ -210,7 +210,7 @@ class ChatServiceHelpIntegrationTest {
         assertThat(response.get("routeAction")).isEqualTo("DISPATCH_WORKFLOW");
         assertThat(response.get("workflowKey")).isEqualTo("daily");
         assertThat(response.get("runId")).isEqualTo(run.getRunId());
-        verify(workflowService).createRun(eq("daily"), anyString(), any());
+        verify(workflowService).createRun(eq("daily"), anyString(), any(), any());
         verify(langChainGateway, never()).runAgent(any(), any(), any(), any());
     }
 

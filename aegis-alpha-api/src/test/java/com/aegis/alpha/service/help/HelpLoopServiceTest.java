@@ -68,4 +68,40 @@ class HelpLoopServiceTest {
         HelpLoopService.Grade grade = helpLoopService.grade("如何审批 证据", chunks);
         assertThat(grade.ok).isTrue();
     }
+
+    @Test
+    void diagnosticsReportHybridRetrievalMode() {
+        HelpLoopService.LoopResult result = helpLoopService.run(
+                "如何运行 published 工作流 操作步骤 说明",
+                Collections.emptyList()
+        );
+
+        assertThat(result.retrievalMode).isEqualTo(KnowledgeService.RETRIEVAL_MODE_HYBRID);
+        assertThat(result.retrievalMode).isEqualTo("hybrid_tfidf_keyword_rrf");
+
+        Map<String, Object> diagnostics = result.toDiagnostics();
+        // Existing response shape is preserved…
+        assertThat(diagnostics).containsKeys("retrievalRounds", "maxRounds", "grade", "chunkCount",
+                "appliedFilter", "preFiltered", "escalate");
+        // …and the retrieval pipeline is now reported explicitly.
+        assertThat(diagnostics.get("retrievalMode")).isEqualTo("hybrid_tfidf_keyword_rrf");
+
+        // Chunks carry the per-hit hybrid diagnostics used to build that ranking.
+        assertThat(result.chunks).isNotEmpty();
+        assertThat(result.chunks.get(0)).containsKeys("id", "title", "score", "excerpt",
+                "fusedScore", "vectorScore", "keywordScore", "vectorRank", "keywordRank");
+    }
+
+    @Test
+    void escalateDiagnosticsAlsoCarryRetrievalMode() {
+        KnowledgeService empty = new KnowledgeService();
+        empty.replaceDocumentsForTest(Collections.emptyList());
+        HelpLoopService loop = new HelpLoopService(empty);
+
+        HelpLoopService.LoopResult result = loop.run("完全无关的 xyzzy-no-hit-query-999", Collections.emptyList());
+
+        assertThat(result.escalate).isTrue();
+        assertThat(result.toDiagnostics().get("retrievalMode"))
+                .isEqualTo(KnowledgeService.RETRIEVAL_MODE_HYBRID);
+    }
 }

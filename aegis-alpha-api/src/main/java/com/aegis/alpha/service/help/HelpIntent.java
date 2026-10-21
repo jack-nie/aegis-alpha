@@ -19,7 +19,7 @@ public final class HelpIntent {
         CHITCHAT
     }
 
-    /** L0=playbook, L1=vanilla RAG (P1), L2=help graph / diagnosis */
+    /** L0=playbook, L1=hybrid lexical retrieval (TF-IDF + keyword + RRF), L2=help graph / diagnosis */
     public enum Complexity {
         L0,
         L1,

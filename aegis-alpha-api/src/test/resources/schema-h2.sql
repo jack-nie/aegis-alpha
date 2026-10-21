@@ -1,3 +1,4 @@
+DROP TABLE IF EXISTS help_thread_state;
 DROP TABLE IF EXISTS chat_message;
 DROP TABLE IF EXISTS chat_thread;
 DROP TABLE IF EXISTS market_snapshot;
@@ -116,6 +117,8 @@ CREATE TABLE workflow_version (
 );
 CREATE TABLE workflow_run (
   run_id VARCHAR(64) PRIMARY KEY,
+  user_id VARCHAR(64),
+  tenant_id VARCHAR(64),
   workflow_key VARCHAR(128) NOT NULL,
   trace_id VARCHAR(64) NOT NULL,
   status VARCHAR(32) NOT NULL,
@@ -285,5 +288,17 @@ CREATE TABLE macro_quadrant (as_of_date VARCHAR(32) PRIMARY KEY, china INT, usa 
 CREATE TABLE credit_impulse (period VARCHAR(32) PRIMARY KEY, china VARCHAR(64), usa VARCHAR(64), europe VARCHAR(64), japan VARCHAR(64));
 CREATE TABLE market_indicator (name VARCHAR(64) PRIMARY KEY, value VARCHAR(64), subtitle VARCHAR(128));
 CREATE TABLE market_snapshot (symbol VARCHAR(32) PRIMARY KEY, name VARCHAR(128), change_pct DECIMAL(10, 4));
-CREATE TABLE chat_thread (thread_id VARCHAR(64) PRIMARY KEY, title VARCHAR(200));
+CREATE TABLE chat_thread (thread_id VARCHAR(64) PRIMARY KEY, user_id VARCHAR(64), tenant_id VARCHAR(64), title VARCHAR(200));
 CREATE TABLE chat_message (message_id VARCHAR(64) PRIMARY KEY, thread_id VARCHAR(64), role VARCHAR(32), content TEXT);
+CREATE TABLE help_thread_state (
+  thread_id VARCHAR(64) PRIMARY KEY,
+  user_id VARCHAR(64),
+  tenant_id VARCHAR(64),
+  goal VARCHAR(1024),
+  last_run_id VARCHAR(64),
+  last_domain VARCHAR(64),
+  last_route_action VARCHAR(64),
+  pending_clarification TINYINT NOT NULL DEFAULT 0,
+  checkpoint_json TEXT,
+  updated_at VARCHAR(32) NOT NULL DEFAULT ''
+);

@@ -52,13 +52,13 @@ class MarketDataServiceTest {
                 "",
                 "",
                 "",
-                4000);
+                8000);
 
         RestTemplate configured = (RestTemplate) ReflectionTestUtils.getField(defaultService, "restTemplate");
         assertThat(configured.getRequestFactory()).isInstanceOf(SimpleClientHttpRequestFactory.class);
         Object factory = configured.getRequestFactory();
-        assertThat(ReflectionTestUtils.getField(factory, "connectTimeout")).isEqualTo(4000);
-        assertThat(ReflectionTestUtils.getField(factory, "readTimeout")).isEqualTo(4000);
+        assertThat(ReflectionTestUtils.getField(factory, "connectTimeout")).isEqualTo(8000);
+        assertThat(ReflectionTestUtils.getField(factory, "readTimeout")).isEqualTo(8000);
     }
 
     @Test

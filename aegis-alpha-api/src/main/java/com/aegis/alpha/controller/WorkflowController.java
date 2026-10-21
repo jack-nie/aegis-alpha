@@ -1,14 +1,18 @@
 package com.aegis.alpha.controller;
 
+import com.aegis.alpha.config.AsyncConfig;
 import com.aegis.alpha.domain.WorkflowDefinition;
 import com.aegis.alpha.domain.WorkflowNodeRun;
 import com.aegis.alpha.domain.WorkflowRun;
 import com.aegis.alpha.domain.WorkflowRunEvent;
 import com.aegis.alpha.domain.WorkflowVersion;
+import com.aegis.alpha.security.AuthenticatedPrincipal;
 import com.aegis.alpha.service.AuthService;
 import com.aegis.alpha.service.TokenService;
 import com.aegis.alpha.service.WorkflowNodeExecutionService;
 import com.aegis.alpha.service.WorkflowService;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
@@ -18,7 +22,7 @@ import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executor;
 
 @RestController
 @RequestMapping("/_backend")
@@ -32,15 +36,19 @@ public class WorkflowController {
     private final WorkflowService workflowService;
     private final WorkflowNodeExecutionService workflowNodeExecutionService;
     private final TokenService tokenService;
+    private final Executor workflowExecutor;
 
+    @Autowired
     public WorkflowController(AuthService authService,
                               WorkflowService workflowService,
                               WorkflowNodeExecutionService workflowNodeExecutionService,
-                              TokenService tokenService) {
+                              TokenService tokenService,
+                              @Qualifier(AsyncConfig.WORKFLOW_EXECUTOR) Executor workflowExecutor) {
         this.authService = authService;
         this.workflowService = workflowService;
         this.workflowNodeExecutionService = workflowNodeExecutionService;
         this.tokenService = tokenService;
+        this.workflowExecutor = workflowExecutor;
     }
 
     @GetMapping("/workflows")
@@ -85,38 +93,42 @@ public class WorkflowController {
 
     @GetMapping("/workflow/runs")
     public ResponseEntity<List<WorkflowRun>> runs(@RequestHeader(value = "Authorization", required = false) String authorization) {
-        if (authService.me(authorization) == null) {
+        AuthenticatedPrincipal principal = authService.principal(authorization);
+        if (principal == null) {
             return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build();
         }
-        return ResponseEntity.ok(workflowService.runs());
+        return ResponseEntity.ok(workflowService.runsForPrincipal(principal));
     }
 
     @GetMapping("/workflow/runs/{runId}")
     public ResponseEntity<WorkflowRun> run(@RequestHeader(value = "Authorization", required = false) String authorization,
                                            @PathVariable String runId) {
-        if (authService.me(authorization) == null) {
+        AuthenticatedPrincipal principal = authService.principal(authorization);
+        if (principal == null) {
             return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build();
         }
-        WorkflowRun run = workflowService.run(runId);
+        WorkflowRun run = workflowService.runForPrincipal(runId, principal);
         return run == null ? ResponseEntity.notFound().build() : ResponseEntity.ok(run);
     }
 
     @GetMapping("/workflow/runs/{runId}/nodes")
     public ResponseEntity<List<WorkflowNodeRun>> nodeRuns(@RequestHeader(value = "Authorization", required = false) String authorization,
                                                           @PathVariable String runId) {
-        if (authService.me(authorization) == null) {
+        AuthenticatedPrincipal principal = authService.principal(authorization);
+        if (principal == null) {
             return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build();
         }
-        return ResponseEntity.ok(workflowService.nodeRuns(runId));
+        return ResponseEntity.ok(workflowService.nodeRunsForPrincipal(runId, principal));
     }
 
     @GetMapping("/workflow/runs/{runId}/events")
     public ResponseEntity<List<WorkflowRunEvent>> runEvents(@RequestHeader(value = "Authorization", required = false) String authorization,
                                                             @PathVariable String runId) {
-        if (authService.me(authorization) == null) {
+        AuthenticatedPrincipal principal = authService.principal(authorization);
+        if (principal == null) {
             return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build();
         }
-        return ResponseEntity.ok(workflowService.runEvents(runId));
+        return ResponseEntity.ok(workflowService.runEventsForPrincipal(runId, principal));
     }
 
     @GetMapping("/workflows/{workflowKey}/layout")
@@ -132,10 +144,19 @@ public class WorkflowController {
     public ResponseEntity<Map<String, Object>> saveLayout(@RequestHeader(value = "Authorization", required = false) String authorization,
                                                           @PathVariable String workflowKey,
                                                           @RequestBody Map<String, Object> body) {
-        if (authService.me(authorization) == null) {
+        Map<String, Object> me = authService.me(authorization);
+        if (me == null) {
             return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build();
         }
-        return ResponseEntity.ok(workflowService.saveLayout(workflowKey, body));
+        try {
+            return ResponseEntity.ok(workflowService.saveLayoutForUser(
+                    String.valueOf(me.get("username")), workflowKey, body));
+        } catch (WorkflowService.AccessDeniedException ex) {
+            Map<String, Object> error = new LinkedHashMap<String, Object>();
+            error.put("ok", false);
+            error.put("error", ex.getMessage());
+            return ResponseEntity.status(HttpStatus.FORBIDDEN).body(error);
+        }
     }
 
     @PostMapping("/workflows/{workflowKey}/publish-version")
@@ -145,7 +166,11 @@ public class WorkflowController {
         if (me == null) {
             return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build();
         }
-        return ResponseEntity.ok(workflowService.publishVersion(workflowKey, String.valueOf(me.get("username"))));
+        try {
+            return ResponseEntity.ok(workflowService.publishVersion(workflowKey, String.valueOf(me.get("username"))));
+        } catch (WorkflowService.AccessDeniedException ex) {
+            return ResponseEntity.status(HttpStatus.FORBIDDEN).build();
+        }
     }
 
     @PostMapping("/workflow/runs")
@@ -153,18 +178,19 @@ public class WorkflowController {
                                              @RequestHeader(value = "Idempotency-Key", required = false) String idempotencyKey,
                                              @RequestParam(value = "async", defaultValue = "false") boolean async,
                                              @RequestBody Map<String, Object> body) {
-        if (authService.me(authorization) == null) {
+        AuthenticatedPrincipal principal = authService.principal(authorization);
+        if (principal == null) {
             return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build();
         }
         String workflowKey = body == null ? null : string(body.get("workflowKey"));
         String subject = body == null ? null : string(body.get("subject"));
         WorkflowRun existing = workflowService.findIdempotentRun(workflowKey, subject, idempotencyKey);
-        if (existing != null) {
+        if (existing != null && workflowService.isRunAccessible(existing, principal)) {
             return ResponseEntity.ok(existing);
         }
         WorkflowRun run = async
-                ? workflowService.queueStart(workflowKey, subject, body == null ? null : objectMap(body.get("inputs")), idempotencyKey)
-                : workflowService.start(workflowKey, subject, body == null ? null : objectMap(body.get("inputs")), idempotencyKey);
+                ? workflowService.queueStart(workflowKey, subject, body == null ? null : objectMap(body.get("inputs")), idempotencyKey, principal)
+                : workflowService.start(workflowKey, subject, body == null ? null : objectMap(body.get("inputs")), idempotencyKey, principal);
         return ResponseEntity.status(async ? HttpStatus.ACCEPTED : HttpStatus.CREATED).body(run);
     }
 
@@ -174,17 +200,18 @@ public class WorkflowController {
                                                      @PathVariable String workflowKey,
                                                      @RequestParam(value = "async", defaultValue = "false") boolean async,
                                                      @RequestBody(required = false) Map<String, Object> body) {
-        if (authService.me(authorization) == null) {
+        AuthenticatedPrincipal principal = authService.principal(authorization);
+        if (principal == null) {
             return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build();
         }
         String subject = body == null ? null : string(body.get("subject"));
         WorkflowRun existing = workflowService.findIdempotentRun(workflowKey, subject, idempotencyKey);
-        if (existing != null) {
+        if (existing != null && workflowService.isRunAccessible(existing, principal)) {
             return ResponseEntity.ok(existing);
         }
         WorkflowRun run = async
-                ? workflowService.queueStart(workflowKey, subject, body == null ? null : objectMap(body.get("inputs")), idempotencyKey)
-                : workflowService.start(workflowKey, subject, body == null ? null : objectMap(body.get("inputs")), idempotencyKey);
+                ? workflowService.queueStart(workflowKey, subject, body == null ? null : objectMap(body.get("inputs")), idempotencyKey, principal)
+                : workflowService.start(workflowKey, subject, body == null ? null : objectMap(body.get("inputs")), idempotencyKey, principal);
         return ResponseEntity.status(async ? HttpStatus.ACCEPTED : HttpStatus.CREATED).body(run);
     }
 
@@ -192,20 +219,18 @@ public class WorkflowController {
     public SseEmitter streamWorkflow(@RequestHeader(value = "Authorization", required = false) String authorization,
                                       @PathVariable String workflowKey,
                                       @RequestBody(required = false) Map<String, Object> body) {
-        Map<String, Object> me = authService.me(authorization);
-        if (me == null) {
+        AuthenticatedPrincipal principal = authService.principal(authorization);
+        if (principal == null) {
             SseEmitter rejected = new SseEmitter();
             rejected.completeWithError(new RuntimeException("Unauthorized"));
             return rejected;
         }
         String subject = body == null ? null : string(body.get("subject"));
         Map<String, Object> inputs = body == null ? null : objectMap(body.get("inputs"));
-        final String userId = me.get("user_id") == null ? null : String.valueOf(me.get("user_id"));
-        final String tenantId = me.get("tenant_id") == null ? null : String.valueOf(me.get("tenant_id"));
         SseEmitter emitter = new SseEmitter(300000L);
-        CompletableFuture.runAsync(() -> {
+        workflowExecutor.execute(() -> {
             try {
-                workflowService.startWithStreaming(workflowKey, subject, inputs, emitter, userId, tenantId);
+                workflowService.startWithStreaming(workflowKey, subject, inputs, emitter, principal);
             } catch (Exception ex) {
                 try { emitter.completeWithError(ex); } catch (Exception ignored) {}
             }
@@ -216,8 +241,9 @@ public class WorkflowController {
     @PostMapping("/workflow/runs/{runId}/dispatch")
     public ResponseEntity<WorkflowRun> dispatchRun(@RequestHeader(value = "Authorization", required = false) String authorization,
                                                    @PathVariable String runId) {
-        if (authService.me(authorization) == null) {
-            return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build();
+        ResponseEntity<WorkflowRun> denied = requireRunAccess(authorization, runId);
+        if (denied != null) {
+            return denied;
         }
         return ResponseEntity.ok(workflowService.dispatchQueuedRun(runId));
     }
@@ -225,8 +251,9 @@ public class WorkflowController {
     @PostMapping("/workflow/runs/{runId}/pause")
     public ResponseEntity<WorkflowRun> pauseRun(@RequestHeader(value = "Authorization", required = false) String authorization,
                                                 @PathVariable String runId) {
-        if (authService.me(authorization) == null) {
-            return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build();
+        ResponseEntity<WorkflowRun> denied = requireRunAccess(authorization, runId);
+        if (denied != null) {
+            return denied;
         }
         return ResponseEntity.ok(workflowService.pauseRun(runId));
     }
@@ -234,8 +261,9 @@ public class WorkflowController {
     @PostMapping("/workflow/runs/{runId}/resume")
     public ResponseEntity<WorkflowRun> resumeRun(@RequestHeader(value = "Authorization", required = false) String authorization,
                                                  @PathVariable String runId) {
-        if (authService.me(authorization) == null) {
-            return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build();
+        ResponseEntity<WorkflowRun> denied = requireRunAccess(authorization, runId);
+        if (denied != null) {
+            return denied;
         }
         return ResponseEntity.ok(workflowService.resumeRun(runId));
     }
@@ -243,10 +271,26 @@ public class WorkflowController {
     @PostMapping("/workflow/runs/{runId}/cancel")
     public ResponseEntity<WorkflowRun> cancelRun(@RequestHeader(value = "Authorization", required = false) String authorization,
                                                  @PathVariable String runId) {
-        if (authService.me(authorization) == null) {
-            return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build();
+        ResponseEntity<WorkflowRun> denied = requireRunAccess(authorization, runId);
+        if (denied != null) {
+            return denied;
         }
         return ResponseEntity.ok(workflowService.cancelRun(runId));
+    }
+
+    /**
+     * Returns an error response when the caller is unauthenticated or cannot see the run;
+     * null means the caller may proceed. Missing and foreign runs intentionally look identical.
+     */
+    private ResponseEntity<WorkflowRun> requireRunAccess(String authorization, String runId) {
+        AuthenticatedPrincipal principal = authService.principal(authorization);
+        if (principal == null) {
+            return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build();
+        }
+        if (workflowService.runForPrincipal(runId, principal) == null) {
+            return ResponseEntity.notFound().build();
+        }
+        return null;
     }
 
     @PostMapping("/workflow-nodes/execute")
@@ -277,7 +321,8 @@ public class WorkflowController {
         if (runId == null || runId.trim().isEmpty()) {
             return ResponseEntity.badRequest().build();
         }
-        WorkflowRun run = workflowService.run(runId);
+        /* Only the run owner (or an admin) may mint a delegation bound to that run. */
+        WorkflowRun run = workflowService.runForPrincipal(runId, authService.principal(authorization));
         if (run == null) {
             return ResponseEntity.notFound().build();
         }

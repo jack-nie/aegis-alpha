@@ -1,0 +1,413 @@
+[
+  {
+    "id": "eval-01-grounded-howto",
+    "query": "如何打开 AI Copilot？",
+    "answer": "在任意页面右下角点击 Copilot 悬浮按钮即可打开 AI Copilot 面板，面板默认停留在当前页面上下文。",
+    "chunks": [
+      {
+        "title": "如何打开 AI Copilot？",
+        "text": "在任意页面右下角点击 Copilot 悬浮按钮即可打开 AI Copilot 面板，面板默认停留在当前页面上下文。"
+      }
+    ],
+    "escalated": false,
+    "expectedEscalate": false,
+    "minFaithfulness": 0.75,
+    "minRelevance": 0.75,
+    "minTaskCompletion": 1.0
+  },
+  {
+    "id": "eval-02-invented-number",
+    "query": "运行超时后多久会自动重试？",
+    "answer": "超时 30 分钟后系统会自动重试 5 次，并且结果会推送到邮箱。",
+    "chunks": [
+      {
+        "title": "运行超时后如何处理？",
+        "text": "运行超时后需要手动重试，重试入口在运行中心，操作前请确认节点日志。"
+      }
+    ],
+    "escalated": false,
+    "expectedEscalate": false,
+    "minFaithfulness": 0.75,
+    "minRelevance": 0.5,
+    "minTaskCompletion": 1.0
+  },
+  {
+    "id": "eval-03-irrelevant-retrieval",
+    "query": "如何添加自选股并设置价格提醒？",
+    "answer": "在回测页面点击新建任务，选择策略并设置回测区间即可开始回测。",
+    "chunks": [
+      {
+        "title": "回测任务如何创建？",
+        "text": "在回测页面点击新建任务，选择策略并设置回测区间即可开始回测。"
+      }
+    ],
+    "escalated": false,
+    "expectedEscalate": false,
+    "minFaithfulness": 0.75,
+    "minRelevance": 0.75,
+    "minTaskCompletion": 1.0
+  },
+  {
+    "id": "eval-04-escalation-expected",
+    "query": "账户被风控冻结了怎么解除？",
+    "answer": "账户风控冻结需要人工核验，已为你转交人工支持，请查看工单回复或联系 support@aegis.example。",
+    "chunks": [
+      {
+        "title": "什么情况需要转人工？",
+        "text": "账户冻结、权限异常、资金异常等情况需要人工核验，请转交人工支持。"
+      }
+    ],
+    "escalated": true,
+    "expectedEscalate": true,
+    "minFaithfulness": 0.0,
+    "minRelevance": 0.0,
+    "minTaskCompletion": 1.0
+  },
+  {
+    "id": "eval-05-false-confidence",
+    "query": "推荐被驳回后还能恢复吗？",
+    "answer": "推荐被驳回后可以直接重新提交，系统会在 10 分钟内自动通过。",
+    "chunks": [
+      {
+        "title": "推荐被驳回后如何处理？",
+        "text": "推荐被驳回后需要在推荐中心重新提交，并补充驳回原因对应的材料。"
+      }
+    ],
+    "escalated": false,
+    "expectedEscalate": true,
+    "minFaithfulness": 0.5,
+    "minRelevance": 0.5,
+    "minTaskCompletion": 1.0
+  },
+  {
+    "id": "eval-06-over-escalation",
+    "query": "运行中心在哪里查看节点输出？",
+    "answer": "在运行中心打开对应 run，切换到节点面板即可查看节点输出。",
+    "chunks": [
+      {
+        "title": "运行中心在哪里查看节点输出？",
+        "text": "在运行中心打开对应 run，切换到节点面板即可查看节点输出。"
+      }
+    ],
+    "escalated": true,
+    "expectedEscalate": false,
+    "minFaithfulness": 0.75,
+    "minRelevance": 0.75,
+    "minTaskCompletion": 1.0
+  },
+  {
+    "id": "eval-07-empty-answer",
+    "query": "运行日志如何导出？",
+    "answer": "",
+    "chunks": [
+      {
+        "title": "运行日志如何导出？",
+        "text": "在运行详情页点击导出日志按钮，即可下载本次运行的完整日志文件。"
+      }
+    ],
+    "escalated": false,
+    "expectedEscalate": false,
+    "minFaithfulness": 0.75,
+    "minRelevance": 0.75,
+    "minTaskCompletion": 1.0
+  },
+  {
+    "id": "eval-08-partial-actionable-weak-grounding",
+    "query": "节点失败后如何排查？",
+    "answer": "步骤一：打开运行中心，步骤二：点击失败节点查看日志，步骤三：联系后端同学确认。",
+    "chunks": [],
+    "escalated": false,
+    "expectedEscalate": false,
+    "minFaithfulness": 0.5,
+    "minRelevance": 0.5,
+    "minTaskCompletion": 1.0
+  },
+  {
+    "id": "eval-09-run-center-node-output",
+    "query": "运行中心在哪里查看节点输出？",
+    "answer": "进入运行中心打开对应 run 的运行详情，切换到节点面板即可查看每个节点的输入输出与耗时。",
+    "chunks": [
+      {
+        "title": "运行中心在哪里查看节点输出？",
+        "text": "在左侧导航进入运行中心，打开对应 run 的运行详情，切换到节点面板即可查看每个节点的输入输出与耗时。"
+      }
+    ],
+    "escalated": false,
+    "expectedEscalate": false,
+    "minFaithfulness": 0.75,
+    "minRelevance": 0.75,
+    "minTaskCompletion": 1.0
+  },
+  {
+    "id": "eval-10-approval-inbox",
+    "query": "推荐审批在哪里做？",
+    "answer": "打开推荐中心的待审批列表，选择推荐记录点击审批按钮，填写意见即可完成审批。",
+    "chunks": [
+      {
+        "title": "推荐审批在哪里做？",
+        "text": "在推荐中心打开待审批列表，选择推荐记录后点击审批按钮，填写意见即可完成审批。"
+      }
+    ],
+    "escalated": false,
+    "expectedEscalate": false,
+    "minFaithfulness": 0.75,
+    "minRelevance": 0.75,
+    "minTaskCompletion": 1.0
+  },
+  {
+    "id": "eval-11-published-workflow",
+    "query": "什么是 published workflow？",
+    "answer": "published workflow 是已发布、可被意图路由分发执行的工作流，只有发布后才会出现在运行入口。",
+    "chunks": [
+      {
+        "title": "什么是 published workflow？",
+        "text": "published workflow 指已发布并可以被意图路由分发执行的工作流，只有发布后的工作流才会出现在运行入口。"
+      }
+    ],
+    "escalated": false,
+    "expectedEscalate": false,
+    "minFaithfulness": 0.75,
+    "minRelevance": 0.75,
+    "minTaskCompletion": 1.0
+  },
+  {
+    "id": "eval-12-degraded-meaning",
+    "query": "DEGRADED 是什么意思？",
+    "answer": "DEGRADED 表示本次运行部分节点失败但主流程可用，结果可用性下降，需要查看失败节点日志确认原因。",
+    "chunks": [
+      {
+        "title": "DEGRADED 是什么意思？",
+        "text": "DEGRADED 表示本次运行部分节点失败但主流程可用，结果可用性下降，需要查看失败节点的日志确认原因。"
+      }
+    ],
+    "escalated": false,
+    "expectedEscalate": false,
+    "minFaithfulness": 0.75,
+    "minRelevance": 0.75,
+    "minTaskCompletion": 1.0
+  },
+  {
+    "id": "eval-13-rerun-workflow",
+    "query": "工作流失败后如何重跑？",
+    "answer": "打开运行详情，点击重跑按钮即可按原始入参重新执行整个工作流。",
+    "chunks": [
+      {
+        "title": "工作流失败后如何重跑？",
+        "text": "工作流失败后打开运行详情，点击重跑按钮即可按原始入参重新执行整个工作流。"
+      }
+    ],
+    "escalated": false,
+    "expectedEscalate": false,
+    "minFaithfulness": 0.75,
+    "minRelevance": 0.75,
+    "minTaskCompletion": 1.0
+  },
+  {
+    "id": "eval-14-backtest-params",
+    "query": "回测参数怎么设置？",
+    "answer": "在回测页面设置回测区间、初始资金、手续费与滑点参数，选择策略后点击开始回测。",
+    "chunks": [
+      {
+        "title": "回测参数怎么设置？",
+        "text": "在回测页面设置回测区间、初始资金、手续费与滑点参数，选择策略后点击开始回测。"
+      }
+    ],
+    "escalated": false,
+    "expectedEscalate": false,
+    "minFaithfulness": 0.75,
+    "minRelevance": 0.75,
+    "minTaskCompletion": 1.0
+  },
+  {
+    "id": "eval-15-watchlist-add",
+    "query": "自选股如何添加？",
+    "answer": "在行情页面搜索股票代码，点击加自选按钮即可添加进自选股列表。",
+    "chunks": [
+      {
+        "title": "自选股如何添加？",
+        "text": "在行情页面搜索股票代码，点击加自选按钮即可把股票添加进自选股列表。"
+      }
+    ],
+    "escalated": false,
+    "expectedEscalate": false,
+    "minFaithfulness": 0.75,
+    "minRelevance": 0.75,
+    "minTaskCompletion": 1.0
+  },
+  {
+    "id": "eval-16-daily-report",
+    "query": "日报如何订阅？",
+    "answer": "进入订阅设置页面勾选日报，选择推送时间与渠道，保存后每天按时收到日报。",
+    "chunks": [
+      {
+        "title": "日报如何订阅？",
+        "text": "进入订阅设置页面，勾选日报并选择推送时间与渠道，保存后每天按时收到日报。"
+      }
+    ],
+    "escalated": false,
+    "expectedEscalate": false,
+    "minFaithfulness": 0.75,
+    "minRelevance": 0.75,
+    "minTaskCompletion": 1.0
+  },
+  {
+    "id": "eval-17-portfolio-detail",
+    "query": "持仓明细在哪里查看？",
+    "answer": "在投资组合页面打开持仓明细标签，可以查看每只股票的持仓数量、成本价与浮动盈亏。",
+    "chunks": [
+      {
+        "title": "持仓明细在哪里查看？",
+        "text": "在投资组合页面打开持仓明细标签，可以看到每只股票的持仓数量、成本价与浮动盈亏。"
+      }
+    ],
+    "escalated": false,
+    "expectedEscalate": false,
+    "minFaithfulness": 0.75,
+    "minRelevance": 0.75,
+    "minTaskCompletion": 1.0
+  },
+  {
+    "id": "eval-18-token-expired",
+    "query": "登录 Token 过期怎么办？",
+    "answer": "Token 过期后重新登录获取新的 Token，前端收到 401 时会跳转登录页。",
+    "chunks": [
+      {
+        "title": "登录 Token 过期怎么办？",
+        "text": "登录 Token 过期后需要重新登录获取新的 Token，前端会在收到 401 时跳转登录页。"
+      }
+    ],
+    "escalated": false,
+    "expectedEscalate": false,
+    "minFaithfulness": 0.75,
+    "minRelevance": 0.75,
+    "minTaskCompletion": 1.0
+  },
+  {
+    "id": "eval-19-publish-workflow",
+    "query": "工作流如何发布？",
+    "answer": "在编排页面点击发布按钮，校验通过后工作流进入发布状态，可被意图路由按 trigger keywords 匹配。",
+    "chunks": [
+      {
+        "title": "工作流如何发布？",
+        "text": "在编排页面点击发布按钮，校验通过后工作流进入发布状态，并可按 trigger keywords 被意图路由匹配。"
+      }
+    ],
+    "escalated": false,
+    "expectedEscalate": false,
+    "minFaithfulness": 0.75,
+    "minRelevance": 0.75,
+    "minTaskCompletion": 1.0
+  },
+  {
+    "id": "eval-20-approval-timeout",
+    "query": "审批超时会被自动通过吗？",
+    "answer": "审批超时不会自动通过，超时后推荐会被标记为过期，需要重新提交审批。",
+    "chunks": [
+      {
+        "title": "审批超时会被自动通过吗？",
+        "text": "审批超时不会自动通过，超时后系统会把推荐标记为过期，需要重新提交审批。"
+      }
+    ],
+    "escalated": false,
+    "expectedEscalate": false,
+    "minFaithfulness": 0.75,
+    "minRelevance": 0.75,
+    "minTaskCompletion": 1.0
+  },
+  {
+    "id": "eval-21-knowledge-update",
+    "query": "知识库文档如何更新？",
+    "answer": "知识库文档以 markdown 维护，提交新文档后重新加载知识服务即可生效。",
+    "chunks": [
+      {
+        "title": "知识库文档如何更新？",
+        "text": "知识库文档以 markdown 维护，提交新的文档后在知识服务重新加载即可生效。"
+      }
+    ],
+    "escalated": false,
+    "expectedEscalate": false,
+    "minFaithfulness": 0.75,
+    "minRelevance": 0.75,
+    "minTaskCompletion": 1.0
+  },
+  {
+    "id": "eval-22-help-entry",
+    "query": "帮助中心入口在哪？",
+    "answer": "点击右上角问号图标即可打开帮助中心，也可以直接用快捷键搜索帮助文档。",
+    "chunks": [
+      {
+        "title": "帮助中心入口在哪？",
+        "text": "点击右上角问号图标即可打开帮助中心，也可以直接用快捷键搜索帮助文档。"
+      }
+    ],
+    "escalated": false,
+    "expectedEscalate": false,
+    "minFaithfulness": 0.75,
+    "minRelevance": 0.75,
+    "minTaskCompletion": 1.0
+  },
+  {
+    "id": "eval-23-export-logs",
+    "query": "运行日志如何导出？",
+    "answer": "在运行详情页点击导出日志按钮，即可下载本次运行的完整日志文件。",
+    "chunks": [
+      {
+        "title": "运行日志如何导出？",
+        "text": "在运行详情页点击导出日志按钮，即可下载本次运行的完整日志文件。"
+      }
+    ],
+    "escalated": false,
+    "expectedEscalate": false,
+    "minFaithfulness": 0.75,
+    "minRelevance": 0.75,
+    "minTaskCompletion": 1.0
+  },
+  {
+    "id": "eval-24-portfolio-pnl",
+    "query": "组合盈亏如何计算？",
+    "answer": "组合盈亏按持仓市值减去持仓成本计算，已实现与浮动盈亏分别统计后汇总。",
+    "chunks": [
+      {
+        "title": "组合盈亏如何计算？",
+        "text": "组合盈亏按持仓市值减去持仓成本计算，已实现盈亏与浮动盈亏分别统计后汇总。"
+      }
+    ],
+    "escalated": false,
+    "expectedEscalate": false,
+    "minFaithfulness": 0.75,
+    "minRelevance": 0.75,
+    "minTaskCompletion": 1.0
+  },
+  {
+    "id": "eval-25-agent-node",
+    "query": "Agent 节点如何配置？",
+    "answer": "Agent 节点需要配置模型、提示词与可用工具，并在节点输出中声明结果字段。",
+    "chunks": [
+      {
+        "title": "Agent 节点如何配置？",
+        "text": "Agent 节点需要配置模型、提示词与可用工具，并在节点输出中声明结果字段。"
+      }
+    ],
+    "escalated": false,
+    "expectedEscalate": false,
+    "minFaithfulness": 0.75,
+    "minRelevance": 0.75,
+    "minTaskCompletion": 1.0
+  },
+  {
+    "id": "eval-26-reject-reason",
+    "query": "推荐驳回原因在哪里看？",
+    "answer": "在推荐详情页的审批记录中可以查看驳回原因与驳回人，驳回原因也会写入运行日志。",
+    "chunks": [
+      {
+        "title": "推荐驳回原因在哪里看？",
+        "text": "在推荐详情页的审批记录中可以查看驳回原因与驳回人，驳回原因会同时写入运行日志。"
+      }
+    ],
+    "escalated": false,
+    "expectedEscalate": false,
+    "minFaithfulness": 0.75,
+    "minRelevance": 0.75,
+    "minTaskCompletion": 1.0
+  }
+]

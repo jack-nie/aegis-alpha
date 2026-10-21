@@ -145,7 +145,7 @@ public class HelpRoutingService {
                 result.setReason("Playbook hit: " + playbook.getId());
                 return result;
             }
-            // Playbook miss → knowledge RAG (L0/L1) or help-loop (L2)
+            // Playbook miss → hybrid lexical retrieval (L0/L1) or help-loop (L2)
             if (complexity == HelpIntent.Complexity.L2) {
                 result.setRouteAction(HelpIntent.RouteAction.HELP_GRAPH);
                 result.setCacheable(false);
@@ -154,7 +154,7 @@ public class HelpRoutingService {
             }
             result.setRouteAction(HelpIntent.RouteAction.KNOWLEDGE_RAG);
             result.setComplexity(complexity == HelpIntent.Complexity.L0 ? HelpIntent.Complexity.L1 : complexity);
-            result.setReason("Product help playbook miss → knowledge RAG");
+            result.setReason("Product help playbook miss → hybrid lexical retrieval");
             return result;
         }
 
