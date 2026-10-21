@@ -25,7 +25,7 @@ public class PortfolioController {
     public PortfolioController(AuthService authService,
                                PortfolioService portfolioService,
                                TokenService tokenService,
-                               @Value("${aegis.dify.node-execution-token:local-workflow-node-token}") String nodeExecutionToken) {
+                               @Value("${aegis.dify.node-execution-token:}") String nodeExecutionToken) {
         this.authService = authService;
         this.portfolioService = portfolioService;
         this.tokenService = tokenService;
@@ -43,7 +43,8 @@ public class PortfolioController {
             return false;
         }
         String token = authorization.startsWith("Bearer ") ? authorization.substring(7) : authorization;
-        if (nodeExecutionToken != null && nodeExecutionToken.equals(token)) {
+        /* An unset service token must never match an empty bearer. */
+        if (nodeExecutionToken != null && !nodeExecutionToken.trim().isEmpty() && nodeExecutionToken.equals(token)) {
             return true;
         }
         if (tokenService.hasDelegationScope(token, SCOPE_PORTFOLIO_READ)) {

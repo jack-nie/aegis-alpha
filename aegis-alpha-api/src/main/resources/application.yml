@@ -77,7 +77,7 @@ aegis:
     console-base-url: ${AEGIS_ALPHA_DIFY_CONSOLE_BASE_URL:}
     console-token: ${AEGIS_ALPHA_DIFY_CONSOLE_TOKEN:}
     node-callback-base-url: ${AEGIS_ALPHA_NODE_CALLBACK_BASE_URL:http://127.0.0.1:5178}
-    node-execution-token: ${AEGIS_ALPHA_NODE_EXECUTION_TOKEN:local-workflow-node-token}
+    node-execution-token: ${AEGIS_ALPHA_NODE_EXECUTION_TOKEN:}  # no default: set the shared service token explicitly
   market-data:
     yahoo-chart-url: ${AEGIS_ALPHA_YAHOO_CHART_URL:https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1m&range=1d}
     stooq-quote-url: ${AEGIS_ALPHA_STOOQ_QUOTE_URL:https://stooq.com/q/l/?s={symbol}.us&f=sd2t2ohlcv&h&e=csv}

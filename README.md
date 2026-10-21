@@ -71,3 +71,16 @@ $env:AEGIS_ALPHA_NODE_EXECUTION_TOKEN = "local-workflow-node-token"
 ```
 
 Default ports: web `5174`, API `5178`, orchestrator `8787`.
+
+Service token / CORS (Phase 1 hardening):
+
+- `AEGIS_ALPHA_NODE_EXECUTION_TOKEN` has **no default** in the API or the orchestrator; set the same
+  value for both (generate your own random string; do not commit it). Without it the orchestrator
+  answers non-public routes with `503 service_token_not_configured`.
+- The sample value `local-workflow-node-token` used above is accepted by the orchestrator **only** when
+  `AEGIS_ALPHA_DEV_MODE=true` or `AEGIS_ALPHA_LANGCHAIN_MOCK=true` is set explicitly; otherwise it
+  answers `503 service_token_is_example_value` and logs a warning at startup.
+- `AEGIS_ALPHA_CORS_ALLOWED_ORIGINS` (comma-separated, `*` ignored) controls the orchestrator CORS
+  allow-list; the default only allows the local web/API origins (`http://127.0.0.1:5174`,
+  `http://localhost:5174`, `http://127.0.0.1:5178`, `http://localhost:5178`).
+- `docker-compose.aegis-alpha.yml` now requires `AEGIS_ALPHA_NODE_EXECUTION_TOKEN` in `.env`.

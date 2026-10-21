@@ -21,7 +21,7 @@ public class MarketDataController {
     private final String nodeExecutionToken;
 
     public MarketDataController(AuthService authService, MarketDataService marketDataService,
-                                @Value("${aegis.dify.node-execution-token:local-workflow-node-token}") String nodeExecutionToken) {
+                                @Value("${aegis.dify.node-execution-token:}") String nodeExecutionToken) {
         this.authService = authService;
         this.marketDataService = marketDataService;
         this.nodeExecutionToken = nodeExecutionToken;
@@ -33,7 +33,8 @@ public class MarketDataController {
         }
         // Check for internal service token first
         String token = authorization.startsWith("Bearer ") ? authorization.substring(7) : authorization;
-        if (nodeExecutionToken.equals(token)) {
+        /* An unset service token must never match an empty bearer. */
+        if (nodeExecutionToken != null && !nodeExecutionToken.trim().isEmpty() && nodeExecutionToken.equals(token)) {
             return true;
         }
         // Fall back to user token authentication
