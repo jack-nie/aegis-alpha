@@ -35,6 +35,15 @@ class Settings(BaseSettings):
     router_model: str = Field(default="", alias="AEGIS_ALPHA_ROUTER_MODEL")
     router_timeout_ms: int = Field(default=2500, alias="AEGIS_ALPHA_ROUTER_TIMEOUT_MS")
 
+    # Structured output: "function_calling" (portable across OpenAI-compatible providers such as
+    # DeepSeek) or "json_schema" / "json_mode" where the provider supports them.
+    structured_output_method: str = Field(
+        default="function_calling", alias="AEGIS_ALPHA_STRUCTURED_OUTPUT_METHOD"
+    )
+    # Node-level LLM retry budget: total wall time across attempts (including backoff).
+    node_retry_deadline_ms: int = Field(default=120000, alias="AEGIS_ALPHA_NODE_RETRY_DEADLINE_MS")
+    node_retry_max_attempts: int = Field(default=3, alias="AEGIS_ALPHA_NODE_RETRY_MAX_ATTEMPTS")
+
     # Backend
     backend_url: str = Field(default="http://127.0.0.1:5178", alias="AEGIS_ALPHA_BACKEND_URL")
     node_callback_base_url: str = Field(default="", alias="AEGIS_ALPHA_NODE_CALLBACK_BASE_URL")
