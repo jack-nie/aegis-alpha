@@ -43,6 +43,7 @@ public class LangChainGateway {
         this.objectMapper = objectMapper;
         this.restTemplate = restTemplate(connectTimeoutMs, readTimeoutMs);
         this.shortTimeoutRestTemplate = restTemplate(2000, 5000);
+        this.classifyRestTemplate = restTemplate(DEFAULT_CLASSIFY_CONNECT_TIMEOUT_MS, DEFAULT_CLASSIFY_READ_TIMEOUT_MS);
         this.enabled = enabled;
         this.engineUrl = engineUrl;
         this.provider = provider;
@@ -270,12 +271,16 @@ public class LangChainGateway {
             headers.setContentType(MediaType.APPLICATION_JSON);
             applyServiceAuth(headers);
             HttpEntity<Map<String, Object>> request = new HttpEntity<>(body, headers);
-            Object response = shortTimeoutRestTemplate.postForObject(trimSlash(engineUrl) + "/classify-intent", request, Object.class);
+            Object response = classifyRestTemplate.postForObject(trimSlash(engineUrl) + "/classify-intent", request, Object.class);
             if (response instanceof Map) {
                 return (Map<String, Object>) response;
             }
+            log.warn("[LangChainGateway] classifyIntent returned a non-object response (messageLength={})",
+                    message == null ? 0 : message.length());
             return null;
         } catch (Exception ex) {
+            log.warn("[LangChainGateway] classifyIntent failed: {} (messageLength={})",
+                    ex.getClass().getSimpleName(), message == null ? 0 : message.length());
             return null;
         }
     }
@@ -312,7 +317,7 @@ public class LangChainGateway {
             }
             return null;
         } catch (Exception ex) {
-            log.debug("[LangChainGateway] executeHelp failed: {}", ex.getMessage());
+            log.warn("[LangChainGateway] executeHelp failed: {}", ex.getClass().getSimpleName());
             return null;
         }
     }
@@ -439,6 +444,27 @@ public class LangChainGateway {
     }
 
     private final RestTemplate shortTimeoutRestTemplate;
+
+    /*
+     * Classification must out-wait the orchestrator's own LLM timeout
+     * (AEGIS_ALPHA_ROUTER_TIMEOUT_MS, default 2500ms) or the paid-for answer is discarded.
+     */
+    static final int DEFAULT_CLASSIFY_CONNECT_TIMEOUT_MS = 1000;
+    static final int DEFAULT_CLASSIFY_READ_TIMEOUT_MS = 4000;
+    private volatile RestTemplate classifyRestTemplate;
+    private volatile int classifyReadTimeoutMs = DEFAULT_CLASSIFY_READ_TIMEOUT_MS;
+
+    @Autowired(required = false)
+    void configureClassifyTimeouts(
+            @Value("${aegis.router.classify-connect-timeout-ms:" + DEFAULT_CLASSIFY_CONNECT_TIMEOUT_MS + "}") int connectTimeoutMs,
+            @Value("${aegis.router.classify-read-timeout-ms:" + DEFAULT_CLASSIFY_READ_TIMEOUT_MS + "}") int readTimeoutMs) {
+        this.classifyReadTimeoutMs = Math.max(1, readTimeoutMs);
+        this.classifyRestTemplate = restTemplate(connectTimeoutMs, this.classifyReadTimeoutMs);
+    }
+
+    int classifyReadTimeoutMs() {
+        return classifyReadTimeoutMs;
+    }
 
     private RestTemplate restTemplate(int connectTimeoutMs, int readTimeoutMs) {
         SimpleClientHttpRequestFactory factory = new SimpleClientHttpRequestFactory();
