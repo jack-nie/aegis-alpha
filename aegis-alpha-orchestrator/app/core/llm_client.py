@@ -178,8 +178,15 @@ class LLMClient:
         temperature: float = 0.2,
         timeout_ms: int | None = None,
         tools: list | None = None,
+        structured: bool | None = None,
     ) -> LLMResponse:
-        """Invoke LLM with system prompt and user message."""
+        """Invoke LLM with system prompt and user message.
+
+        ``structured`` selects the output protocol explicitly: ``True`` → AnalystResult via
+        ``with_structured_output`` (one model call on success, at most one plain fallback call on
+        failure); ``False`` → plain text/markdown. ``None`` keeps the legacy prompt-substring
+        heuristic for callers that have not been migrated.
+        """
         resolved_model = self._resolve_model(model)
         effective_timeout = timeout_ms or self._config.timeout_ms
 
@@ -198,13 +205,18 @@ class LLMClient:
         ]
 
         try:
-            use_structured = tools is None and not self._is_aggregate_handler(system)
+            if structured is None:
+                use_structured = tools is None and not self._is_aggregate_handler(system)
+            else:
+                use_structured = bool(structured) and tools is None
             if use_structured:
                 try:
                     # include_raw keeps the AIMessage so usage_metadata survives parsing.
-                    # A bare AnalystResult has no token counts, and finance plus aggregate
-                    # both take this branch.
-                    structured_llm = client.with_structured_output(AnalystResult, include_raw=True)
+                    structured_llm = client.with_structured_output(
+                        AnalystResult,
+                        method=self._structured_output_method(),
+                        include_raw=True,
+                    )
                     response = await structured_llm.ainvoke(messages)
                     parsed, usage = self._structured_payload(response)
                     if isinstance(parsed, AnalystResult):
@@ -532,6 +544,10 @@ class LLMClient:
         if isinstance(response, AnalystResult):
             return response, getattr(response, "usage_metadata", None)
         return None, None
+
+    def _structured_output_method(self) -> str:
+        method = (getattr(self._config, "structured_output_method", "") or "").strip()
+        return method if method in ("function_calling", "json_schema", "json_mode") else "function_calling"
 
     @staticmethod
     def _is_aggregate_handler(system_prompt: str) -> bool:

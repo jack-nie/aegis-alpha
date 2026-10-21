@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import random
+import re
+import time
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator
 
@@ -28,6 +32,56 @@ def _assemble_context(state: dict[str, Any], *, aggregate: bool = False) -> str:
     """Budgeted prompt context. Aggregate keeps a larger budget; never a prefix cut."""
     budget = AGGREGATE_TOKEN_BUDGET if aggregate else DEFAULT_TOKEN_BUDGET
     return assemble_model_context(state, token_budget=budget)
+
+
+AGGREGATE_HANDLER = "finance.stock_recommendation_aggregate"
+
+
+def render_prompt(template: str | None, *, subject: str, agent_name: str) -> str:
+    """Fill ``{subject}`` / ``{agent_name}`` only.
+
+    ``str.format`` raised ``KeyError('"recommendation"')`` on templates that contain literal JSON
+    (the default aggregate prompt ends with a JSON example), so the aggregate node always failed;
+    user-authored prompts with braces failed the same way.
+    """
+    text = template or ""
+    return text.replace("{subject}", str(subject or "")).replace("{agent_name}", str(agent_name or ""))
+
+
+def aggregate_system_prompt(agent_name: str) -> str:
+    """Single output protocol for the aggregate node (streaming and non-streaming).
+
+    Markdown report followed by one fenced ``json`` trailer the policy layer can parse.
+    """
+    return (
+        f"You are {agent_name}. Generate an evidence-based investment research report. "
+        "Use markdown formatting with clear sections. "
+        "Use only numbers present in marketDataContext / tool outputs. "
+        "If critical market or financial data is missing, recommend INSUFFICIENT_DATA "
+        "and list missing fields. Never invent prices, multiples, or target prices. "
+        "End the report with exactly one fenced ```json block of the shape "
+        '{"recommendation":"BUY|HOLD|SELL|WATCH|INSUFFICIENT_DATA","confidence":0.0,'
+        '"claims":[{"text":"...","evidenceId":"..."}],"missingData":["..."]} '
+        "where every evidenceId is copied from the context."
+    )
+
+
+_JSON_TRAILER = re.compile(r"```json\s*(\{.*?\})\s*```", re.DOTALL | re.IGNORECASE)
+
+
+def parse_aggregate_trailer(content: str | None) -> dict[str, Any]:
+    """Parse the last fenced json trailer of an aggregate report; ``{}`` when absent/invalid."""
+    if not content:
+        return {}
+    matches = _JSON_TRAILER.findall(content)
+    for raw in reversed(matches):
+        try:
+            parsed = json.loads(raw)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return {}
 
 
 def _with_token_usage(result_data: dict[str, Any], response: LLMResponse) -> dict[str, Any]:
@@ -72,6 +126,28 @@ class NodeExecutor:
         self._config = config
         self._llm_client = llm_client
         self._market_data = market_data
+        # Injectable for tests: retry backoff sleep, jitter source and monotonic clock.
+        self._sleep = asyncio.sleep
+        self._random = random.random
+        self._clock = time.monotonic
+
+    def _retry_budget(self) -> tuple[int, float]:
+        attempts = getattr(self._config, "node_retry_max_attempts", 3)
+        deadline_ms = getattr(self._config, "node_retry_deadline_ms", 120000)
+        try:
+            attempts = max(1, int(attempts))
+        except (TypeError, ValueError):
+            attempts = 3
+        try:
+            deadline_s = max(0.0, float(deadline_ms) / 1000.0)
+        except (TypeError, ValueError):
+            deadline_s = 120.0
+        return attempts, deadline_s
+
+    def _backoff_delay(self, attempt: int) -> float:
+        """Exponential backoff (1s, 2s, ...) with ±50% jitter so parallel nodes do not retry in lockstep."""
+        base = float(2 ** attempt)
+        return base * (0.5 + self._random())
 
     async def execute(
         self,
@@ -109,10 +185,11 @@ class NodeExecutor:
             logger.info(f"[THINKING] Market data hydrated for node id={node.id} handler={handler} data_keys={list(market_context.keys())}")
             state = {**state, "marketDataContext": market_context}
 
-        # Invoke LLM with retry
-        max_retries = 2
+        # Invoke LLM with retry: bounded attempts, jittered backoff and a total deadline.
+        max_attempts, deadline_s = self._retry_budget()
+        retry_started = self._clock()
         last_error = None
-        for attempt in range(max_retries + 1):
+        for attempt in range(max_attempts):
             try:
                 result = await self._invoke_llm(
                     node=node,
@@ -133,10 +210,17 @@ class NodeExecutor:
                 if not self._is_retryable(e):
                     logger.warning(f"[THINKING] Node invoke failed (non-retryable): id={node.id} handler={handler} error={e}")
                     break
-                if attempt < max_retries:
-                    delay = 2 ** attempt
-                    logger.warning(f"[THINKING] Node {node.id} LLM call failed (attempt {attempt + 1}/{max_retries + 1}), retrying in {delay}s: {e}")
-                    await asyncio.sleep(delay)
+                if attempt + 1 < max_attempts:
+                    delay = self._backoff_delay(attempt)
+                    elapsed = self._clock() - retry_started
+                    if elapsed + delay >= deadline_s:
+                        logger.warning(
+                            f"[THINKING] Node {node.id} retry deadline reached "
+                            f"(elapsed={elapsed:.1f}s, deadline={deadline_s:.1f}s); giving up"
+                        )
+                        break
+                    logger.warning(f"[THINKING] Node {node.id} LLM call failed (attempt {attempt + 1}/{max_attempts}), retrying in {delay:.2f}s: {type(e).__name__}")
+                    await self._sleep(delay)
 
         logger.error(f"[THINKING] Node execution failed after all retries: id={node.id} handler={handler} label={node_label} error={last_error}")
         return self._fallback_result(node, handler, subject, state, started_at, str(last_error))
@@ -204,11 +288,10 @@ class NodeExecutor:
         )
 
         # Get prompt
-        prompt = (
+        prompt = render_prompt(
             data.prompt
             or (agent.prompt if agent else None)
-            or PromptManager.get_prompt(handler)
-        ).format(
+            or PromptManager.get_prompt(handler),
             subject=subject,
             agent_name=agent_name,
         )
@@ -219,13 +302,7 @@ class NodeExecutor:
 
         # Build system prompt
         if is_aggregate:
-            system = (
-                f"You are {agent_name}. Generate an evidence-based investment research report. "
-                "Use markdown formatting with clear sections. "
-                "Use only numbers present in marketDataContext / tool outputs. "
-                "If critical market or financial data is missing, recommend INSUFFICIENT_DATA "
-                "and list missing fields. Never invent prices, multiples, or target prices."
-            )
+            system = aggregate_system_prompt(agent_name)
         else:
             system = (
                 f"You are {agent_name}. "
@@ -242,6 +319,8 @@ class NodeExecutor:
             model=model,
             temperature=0.2,
             timeout_ms=timeout_ms,
+            # Explicit protocol: analysts → AnalystResult; aggregate → markdown + json trailer.
+            structured=not is_aggregate,
         )
 
         duration_ms = int((datetime.now(timezone.utc) - datetime.fromisoformat(started_at)).total_seconds() * 1000)
@@ -267,6 +346,11 @@ class NodeExecutor:
             ]
 
         result_data = _with_token_usage(response.data or {}, response)
+        if is_aggregate:
+            trailer = parse_aggregate_trailer(response.content)
+            for key in ("recommendation", "claims", "missingData", "conflicts"):
+                if key in trailer and key not in result_data:
+                    result_data[key] = trailer[key]
         summary = response.summary
         confidence = response.confidence
         degraded = False
@@ -527,11 +611,10 @@ class NodeExecutor:
             or data.title
             or "Aegis Alpha Agent"
         )
-        prompt = (
+        prompt = render_prompt(
             data.prompt
             or (agent.prompt if agent else None)
-            or PromptManager.get_prompt(handler)
-        ).format(
+            or PromptManager.get_prompt(handler),
             subject=subject,
             agent_name=agent_name,
         )
@@ -642,23 +725,19 @@ class NodeExecutor:
             or data.title
             or "Aegis Alpha Agent"
         )
-        prompt = (
+        prompt = render_prompt(
             data.prompt
             or (agent.prompt if agent else None)
-            or PromptManager.get_prompt(handler)
-        ).format(
+            or PromptManager.get_prompt(handler),
             subject=subject,
             agent_name=agent_name,
         )
 
         context = _assemble_context(state, aggregate=True)
 
-        system = (
-            f"You are {agent_name}. Generate a comprehensive investment research report. "
-            "Use markdown formatting with clear sections. "
-            "Include actual data values from the context. "
-            "Do NOT say 'data insufficient' or 'unable to analyze'."
-        )
+        # Same protocol as the non-streaming aggregate path (the old streaming prompt forbade
+        # INSUFFICIENT_DATA, contradicting the recommendation policy).
+        system = aggregate_system_prompt(agent_name)
 
         effective_model = model or self._config.model
         effective_base = base_url or self._config.effective_base_url
