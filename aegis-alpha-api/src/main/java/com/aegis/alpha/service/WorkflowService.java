@@ -929,24 +929,87 @@ public class WorkflowService {
         return mapper.findRun(runId);
     }
 
+    /** Roles allowed to approve/reject runs paused at the approval gate (comma separated). */
+    @Value("${aegis.workflow.approver-roles:desk,admin}")
+    private String approverRoles = "desk,admin";
+
+    /** True when the principal holds one of the configured approver roles. */
+    public boolean isApprover(AuthenticatedPrincipal principal) {
+        if (principal == null || approverRoles == null) {
+            return false;
+        }
+        for (String role : approverRoles.split(",")) {
+            if (!role.trim().isEmpty() && principal.hasRole(role.trim())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void setApproverRoles(String approverRoles) {
+        this.approverRoles = approverRoles;
+    }
+
+    /** Control status held while one request owns the approval decision (CAS from HUMAN_INTERRUPT). */
+    static final String APPROVAL_IN_PROGRESS = "APPROVAL_IN_PROGRESS";
+
     /**
      * Continue a run paused at the orchestrator approval gate. Does not start a new execution.
      */
     public WorkflowRun decideApproval(String runId, boolean approved) {
+        return decideApproval(runId, approved, null, null);
+    }
+
+    /**
+     * Approve or reject a run paused at the approval gate.
+     *
+     * <ul>
+     *   <li>Only one caller wins the {@code HUMAN_INTERRUPT → APPROVAL_IN_PROGRESS} compare-and-set,
+     *       so the orchestrator is resumed at most once; repeated submissions for an already
+     *       decided run return its current state.</li>
+     *   <li>Approval completes the run ({@code COMPLETED}); rejection ends it as {@code REJECTED}
+     *       (status name 待确认 with product) and the orchestrator skips the aggregate node.</li>
+     *   <li>A failed resume returns the run to {@code HUMAN_INTERRUPT} so it can be retried.</li>
+     * </ul>
+     *
+     * @throws IllegalStateException when the run never waited for approval
+     */
+    public WorkflowRun decideApproval(String runId, boolean approved, String comment, AuthenticatedPrincipal approver) {
         WorkflowRun run = requireRun(runId);
         if (!isHumanInterrupt(run)) {
+            if (isApprovalDecidedOrInFlight(run)) {
+                return mapper.findRun(runId);
+            }
             throw new IllegalStateException("Workflow run is not awaiting human approval: " + runId);
         }
+        if (mapper.transitionControlStatus(runId, "HUMAN_INTERRUPT", APPROVAL_IN_PROGRESS) == 0) {
+            /* Another request claimed the decision first. */
+            return mapper.findRun(runId);
+        }
+        Map<String, Object> audit = new LinkedHashMap<>();
+        audit.put("approved", approved);
+        if (approver != null) {
+            audit.put("approverUserId", approver.getUserId());
+            audit.put("approverUsername", approver.getUsername());
+        }
+        if (comment != null && !comment.trim().isEmpty()) {
+            String trimmed = comment.trim();
+            audit.put("comment", trimmed.length() > 500 ? trimmed.substring(0, 500) : trimmed);
+        }
+        recordRunEvent(run, "RUN_APPROVAL_DECISION", null, null, "PAUSED",
+                approved ? "Approval submitted." : "Rejection submitted.", audit, 955000);
+
         Map<String, Object> resume = langChainGateway.resumeWorkflow(run.getRunId(), approved);
         if (isResumeOk(resume)) {
-            run.setStatus("COMPLETED");
+            run.setStatus(approved ? "COMPLETED" : "REJECTED");
             run.setCompletedAt(now());
-            run.setControlStatus("COMPLETED");
+            run.setControlStatus(approved ? "COMPLETED" : "REJECTED");
             run.setPauseRequested(0);
             Map<String, Object> result = new LinkedHashMap<>();
             if (resume != null) {
                 result.putAll(resume);
             }
+            result.putAll(audit);
             if (approved) {
                 result.put("approval", "approved");
             } else {
@@ -958,18 +1021,31 @@ public class WorkflowService {
             }
             run.setResultJson(toJson(result));
             mapper.updateRun(run);
-            recordRunEvent(run, approved ? "RUN_APPROVED" : "RUN_REJECTED", null, null, "COMPLETED",
+            recordRunEvent(run, approved ? "RUN_APPROVED" : "RUN_REJECTED", null, null,
+                    approved ? "COMPLETED" : "REJECTED",
                     approved ? "Human approval accepted; workflow resumed."
-                            : "Human approval rejected; workflow completed.",
+                            : "Human approval rejected; final report skipped.",
                     result, 1000000);
         } else {
             String error = resume == null ? "" : string(resume.get("error"));
+            run.setControlStatus("HUMAN_INTERRUPT");
             run.setErrorMessage(error == null || error.trim().isEmpty() ? "resume failed" : error);
             mapper.updateRun(run);
             recordRunEvent(run, "RUN_RESUME_FAILED", null, null, "PAUSED",
                     "Human approval resume failed.", resume, 960000);
         }
         return mapper.findRun(runId);
+    }
+
+    private boolean isApprovalDecidedOrInFlight(WorkflowRun run) {
+        if (run == null) {
+            return false;
+        }
+        if (APPROVAL_IN_PROGRESS.equals(run.getControlStatus()) || "REJECTED".equals(run.getStatus())) {
+            return true;
+        }
+        Map<String, Object> result = parseJsonMap(run.getResultJson());
+        return result.get("approval") != null;
     }
 
     private boolean isHumanInterrupt(WorkflowRun run) {

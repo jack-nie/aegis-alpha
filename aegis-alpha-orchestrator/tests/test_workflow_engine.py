@@ -745,3 +745,112 @@ async def test_durable_approval_resume_reloads_layout_after_restart():
             await store_reopened.close()
         close_checkpointer()
         temp_dir.cleanup()
+
+# ---- P1-5: approval gate is fail-closed and rejection skips aggregate ----
+
+
+async def _paused_engine(thread_id):
+    from langgraph.checkpoint.memory import InMemorySaver
+
+    from app.core.workflow_engine import WorkflowEngine
+    from app.models.responses import NodeResult
+
+    WorkflowEngine._graph_cache.clear()
+
+    class CountingExecutor:
+        def __init__(self):
+            self.calls = []
+
+        async def execute(self, node, state, subject="", **kwargs):
+            self.calls.append(node.id)
+            return NodeResult(ok=True, summary="node", node_id=node.id,
+                              handler=node.data.handler or "logic", node_name=node.id, subject=subject or "")
+
+    executor = CountingExecutor()
+    engine = WorkflowEngine(executor, checkpointer=InMemorySaver())
+    nodes = [
+        Node(id="start", data=NodeData(handler="start", nodeType="start")),
+        Node(id="market", data=NodeData(handler="finance.market_analysis")),
+        Node(id="aggregate", data=NodeData(handler="finance.stock_recommendation_aggregate")),
+        Node(id="end", data=NodeData(handler="end", nodeType="end")),
+    ]
+    edges = [
+        Edge(source="start", target="market"),
+        Edge(source="market", target="aggregate"),
+        Edge(source="aggregate", target="end"),
+    ]
+    paused = await engine.execute_workflow(
+        nodes=nodes, edges=edges, state={"ticker": "AAPL"}, subject="AAPL",
+        require_approval=True, thread_id=thread_id,
+    )
+    assert paused.ok is True, paused.error
+    assert "aggregate" not in executor.calls
+    return engine, executor
+
+
+@pytest.mark.asyncio
+async def test_rejection_does_not_run_aggregate():
+    from app.core.workflow_engine import WorkflowEngine
+
+    engine, executor = await _paused_engine("reject-thread")
+    try:
+        result = await engine.resume_workflow("reject-thread", {"approved": False, "comment": "no"})
+        assert result.ok is True, result.error
+        assert executor.calls.count("aggregate") == 0
+        assert (result.final_state or {}).get("approval_status") == "rejected"
+    finally:
+        WorkflowEngine._graph_cache.clear()
+
+
+@pytest.mark.asyncio
+async def test_approval_runs_aggregate_once():
+    from app.core.workflow_engine import WorkflowEngine
+
+    engine, executor = await _paused_engine("approve-thread")
+    try:
+        result = await engine.resume_workflow("approve-thread", {"approved": True})
+        assert result.ok is True, result.error
+        assert executor.calls.count("aggregate") == 1
+        assert (result.final_state or {}).get("approval_status") == "approved"
+    finally:
+        WorkflowEngine._graph_cache.clear()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("resume_value", [None, {}, {"approved": "yes"}, {"comment": "lgtm"}, {"approved": 1}])
+async def test_resume_without_boolean_decision_is_rejected_and_does_not_approve(resume_value):
+    from app.core.workflow_engine import WorkflowEngine
+
+    engine, executor = await _paused_engine("missing-decision-thread")
+    try:
+        result = await engine.resume_workflow("missing-decision-thread", resume_value)
+        assert result.ok is False
+        assert "approved" in (result.error or "")
+        assert "aggregate" not in executor.calls
+    finally:
+        WorkflowEngine._graph_cache.clear()
+
+
+@pytest.mark.asyncio
+async def test_resume_router_has_no_default_approval(monkeypatch):
+    from app.routers import workflow as workflow_router
+
+    captured = {}
+
+    async def fake_resume(thread_id, resume_value=None, **kwargs):
+        captured["resume_value"] = resume_value
+        from app.models.responses import WorkflowResult
+        return WorkflowResult(ok=False, error="x", final_state={})
+
+    monkeypatch.setattr(workflow_router.workflow_engine, "resume_workflow", fake_resume)
+    body = workflow_router.ResumeRequest.model_validate({"threadId": "t-1"})
+    await workflow_router.resume_workflow(body)
+    assert captured["resume_value"] is None
+
+
+def test_gate_helpers_are_fail_closed():
+    from app.core.workflow_engine import is_explicit_approval
+
+    assert is_explicit_approval({"approved": True}) is True
+    for value in (None, {}, {"approved": False}, {"approved": "true"}, {"approved": 1}, "approved"):
+        assert is_explicit_approval(value) is False
