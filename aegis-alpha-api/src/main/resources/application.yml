@@ -44,6 +44,9 @@ aegis:
     # Roles allowed to approve/reject runs paused at the approval gate (待确认: seed users only have
     # portfolio_manager/research_user; add e.g. portfolio_manager here if they should approve).
     approver-roles: ${AEGIS_ALPHA_APPROVER_ROLES:desk,admin}
+    # User-authored layout limits (待确认): prompt/systemPrompt max length; modelName whitelist (empty = any).
+    max-prompt-chars: ${AEGIS_ALPHA_WORKFLOW_MAX_PROMPT_CHARS:8000}
+    allowed-model-names: ${AEGIS_ALPHA_WORKFLOW_ALLOWED_MODEL_NAMES:}
   langchain:
     enabled: ${AEGIS_ALPHA_LANGCHAIN_ENABLED:true}
     engine-url: ${AEGIS_ALPHA_LANGCHAIN_ENGINE_URL:http://127.0.0.1:8787}

@@ -1,9 +1,11 @@
 package com.aegis.alpha.service;
 
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -14,6 +16,57 @@ import java.util.Set;
 
 @Service
 public class WorkflowValidationService {
+    /** Max characters for user-authored data.prompt / data.systemPrompt (待确认: default 8000). */
+    @Value("${aegis.workflow.max-prompt-chars:8000}")
+    private int maxPromptChars = 8000;
+
+    /** Comma-separated allowed data.modelName values; empty = no whitelist (待确认). */
+    @Value("${aegis.workflow.allowed-model-names:}")
+    private String allowedModelNames = "";
+
+    void setMaxPromptChars(int maxPromptChars) {
+        this.maxPromptChars = maxPromptChars;
+    }
+
+    void setAllowedModelNames(String allowedModelNames) {
+        this.allowedModelNames = allowedModelNames == null ? "" : allowedModelNames;
+    }
+
+    /**
+     * Executable-field checks for user-authored layouts (save/publish by a user).
+     * Not applied to system seeding or run-time layout loads, so existing stored layouts keep running.
+     */
+    public void validateExecutableFields(Map<String, Object> layout) {
+        Set<String> allowedModels = new HashSet<>();
+        for (String name : Arrays.asList(allowedModelNames.split(","))) {
+            if (!name.trim().isEmpty()) {
+                allowedModels.add(name.trim());
+            }
+        }
+        for (Map<String, Object> node : castList(layout == null ? null : layout.get("nodes"))) {
+            Object rawData = node.get("data");
+            if (!(rawData instanceof Map)) {
+                continue;
+            }
+            Map<?, ?> data = (Map<?, ?>) rawData;
+            String id = text(node.get("id"));
+            for (String key : new String[] {"prompt", "systemPrompt"}) {
+                Object value = data.get(key);
+                if (value != null && !(value instanceof String)) {
+                    throw new IllegalArgumentException("Workflow validation failed: node " + id + " " + key + " must be a string.");
+                }
+                if (value != null && ((String) value).length() > maxPromptChars) {
+                    throw new IllegalArgumentException("Workflow validation failed: node " + id + " " + key
+                            + " exceeds " + maxPromptChars + " characters.");
+                }
+            }
+            Object model = data.get("modelName");
+            if (model != null && !text(model).isEmpty() && !allowedModels.isEmpty() && !allowedModels.contains(text(model))) {
+                throw new IllegalArgumentException("Workflow validation failed: node " + id + " modelName is not allowed.");
+            }
+        }
+    }
+
     public void validateLayout(Map<String, Object> layout) {
         List<Map<String, Object>> nodes = castList(layout == null ? null : layout.get("nodes"));
         List<Map<String, Object>> edges = castList(layout == null ? null : layout.get("edges"));

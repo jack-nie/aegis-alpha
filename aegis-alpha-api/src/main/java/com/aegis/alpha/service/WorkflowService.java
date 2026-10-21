@@ -324,6 +324,7 @@ public class WorkflowService {
         requireEditable(definition, username);
         Map<String, Object> currentLayout = layout(workflowKey);
         validationService.validateLayout(currentLayout);
+        validationService.validateExecutableFields(currentLayout);
         WorkflowVersion version = new WorkflowVersion();
         version.setVersionId(UUID.randomUUID().toString());
         version.setWorkflowKey(workflowKey);
@@ -377,6 +378,7 @@ public class WorkflowService {
      */
     public Map<String, Object> saveLayoutForUser(String username, String workflowKey, Map<String, Object> body) {
         requireEditable(mapper.findDefinition(workflowKey), username);
+        validationService.validateExecutableFields(body);
         return saveLayoutInternal(workflowKey, body, username);
     }
 

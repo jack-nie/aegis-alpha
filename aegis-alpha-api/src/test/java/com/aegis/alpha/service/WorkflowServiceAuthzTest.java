@@ -17,6 +17,7 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -26,6 +27,8 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.atLeastOnce;
 
 /**
  * P0 authorization tests for run ownership in {@link WorkflowService}.
@@ -240,6 +243,81 @@ class WorkflowServiceAuthzTest {
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("another user");
         verify(mapper, never()).insertVersion(any());
+    }
+
+    @Test
+    void ownerCanSaveOwnWorkflowLayout() {
+        when(mapper.findDefinition("mine")).thenReturn(definition("mine", "u-1", false));
+
+        Map<String, Object> saved = service.saveLayoutForUser("u-1", "mine", validLayout("short prompt", null));
+
+        assertThat(saved).isNotNull();
+        verify(mapper, atLeastOnce()).findDefinition("mine");
+        verify(mapper, times(1)).insertLayout(any());
+    }
+
+    @Test
+    void createDefinitionStillWritesDefaultLayoutWithoutUserChecks() {
+        // first lookup: key is free; afterwards the freshly inserted (owned, non-readonly) definition exists
+        when(mapper.findDefinition(anyString())).thenReturn(null, definition("custom-workflow", "u-1", false));
+
+        service.createDefinition("u-1", new LinkedHashMap<String, Object>());
+
+        verify(mapper, times(1)).insertDefinition(any());
+        verify(mapper, times(1)).insertLayout(any());
+    }
+
+    @Test
+    void saveLayoutRejectsOverlongPrompt() {
+        when(mapper.findDefinition("mine")).thenReturn(definition("mine", "u-1", false));
+        StringBuilder longPrompt = new StringBuilder();
+        for (int i = 0; i < 8001; i++) {
+            longPrompt.append('p');
+        }
+
+        assertThatThrownBy(() -> service.saveLayoutForUser("u-1", "mine", validLayout(longPrompt.toString(), null)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .isNotInstanceOf(WorkflowService.AccessDeniedException.class)
+                .hasMessageContaining("prompt exceeds");
+        verify(mapper, never()).insertLayout(any());
+        verify(mapper, never()).updateLayout(any());
+    }
+
+    @Test
+    void saveLayoutRejectsModelOutsideConfiguredWhitelist() {
+        WorkflowValidationService validation = new WorkflowValidationService();
+        validation.setAllowedModelNames("deepseek-v4-flash, deepseek-v4-pro");
+
+        assertThatThrownBy(() -> validation.validateExecutableFields(validLayout("ok", "gpt-unknown")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("modelName");
+        validation.validateExecutableFields(validLayout("ok", "deepseek-v4-pro"));
+        new WorkflowValidationService().validateExecutableFields(validLayout("ok", "anything"));
+    }
+
+    private static Map<String, Object> validLayout(String prompt, String modelName) {
+        Map<String, Object> startData = new LinkedHashMap<String, Object>();
+        startData.put("nodeType", "start");
+        startData.put("handler", "start");
+        Map<String, Object> start = new LinkedHashMap<String, Object>();
+        start.put("id", "start");
+        start.put("data", startData);
+        Map<String, Object> agentData = new LinkedHashMap<String, Object>();
+        agentData.put("handler", "general.agent");
+        agentData.put("prompt", prompt);
+        if (modelName != null) {
+            agentData.put("modelName", modelName);
+        }
+        Map<String, Object> agent = new LinkedHashMap<String, Object>();
+        agent.put("id", "agent");
+        agent.put("data", agentData);
+        Map<String, Object> edge = new LinkedHashMap<String, Object>();
+        edge.put("source", "start");
+        edge.put("target", "agent");
+        Map<String, Object> layout = new LinkedHashMap<String, Object>();
+        layout.put("nodes", java.util.Arrays.asList(start, agent));
+        layout.put("edges", java.util.Collections.singletonList(edge));
+        return layout;
     }
 
     private static WorkflowDefinition definition(String key, String owner, boolean readonly) {
