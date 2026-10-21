@@ -483,9 +483,14 @@ public class ChatService {
         String ownerUserId = ownerText(owner, "user_id", "userId");
         String ownerTenantId = ownerText(owner, "tenant_id", "tenantId");
         if (ownerUserId.isEmpty() && ownerTenantId.isEmpty()) {
-            /* Legacy thread created before ownership tracking: claim it. */
-            mapper.updateThreadOwner(existing, principal.getUserId(), principal.getTenantId());
-            return existing;
+            /* Legacy thread created before ownership tracking: claim it (待确认: first caller wins).
+             * The claim is conditional, so a concurrent claimer cannot overwrite the winner. */
+            if (mapper.updateThreadOwner(existing, principal.getUserId(), principal.getTenantId()) > 0) {
+                return existing;
+            }
+            owner = mapper.findThreadOwner(existing);
+            ownerUserId = ownerText(owner, "user_id", "userId");
+            ownerTenantId = ownerText(owner, "tenant_id", "tenantId");
         }
         if (!sameOwner(ownerUserId, principal.getUserId()) || !sameOwner(ownerTenantId, principal.getTenantId())) {
             throw new IllegalArgumentException("thread belongs to another user");

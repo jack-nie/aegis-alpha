@@ -35,8 +35,10 @@ public interface ChatMapper {
                            @Param("userId") String userId,
                            @Param("tenantId") String tenantId);
 
-    @Update("update chat_thread set user_id = #{userId}, tenant_id = #{tenantId} where thread_id = #{threadId}")
-    void updateThreadOwner(@Param("threadId") String threadId,
+    /** Claims a legacy (unowned) thread; returns 0 when another caller already owns it (lost race). */
+    @Update("update chat_thread set user_id = #{userId}, tenant_id = #{tenantId} where thread_id = #{threadId}"
+            + " and (user_id is null or user_id = '') and (tenant_id is null or tenant_id = '')")
+    int updateThreadOwner(@Param("threadId") String threadId,
                            @Param("userId") String userId,
                            @Param("tenantId") String tenantId);
 
