@@ -55,7 +55,7 @@ class ChatServicePrincipalIdentityTest {
                 knowledgeService, new HelpLoopService(knowledgeService), langChainGateway);
         HelpAnswerCacheService cache = mock(HelpAnswerCacheService.class);
         /* Mockito returns an empty Map by default, which would look like a cache hit. */
-        when(cache.getIfAllowed(anyString(), any())).thenReturn(null);
+        when(cache.getIfAllowed(anyString(), any(), any())).thenReturn(null);
         chatService = new ChatService(chatMapper, langChainGateway, mock(MarketDataService.class), workflowService,
                 helpRoutingService, helpService, cache);
         when(langChainGateway.runAgent(any(), any(), any(), any())).thenAnswer(invocation -> {
