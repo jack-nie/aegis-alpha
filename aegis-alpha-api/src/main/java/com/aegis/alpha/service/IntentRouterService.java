@@ -2,6 +2,7 @@ package com.aegis.alpha.service;
 
 import com.aegis.alpha.domain.WorkflowDefinition;
 import com.aegis.alpha.mapper.WorkflowMapper;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.util.ArrayList;
@@ -28,6 +29,9 @@ public class IntentRouterService {
 
     private final WorkflowMapper workflowMapper;
     private final LangChainGateway langChainGateway;
+    /** LLM results below this confidence never short-circuit the keyword rules. */
+    @Value("${aegis.router.llm-min-confidence:0.6}")
+    private double llmMinConfidence = 0.6;
     private volatile List<WorkflowDefinition> cachedDefinitions;
     private volatile long cacheTimestamp;
 
@@ -44,13 +48,47 @@ public class IntentRouterService {
         if (definitions.isEmpty()) {
             return IntentResult.empty();
         }
-        // Step 1: try LLM function calling classification
+        // Step 1: LLM function calling classification
         IntentResult llmResult = classifyByLlm(message, definitions);
-        if (llmResult != null && llmResult.getWorkflowKey() != null) {
+        if (llmResult != null && llmResult.getWorkflowKey() != null
+                && llmResult.getConfidence() >= llmMinConfidence) {
             return llmResult;
         }
-        // Step 2: fallback to DB-driven keyword matching
+        // Step 2: low-confidence / missing LLM result never hides a keyword match
+        IntentResult keywordResult = classifyByKeywords(message, definitions);
+        return pickHigher(llmResult, keywordResult);
+    }
+
+    /**
+     * Deterministic keyword/regex classification only (no remote call). Used by the
+     * help router for high-precision rules before any LLM is consulted.
+     */
+    public IntentResult classifyByRules(String message) {
+        if (message == null || message.trim().isEmpty()) {
+            return IntentResult.empty();
+        }
+        List<WorkflowDefinition> definitions = getDefinitions();
+        if (definitions.isEmpty()) {
+            return IntentResult.empty();
+        }
         return classifyByKeywords(message, definitions);
+    }
+
+    double getLlmMinConfidence() {
+        return llmMinConfidence;
+    }
+
+    void setLlmMinConfidence(double llmMinConfidence) {
+        this.llmMinConfidence = llmMinConfidence;
+    }
+
+    private static IntentResult pickHigher(IntentResult llm, IntentResult keyword) {
+        boolean llmUsable = llm != null && llm.getWorkflowKey() != null;
+        boolean keywordUsable = keyword != null && keyword.getWorkflowKey() != null;
+        if (llmUsable && (!keywordUsable || llm.getConfidence() > keyword.getConfidence())) {
+            return llm;
+        }
+        return keyword == null ? IntentResult.empty() : keyword;
     }
 
     @SuppressWarnings("unchecked")

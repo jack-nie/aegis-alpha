@@ -27,6 +27,10 @@ class Settings(BaseSettings):
     timeout_ms: int = Field(default=25000, alias="AEGIS_ALPHA_LANGCHAIN_TIMEOUT_MS")
     mock_mode: bool = Field(default=False, alias="AEGIS_ALPHA_LANGCHAIN_MOCK")
 
+    # Intent router (classification). Empty model -> fall back to the main model.
+    router_model: str = Field(default="", alias="AEGIS_ALPHA_ROUTER_MODEL")
+    router_timeout_ms: int = Field(default=5000, alias="AEGIS_ALPHA_ROUTER_TIMEOUT_MS")
+
     # Backend
     backend_url: str = Field(default="http://127.0.0.1:5178", alias="AEGIS_ALPHA_BACKEND_URL")
     node_callback_base_url: str = Field(default="", alias="AEGIS_ALPHA_NODE_CALLBACK_BASE_URL")
