@@ -118,6 +118,9 @@ public class WorkflowController {
         if (principal == null) {
             return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build();
         }
+        if (workflowService.runForPrincipal(runId, principal) == null) {
+            return ResponseEntity.notFound().build();
+        }
         return ResponseEntity.ok(workflowService.nodeRunsForPrincipal(runId, principal));
     }
 
@@ -127,6 +130,9 @@ public class WorkflowController {
         AuthenticatedPrincipal principal = authService.principal(authorization);
         if (principal == null) {
             return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build();
+        }
+        if (workflowService.runForPrincipal(runId, principal) == null) {
+            return ResponseEntity.notFound().build();
         }
         return ResponseEntity.ok(workflowService.runEventsForPrincipal(runId, principal));
     }
