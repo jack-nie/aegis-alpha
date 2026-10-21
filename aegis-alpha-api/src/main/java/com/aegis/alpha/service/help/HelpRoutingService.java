@@ -2,6 +2,7 @@ package com.aegis.alpha.service.help;
 
 import com.aegis.alpha.service.IntentRouterService;
 import com.aegis.alpha.service.IntentRouterService.IntentResult;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.util.Locale;
@@ -9,12 +10,16 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * Adaptive router: RESEARCH workflow first, then diagnosis / product help / copilot.
+ * Adaptive router. High-precision rules run first and never pay for an LLM call:
+ * diagnosis (runId in text / diagnosis words) → product help (help words / playbook) →
+ * research keyword rules. Only messages no rule claims are sent to the LLM classifier.
  */
 @Service
 public class HelpRoutingService {
 
-    private static final double RESEARCH_PRIORITY_CONFIDENCE = 0.6;
+    /** Minimum research confidence to dispatch a workflow (also decides help+research mixes). */
+    @Value("${aegis.router.research-priority-confidence:0.6}")
+    private double researchPriorityConfidence = 0.6;
 
     private static final String[] RESEARCH_HINTS = {
             "日报", "晨报", "深度分析", "深度研究", "个股分析", "分析一下", "分析股票",
@@ -34,6 +39,13 @@ public class HelpRoutingService {
             "超时", "卡住", "节点失败", "run 失败", "执行失败", "failed", "error", "diagnose",
             "这个 run", "这次 run", "运行失败", "执行报错"
     };
+
+    /** Pure greetings / thanks: never worth an LLM routing call or a workflow. */
+    private static final String[] CHITCHAT_PHRASES = {
+            "你好", "您好", "嗨", "哈喽", "在吗", "谢谢", "多谢", "早上好", "下午好", "晚上好", "再见",
+            "hello", "hi", "hey", "thanks", "thank you", "bye"
+    };
+    private static final int CHITCHAT_MAX_LENGTH = 12;
 
     private static final Pattern RUN_ID_PATTERN = Pattern.compile(
             "\\b([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\\b",
@@ -65,28 +77,46 @@ public class HelpRoutingService {
             return empty;
         }
 
-        // 1) Research / published workflow (LLM + keyword via existing router)
-        IntentResult research = intentRouterService.classify(text);
-        if (research != null
-                && research.getWorkflowKey() != null
-                && !research.getWorkflowKey().isEmpty()
-                && research.getConfidence() >= RESEARCH_PRIORITY_CONFIDENCE) {
-            HelpIntent.Result result = HelpIntent.Result.empty();
-            result.setWorkflowKey(research.getWorkflowKey());
-            result.setTicker(firstNonEmpty(research.getTicker(), entities.getTicker()));
-            result.setConfidence(research.getConfidence());
-            result.setSource(research.getSource() == null ? "research" : research.getSource());
-            result.setDomain(HelpIntent.Domain.RESEARCH);
-            result.setComplexity(HelpIntent.Complexity.L2);
-            result.setRouteAction(HelpIntent.RouteAction.DISPATCH_WORKFLOW);
-            result.setEntities(entities);
-            result.setCacheable(false);
-            result.setReason("Published workflow match takes priority");
-            return result;
+        boolean runIdInText = RUN_ID_PATTERN.matcher(text).find();
+        boolean diagnosisWords = containsAny(text, DIAGNOSIS_HINTS);
+        boolean helpWords = containsAny(text, HELP_HINTS);
+
+        // 1) Run diagnosis: explicit runId in the message or diagnosis vocabulary
+        if (runIdInText || diagnosisWords) {
+            return diagnosis(entities);
+        }
+
+        // 2) Product help. A help+research mix (golden C02) is RESEARCH only when the
+        //    deterministic research rule is confident; otherwise PRODUCT_HELP.
+        if (helpWords) {
+            if (containsAny(text, RESEARCH_HINTS)) {
+                IntentResult mixed = intentRouterService.classifyByRules(text);
+                if (isConfidentResearch(mixed)) {
+                    return research(mixed, entities, "Help+research mix: research rule above threshold");
+                }
+            }
+            return productHelp(text, entities, cacheable);
+        }
+
+        // 3) Greetings / thanks → copilot chit-chat without consulting the LLM router
+        if (isChitchat(text)) {
+            return chitchat(entities, "Greeting rule");
+        }
+
+        // 4) Research keyword rules (no remote call)
+        IntentResult rule = intentRouterService.classifyByRules(text);
+        if (isConfidentResearch(rule)) {
+            return research(rule, entities, "Research keyword rule");
+        }
+
+        // 5) Ambiguous: only now consult the LLM classifier (keyword fallback inside)
+        IntentResult llm = intentRouterService.classify(text);
+        if (isConfidentResearch(llm)) {
+            return research(llm, entities, "Published workflow match (classifier)");
         }
 
         // Soft research hints without workflow → copilot research path
-        if (containsAny(text, RESEARCH_HINTS) && !containsAny(text, HELP_HINTS) && !containsAny(text, DIAGNOSIS_HINTS)) {
+        if (containsAny(text, RESEARCH_HINTS)) {
             HelpIntent.Result result = HelpIntent.Result.empty();
             result.setTicker(entities.getTicker());
             result.setConfidence(0.4);
@@ -100,65 +130,38 @@ public class HelpRoutingService {
             return result;
         }
 
-        // 2) Run diagnosis
-        if (notEmpty(entities.getRunId()) || containsAny(text, DIAGNOSIS_HINTS)) {
-            if (!notEmpty(entities.getRunId())) {
-                HelpIntent.Result result = HelpIntent.Result.empty();
-                result.setConfidence(0.8);
-                result.setSource("diagnosis_clarify");
-                result.setDomain(HelpIntent.Domain.RUN_DIAGNOSIS);
-                result.setComplexity(HelpIntent.Complexity.L2);
-                result.setRouteAction(HelpIntent.RouteAction.CLARIFY);
-                result.setNeedsClarification(true);
-                result.setClarificationPrompt("请提供运行 ID（runId），或从「运行中心」打开对应 run 后再问我。");
-                result.setEntities(entities);
-                result.setCacheable(false);
-                result.setReason("Diagnosis without runId");
-                return result;
-            }
-            HelpIntent.Result result = HelpIntent.Result.empty();
-            result.setConfidence(0.85);
-            result.setSource("diagnosis");
-            result.setDomain(HelpIntent.Domain.RUN_DIAGNOSIS);
-            result.setComplexity(HelpIntent.Complexity.L2);
-            result.setRouteAction(HelpIntent.RouteAction.HELP_GRAPH);
-            result.setEntities(entities);
-            result.setCacheable(false);
-            result.setReason("Run diagnosis with runId");
-            return result;
+        // 6) Page-context runId (e.g. asking from /runs/{id}) still means diagnosis
+        if (notEmpty(entities.getRunId())) {
+            return diagnosis(entities);
         }
 
-        // 3) Product help
-        if (containsAny(text, HELP_HINTS)) {
-            PlaybookService.Playbook playbook = playbookService.findBestMatch(text);
-            HelpIntent.Complexity complexity = estimateComplexity(text);
-            HelpIntent.Result result = HelpIntent.Result.empty();
-            result.setConfidence(playbook != null ? 0.9 : 0.7);
-            result.setSource(playbook != null ? "playbook" : "help_l0");
-            result.setDomain(HelpIntent.Domain.PRODUCT_HELP);
-            result.setComplexity(complexity);
-            result.setEntities(entities);
-            result.setCacheable(cacheable);
-            if (playbook != null) {
-                result.setPlaybookId(playbook.getId());
-                result.setRouteAction(HelpIntent.RouteAction.PLAYBOOK);
-                result.setReason("Playbook hit: " + playbook.getId());
-                return result;
-            }
-            // Playbook miss → hybrid lexical retrieval (L0/L1) or help-loop (L2)
-            if (complexity == HelpIntent.Complexity.L2) {
-                result.setRouteAction(HelpIntent.RouteAction.HELP_GRAPH);
-                result.setCacheable(false);
-                result.setReason("Product help L2 help-loop");
-                return result;
-            }
-            result.setRouteAction(HelpIntent.RouteAction.KNOWLEDGE_RAG);
-            result.setComplexity(complexity == HelpIntent.Complexity.L0 ? HelpIntent.Complexity.L1 : complexity);
-            result.setReason("Product help playbook miss → hybrid lexical retrieval");
-            return result;
-        }
+        // 7) Default chitchat → research copilot
+        return chitchat(entities, "Fallback copilot");
+    }
 
-        // 4) Default chitchat → research copilot
+    static boolean isChitchat(String text) {
+        if (text == null) {
+            return false;
+        }
+        String normalized = text.toLowerCase(Locale.ROOT)
+                .replaceAll("[\\p{Punct}\\s，。！？、～~]+", "");
+        if (normalized.isEmpty() || normalized.length() > CHITCHAT_MAX_LENGTH) {
+            return false;
+        }
+        for (String phrase : CHITCHAT_PHRASES) {
+            String compact = phrase.replace(" ", "");
+            if (normalized.equals(compact)) {
+                return true;
+            }
+            boolean cjk = Character.UnicodeScript.of(compact.codePointAt(0)) == Character.UnicodeScript.HAN;
+            if (cjk && normalized.startsWith(compact) && normalized.length() <= compact.length() + 3) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private HelpIntent.Result chitchat(HelpIntent.Entities entities, String reason) {
         HelpIntent.Result result = HelpIntent.Result.empty();
         result.setTicker(entities.getTicker());
         result.setConfidence(0.2);
@@ -168,8 +171,85 @@ public class HelpRoutingService {
         result.setRouteAction(HelpIntent.RouteAction.COPILOT);
         result.setEntities(entities);
         result.setCacheable(false);
-        result.setReason("Fallback copilot");
+        result.setReason(reason);
         return result;
+    }
+
+    private boolean isConfidentResearch(IntentResult research) {
+        return research != null
+                && research.getWorkflowKey() != null
+                && !research.getWorkflowKey().isEmpty()
+                && research.getConfidence() >= researchPriorityConfidence;
+    }
+
+    private HelpIntent.Result research(IntentResult research, HelpIntent.Entities entities, String reason) {
+        HelpIntent.Result result = HelpIntent.Result.empty();
+        result.setWorkflowKey(research.getWorkflowKey());
+        result.setTicker(firstNonEmpty(research.getTicker(), entities.getTicker()));
+        result.setConfidence(research.getConfidence());
+        result.setSource(research.getSource() == null ? "research" : research.getSource());
+        result.setDomain(HelpIntent.Domain.RESEARCH);
+        result.setComplexity(HelpIntent.Complexity.L2);
+        result.setRouteAction(HelpIntent.RouteAction.DISPATCH_WORKFLOW);
+        result.setEntities(entities);
+        result.setCacheable(false);
+        result.setReason(reason);
+        return result;
+    }
+
+    private HelpIntent.Result diagnosis(HelpIntent.Entities entities) {
+        HelpIntent.Result result = HelpIntent.Result.empty();
+        result.setDomain(HelpIntent.Domain.RUN_DIAGNOSIS);
+        result.setComplexity(HelpIntent.Complexity.L2);
+        result.setEntities(entities);
+        result.setCacheable(false);
+        if (!notEmpty(entities.getRunId())) {
+            result.setConfidence(0.8);
+            result.setSource("diagnosis_clarify");
+            result.setRouteAction(HelpIntent.RouteAction.CLARIFY);
+            result.setNeedsClarification(true);
+            result.setClarificationPrompt("请提供运行 ID（runId），或从「运行中心」打开对应 run 后再问我。");
+            result.setReason("Diagnosis without runId");
+            return result;
+        }
+        result.setConfidence(0.85);
+        result.setSource("diagnosis");
+        result.setRouteAction(HelpIntent.RouteAction.HELP_GRAPH);
+        result.setReason("Run diagnosis with runId");
+        return result;
+    }
+
+    private HelpIntent.Result productHelp(String text, HelpIntent.Entities entities, boolean cacheable) {
+        PlaybookService.Playbook playbook = playbookService.findBestMatch(text);
+        HelpIntent.Complexity complexity = estimateComplexity(text);
+        HelpIntent.Result result = HelpIntent.Result.empty();
+        result.setConfidence(playbook != null ? 0.9 : 0.7);
+        result.setSource(playbook != null ? "playbook" : "help_l0");
+        result.setDomain(HelpIntent.Domain.PRODUCT_HELP);
+        result.setComplexity(complexity);
+        result.setEntities(entities);
+        result.setCacheable(cacheable);
+        if (playbook != null) {
+            result.setPlaybookId(playbook.getId());
+            result.setRouteAction(HelpIntent.RouteAction.PLAYBOOK);
+            result.setReason("Playbook hit: " + playbook.getId());
+            return result;
+        }
+        // Playbook miss → hybrid lexical retrieval (L0/L1) or help-loop (L2)
+        if (complexity == HelpIntent.Complexity.L2) {
+            result.setRouteAction(HelpIntent.RouteAction.HELP_GRAPH);
+            result.setCacheable(false);
+            result.setReason("Product help L2 help-loop");
+            return result;
+        }
+        result.setRouteAction(HelpIntent.RouteAction.KNOWLEDGE_RAG);
+        result.setComplexity(complexity == HelpIntent.Complexity.L0 ? HelpIntent.Complexity.L1 : complexity);
+        result.setReason("Product help playbook miss → hybrid lexical retrieval");
+        return result;
+    }
+
+    void setResearchPriorityConfidence(double researchPriorityConfidence) {
+        this.researchPriorityConfidence = researchPriorityConfidence;
     }
 
     HelpIntent.Entities extractEntities(String message, HelpIntent.PageContext page) {

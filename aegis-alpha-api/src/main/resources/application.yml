@@ -50,6 +50,11 @@ aegis:
     base-url: ${AEGIS_ALPHA_LANGCHAIN_BASE_URL:${OPENAI_BASE_URL:}}
     connect-timeout-ms: ${AEGIS_ALPHA_LANGCHAIN_CONNECT_TIMEOUT_MS:5000}
     read-timeout-ms: ${AEGIS_ALPHA_LANGCHAIN_READ_TIMEOUT_MS:120000}
+  router:
+    # Intent routing: LLM results below llm-min-confidence never short-circuit keyword rules;
+    # research-priority-confidence is the minimum to dispatch a workflow from chat.
+    llm-min-confidence: ${AEGIS_ALPHA_ROUTER_LLM_MIN_CONFIDENCE:0.6}
+    research-priority-confidence: ${AEGIS_ALPHA_ROUTER_RESEARCH_PRIORITY_CONFIDENCE:0.6}
   dify:
     enabled: ${AEGIS_ALPHA_DIFY_ENABLED:false}
     base-url: ${AEGIS_ALPHA_DIFY_BASE_URL:https://api.dify.ai/v1}

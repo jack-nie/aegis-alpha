@@ -12,6 +12,9 @@ from .llm_client import LLMClient
 
 logger = logging.getLogger(__name__)
 
+# Used when the model calls a function without a usable confidence argument.
+DEFAULT_LLM_CONFIDENCE = 0.5
+
 
 class IntentClassifier:
     """Classifies user intent to match workflow."""
@@ -55,6 +58,9 @@ class IntentClassifier:
         try:
             result = await self._llm_client.classify_intent(message, tools)
             if result:
+                if result.get("argsError"):
+                    logger.warning("Intent classifier arguments unparsable; using keyword fallback")
+                    return self._keyword_fallback(message, workflows)
                 function_name = result.get("function", "")
                 ticker = result.get("ticker", "") or None
                 if ticker is not None and not str(ticker).strip():
@@ -62,17 +68,14 @@ class IntentClassifier:
 
                 # Look up original key; never reverse-munge underscores/hyphens
                 workflow_key = function_name_map.get(function_name)
-
-                # Find matching workflow to get confidence
-                matched_wf = next(
-                    (wf for wf in workflows if wf.get("workflowKey") == workflow_key),
-                    None,
-                )
+                if workflow_key is None:
+                    logger.warning("Intent classifier called an unknown function; using keyword fallback")
+                    return self._keyword_fallback(message, workflows)
 
                 return IntentResult(
                     workflow_key=workflow_key,
                     ticker=ticker,
-                    confidence=0.9 if matched_wf else 0.5,
+                    confidence=self._model_confidence(result.get("confidence")),
                     source="llm_function_calling",
                     data=self._attach_normalized_symbol(ticker),
                 )
@@ -81,8 +84,21 @@ class IntentClassifier:
             return self._keyword_fallback(message, workflows)
 
         except Exception as e:
-            logger.error(f"Intent classification failed: {e}")
+            logger.warning("Intent classification failed: %s", type(e).__name__)
             return self._keyword_fallback(message, workflows)
+
+    @staticmethod
+    def _model_confidence(value: Any) -> float:
+        """Model-reported confidence clamped to [0, 1]; missing/invalid -> 0.5 (uncalibrated)."""
+        if value is None or isinstance(value, bool):
+            return DEFAULT_LLM_CONFIDENCE
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return DEFAULT_LLM_CONFIDENCE
+        if number != number:  # NaN
+            return DEFAULT_LLM_CONFIDENCE
+        return max(0.0, min(1.0, number))
 
     def _build_tools(
         self, workflows: list[dict[str, Any]]
@@ -120,8 +136,17 @@ class IntentClassifier:
                                         "(e.g. AAPL, 600519.SH). Empty string if not applicable."
                                     ),
                                 },
+                                "confidence": {
+                                    "type": "number",
+                                    "minimum": 0,
+                                    "maximum": 1,
+                                    "description": (
+                                        "How confident you are (0-1) that the user wants to RUN "
+                                        "this workflow now."
+                                    ),
+                                },
                             },
-                            "required": ["ticker"],
+                            "required": ["ticker", "confidence"],
                         },
                     },
                 }

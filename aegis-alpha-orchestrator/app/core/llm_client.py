@@ -20,6 +20,25 @@ DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-flash"
 SUPPORTED_DEEPSEEK_MODELS = {"deepseek-v4-pro", "deepseek-v4-flash"}
 
 
+INTENT_CLASSIFIER_SYSTEM_PROMPT = (
+    "You are the workflow router of an investment-research product. Each function starts a "
+    "long, expensive research WORKFLOW. Call exactly ONE function only when the user clearly asks "
+    "to run that kind of research/report. Set `confidence` (0-1) to how sure you are.\n"
+    "Do NOT call any function (reply with an empty message) when the message is:\n"
+    "- product usage help (how to use / where is / what does X mean, e.g. 'DEGRADED', 'published workflow');\n"
+    "- run diagnosis (why did a run fail / time out / degrade);\n"
+    "- greetings or chit-chat;\n"
+    "- a request to trade, place orders, approve/reject recommendations, or read other users' data;\n"
+    "- anything outside investment research.\n"
+    "Examples:\n"
+    "- '给我一份盘前日报' -> call the daily briefing function, confidence 0.95\n"
+    "- '帮我深度分析一下 NVDA' -> call the deep-dive/stock analysis function with ticker NVDA, confidence 0.9\n"
+    "- '怎么运行一个工作流？' -> no function (product help)\n"
+    "- '这个 run 为什么失败了？' -> no function (run diagnosis)\n"
+    "- '你好' / '帮我下单买入 100 股 AAPL' -> no function"
+)
+
+
 class AgentToolResult:
     """Result of a single agent turn that may request tools."""
 
@@ -370,38 +389,50 @@ class LLMClient:
     async def classify_intent(
         self, message: str, tools: list[dict[str, Any]]
     ) -> dict[str, Any] | None:
-        """Classify intent using function calling."""
-        resolved_model = self._resolve_model()
-        client = self._build_client(resolved_model, temperature=0, timeout_ms=5000)
+        """Classify intent using function calling.
 
-        messages = [
-            SystemMessage(
-                content=(
-                    "You are an intent classifier. Based on the user message, call exactly ONE "
-                    "function that best matches the user's intent. If no function matches, do not "
-                    "call any function. Always respond with a function call or empty response."
-                )
-            ),
-            HumanMessage(content=message),
-        ]
+        Returns ``{"function", "ticker", "confidence", "argsError"}`` when the model called a
+        workflow function, ``None`` when it deliberately called nothing (non-workflow intent)
+        or the call failed. ``confidence`` is the model-provided value (may be ``None``).
+        """
+        resolved_model = self._resolve_model(getattr(self._config, "router_model", "") or None)
+        timeout_ms = int(getattr(self._config, "router_timeout_ms", 0) or 5000)
+        client = self._build_client(resolved_model, temperature=0, timeout_ms=timeout_ms)
+
+        messages: list[BaseMessage] = [SystemMessage(content=INTENT_CLASSIFIER_SYSTEM_PROMPT)]
+        messages.append(HumanMessage(content=message))
 
         try:
             response = await client.ainvoke(
                 messages, tools=tools, tool_choice="auto"
             )
-            tool_calls = getattr(response, "additional_kwargs", {}).get("tool_calls", [])
-            if tool_calls:
-                call = tool_calls[0]
-                fn = call.get("function", {})
-                args = json.loads(fn.get("arguments", "{}"))
-                return {
-                    "function": fn.get("name", ""),
-                    "ticker": args.get("ticker", ""),
-                }
-            return None
         except Exception as e:
-            logger.error(f"Intent classification failed: {e}")
+            logger.warning("Intent classification call failed: %s", type(e).__name__)
             return None
+
+        tool_calls = getattr(response, "additional_kwargs", {}).get("tool_calls", [])
+        if not tool_calls:
+            return None
+        call = tool_calls[0]
+        fn = call.get("function", {}) or {}
+        raw_args = fn.get("arguments") or "{}"
+        try:
+            args = json.loads(raw_args)
+            if not isinstance(args, dict):
+                raise ValueError("arguments is not an object")
+        except (ValueError, TypeError) as e:
+            logger.warning(
+                "Intent classification returned unparsable arguments (len=%d): %s",
+                len(str(raw_args)),
+                type(e).__name__,
+            )
+            return {"function": fn.get("name", ""), "ticker": "", "confidence": None, "argsError": True}
+        return {
+            "function": fn.get("name", ""),
+            "ticker": args.get("ticker", "") or "",
+            "confidence": args.get("confidence"),
+            "argsError": False,
+        }
 
     def _normalize_content(self, content: str, usage: Any = None) -> LLMResponse:
         """Normalize LLM response content to structured format."""

@@ -183,7 +183,7 @@ async def test_classify_llm_preserves_underscore_workflow_key():
     settings = Settings(AEGIS_ALPHA_LANGCHAIN_API_KEY="test")
     client = LLMClient(settings)
     client.classify_intent = AsyncMock(
-        return_value={"function": "run_stock_analysis", "ticker": "AAPL"}
+        return_value={"function": "run_stock_analysis", "ticker": "AAPL", "confidence": 0.9}
     )
     classifier = IntentClassifier(client)
     workflows = [
@@ -214,3 +214,74 @@ async def test_classify_llm_preserves_hyphen_workflow_key():
     result = await classifier.classify("analyze MSFT", workflows)
     assert result.workflow_key == "stock-analysis"
     assert result.ticker == "MSFT"
+
+
+# ---- P1-1: confidence comes from the model, never a constant ----
+
+
+def _classifier_with(result):
+    from app.config import Settings
+    from app.core.intent_classifier import IntentClassifier
+    from app.core.llm_client import LLMClient
+
+    client = LLMClient(Settings(AEGIS_ALPHA_LANGCHAIN_API_KEY="test"))
+    client.classify_intent = AsyncMock(return_value=result)
+    return IntentClassifier(client)
+
+
+_WORKFLOWS = [
+    {"workflowKey": "daily", "name": "Daily", "triggerKeywords": "daily,日报"},
+    {"workflowKey": "deep_dive", "name": "Deep Dive", "triggerKeywords": "deep dive"},
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "raw, expected",
+    [(0.3, 0.3), (0.95, 0.95), (1.7, 1.0), (-2, 0.0), ("0.4", 0.4), ("bogus", 0.5), (None, 0.5)],
+)
+async def test_confidence_is_taken_from_model_and_clamped(raw, expected):
+    result = await _classifier_with(
+        {"function": "run_daily", "ticker": "", "confidence": raw}
+    ).classify("给我一份盘前日报", _WORKFLOWS)
+    assert result.workflow_key == "daily"
+    assert result.source == "llm_function_calling"
+    assert result.confidence == pytest.approx(expected)
+
+
+@pytest.mark.asyncio
+async def test_missing_confidence_defaults_to_half():
+    result = await _classifier_with({"function": "run_daily", "ticker": ""}).classify(
+        "给我一份盘前日报", _WORKFLOWS
+    )
+    assert result.confidence == 0.5
+
+
+@pytest.mark.asyncio
+async def test_corrupted_arguments_fall_back_to_keywords():
+    result = await _classifier_with(
+        {"function": "run_deep_dive", "ticker": "", "confidence": None, "argsError": True}
+    ).classify("daily briefing please", _WORKFLOWS)
+    assert result.source == "keyword_fallback"
+    assert result.workflow_key == "daily"
+
+
+@pytest.mark.asyncio
+async def test_unknown_function_falls_back_to_keywords():
+    result = await _classifier_with(
+        {"function": "run_unknown", "ticker": "", "confidence": 0.99}
+    ).classify("hello there", _WORKFLOWS)
+    assert result.source in {"keyword_fallback", "no_match"}
+    assert result.confidence < 0.9
+
+
+def test_tools_require_confidence_parameter():
+    from app.config import Settings
+    from app.core.intent_classifier import IntentClassifier
+    from app.core.llm_client import LLMClient
+
+    classifier = IntentClassifier(LLMClient(Settings(AEGIS_ALPHA_LANGCHAIN_API_KEY="test")))
+    tools, _ = classifier._build_tools(_WORKFLOWS)
+    params = tools[0]["function"]["parameters"]
+    assert params["properties"]["confidence"]["type"] == "number"
+    assert "confidence" in params["required"]
