@@ -1,0 +1,38 @@
+{
+  "id": "g04_hold_partial_data",
+  "description": "Non-actionable HOLD may remain HOLD with partial data (still degraded / missing financials).",
+  "draft": {
+    "recommendation": "HOLD",
+    "confidence": 0.6,
+    "claims": [
+      {
+        "claimId": "c_last_price",
+        "field": "last_price",
+        "value": 12.0,
+        "evidenceId": "quote-src"
+      }
+    ],
+    "sources": [
+      {
+        "id": "quote-src",
+        "title": "quote"
+      }
+    ]
+  },
+  "state": {
+    "symbol": "IBM",
+    "marketDataContext": {
+      "quote": {
+        "price": 12.0,
+        "asOf": "2026-07-01"
+      }
+    }
+  },
+  "expect": {
+    "recommendation": "HOLD",
+    "ok": true,
+    "degraded": true,
+    "forcedInsufficient": false,
+    "missing_data_contains": ["missing_financials"]
+  }
+}

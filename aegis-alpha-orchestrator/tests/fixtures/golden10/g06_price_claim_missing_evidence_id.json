@@ -1,0 +1,46 @@
+{
+  "id": "g06_price_claim_missing_evidence_id",
+  "description": "BUY with price/financial claims missing evidenceId must strip claims and force INSUFFICIENT_DATA.",
+  "draft": {
+    "recommendation": "BUY",
+    "confidence": 0.7,
+    "claims": [
+      {
+        "claimId": "c_last_price",
+        "field": "last_price",
+        "value": 42.5
+      },
+      {
+        "claimId": "c_revenue",
+        "field": "revenue",
+        "value": 5000000
+      }
+    ],
+    "sources": [
+      {
+        "title": "unbound-market",
+        "type": "market"
+      }
+    ]
+  },
+  "state": {
+    "symbol": "NVDA",
+    "marketDataContext": {
+      "quote": {
+        "price": 42.5,
+        "asOf": "2026-07-01"
+      },
+      "financials": {
+        "revenue": 5000000,
+        "netIncome": 100000
+      }
+    }
+  },
+  "expect": {
+    "recommendation": "INSUFFICIENT_DATA",
+    "ok": false,
+    "degraded": true,
+    "forcedInsufficient": true,
+    "missing_data_contains": ["claims_without_evidence"]
+  }
+}

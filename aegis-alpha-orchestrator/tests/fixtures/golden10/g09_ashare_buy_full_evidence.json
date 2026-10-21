@@ -1,0 +1,63 @@
+{
+  "id": "g09_ashare_buy_full_evidence",
+  "description": "A-share symbol BUY with full quote + financials + bound evidence may pass critique.",
+  "draft": {
+    "recommendation": "BUY",
+    "confidence": 0.78,
+    "claims": [
+      {
+        "claimId": "c_last_price",
+        "field": "last_price",
+        "value": 18.56,
+        "unit": "CNY",
+        "asOf": "2026-07-01",
+        "evidenceId": "ashare-market"
+      },
+      {
+        "claimId": "c_revenue",
+        "field": "revenue",
+        "value": 2200000000,
+        "evidenceId": "ashare-market"
+      },
+      {
+        "claimId": "c_netIncome",
+        "field": "netIncome",
+        "value": 310000000,
+        "evidenceId": "ashare-market"
+      }
+    ],
+    "sources": [
+      {
+        "id": "ashare-market",
+        "title": "A-share quote+financials",
+        "type": "market",
+        "evidenceId": "ashare-market"
+      }
+    ]
+  },
+  "state": {
+    "symbol": "600519.SS",
+    "marketDataContext": {
+      "quote": {
+        "ok": true,
+        "symbol": "600519.SS",
+        "price": 18.56,
+        "currency": "CNY",
+        "asOf": "2026-07-01",
+        "provider": "yahoo"
+      },
+      "financials": {
+        "ok": true,
+        "revenue": 2200000000,
+        "netIncome": 310000000,
+        "period": "2025"
+      }
+    }
+  },
+  "expect": {
+    "recommendation": "BUY",
+    "ok": true,
+    "degraded": false,
+    "forcedInsufficient": false
+  }
+}

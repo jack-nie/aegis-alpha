@@ -6,6 +6,7 @@ import logging
 from typing import Any
 
 from ..config import Settings
+from .memory_selector import read_store_value
 from .persistent_store import PersistentStore  # noqa: E402
 
 logger = logging.getLogger(__name__)
@@ -46,14 +47,8 @@ class MemoryStoreManager:
             await self._store.aput(namespace, key, value)
 
     async def get(self, namespace: tuple[str, str], key: str) -> dict[str, Any] | None:
-        item = await self._store.aget(namespace, key)
-        if item is None:
-            return None
-        value = dict(item.value)
-        value.pop("_expires_at", None)
-        value.pop("_updated_at", None)
-        value.pop("_ttl_remaining", None)
-        return value
+        """Return the stored payload. Meta keys are stripped; expired rows are None."""
+        return await read_store_value(self._store, namespace, key)
 
     async def search(self, namespace: tuple[str, str], limit: int = 10) -> list[dict[str, Any]]:
         items = await self._store.asearch(namespace, limit=limit)
@@ -81,6 +76,10 @@ class MemoryStoreManager:
 
     async def get_ticker_insight(self, symbol: str, insight_key: str) -> dict[str, Any] | None:
         return await self.get(("ticker", symbol), insight_key)
+
+    async def store_approved_conclusion(self, symbol: str, conclusion: dict[str, Any]) -> None:
+        """Persist an approved conclusion. ttl 0 means no expiry (not the 30-minute insight TTL)."""
+        await self.put(("ticker", symbol), "approved_conclusion", conclusion, ttl_seconds=0)
 
     async def store_workflow_pattern(self, workflow_key: str, pattern_key: str, value: dict[str, Any]) -> None:
         await self.put(("workflow", workflow_key), pattern_key, value, ttl_seconds=WORKFLOW_PATTERN_TTL)

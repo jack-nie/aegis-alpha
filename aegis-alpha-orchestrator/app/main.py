@@ -11,9 +11,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from .config import settings
+from .core.checkpointer_lifecycle import close_checkpointer
 from .dependencies import market_data, memory_store_manager
 from .core.tools import get_backend_client
-from .routers import health, workflow, intent
+from .routers import health, workflow, intent, help as help_router
 
 # Paths that do not require service token (health/docs only)
 _PUBLIC_PATH_PREFIXES = (
@@ -44,6 +45,7 @@ async def lifespan(app: FastAPI):
     await get_backend_client(settings).close()
     await memory_store_manager.cleanup()
     await memory_store_manager.close()
+    close_checkpointer()
     logger.info("Shutting down Aegis Alpha Orchestrator")
 
 
@@ -126,6 +128,7 @@ async def request_context_middleware(request: Request, call_next):
 app.include_router(health.router)
 app.include_router(workflow.router)
 app.include_router(intent.router)
+app.include_router(help_router.router)
 
 
 def start():

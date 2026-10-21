@@ -1,0 +1,19 @@
+{
+  "id": "g05_insufficient_explicit",
+  "description": "Explicit INSUFFICIENT_DATA with sparse data remains non-actionable and passes critique ok.",
+  "draft": {
+    "recommendation": "INSUFFICIENT_DATA",
+    "confidence": 0.2,
+    "claims": [],
+    "sources": [],
+    "missingData": ["no_primary_source"]
+  },
+  "state": {},
+  "expect": {
+    "recommendation": "INSUFFICIENT_DATA",
+    "ok": true,
+    "degraded": true,
+    "forcedInsufficient": false,
+    "missing_data_contains": ["no_primary_source", "missing_quote"]
+  }
+}

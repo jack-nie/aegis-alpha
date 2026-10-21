@@ -2,6 +2,7 @@ package com.aegis.alpha.service;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.aegis.alpha.config.AsyncConfig;
 import com.aegis.alpha.domain.AgentTemplate;
 import com.aegis.alpha.domain.WorkflowDefinition;
 import com.aegis.alpha.domain.WorkflowLayout;
@@ -11,8 +12,11 @@ import com.aegis.alpha.domain.WorkflowRunEvent;
 import com.aegis.alpha.domain.WorkflowVersion;
 import com.aegis.alpha.mapper.AgentMapper;
 import com.aegis.alpha.mapper.WorkflowMapper;
+import com.aegis.alpha.security.AuthenticatedPrincipal;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
@@ -20,7 +24,6 @@ import java.time.Duration;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayDeque;
-import java.util.concurrent.CompletableFuture;
 import com.fasterxml.jackson.databind.JsonNode;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -33,6 +36,7 @@ import java.util.Map;
 import java.util.Queue;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.Executor;
 
 @Service
 public class WorkflowService {
@@ -61,6 +65,11 @@ public class WorkflowService {
     private final TokenService tokenService;
     /** When true, read-path refresh also async-writes the code default back to workflow_layout. */
     private final boolean refreshDefaultLayouts;
+    /**
+     * Best-effort background writes. Direct execution is only a non-Spring fallback;
+     * Spring injects the bounded {@code workflowExecutor} bean through the setter below.
+     */
+    private Executor workflowExecutor = Runnable::run;
 
     public WorkflowService(WorkflowMapper mapper,
                            AgentMapper agentMapper,
@@ -145,8 +154,36 @@ public class WorkflowService {
         return runs;
     }
 
+    /**
+     * Owner-scoped run list. A null principal keeps the legacy unscoped list for
+     * internal/test callers; HTTP callers always pass a principal.
+     */
+    public List<WorkflowRun> runsForPrincipal(AuthenticatedPrincipal principal) {
+        List<WorkflowRun> runs = runs();
+        if (principal == null) {
+            return runs;
+        }
+        List<WorkflowRun> visible = new ArrayList<WorkflowRun>();
+        for (WorkflowRun run : runs) {
+            if (canAccess(run, principal)) {
+                visible.add(run);
+            }
+        }
+        return visible;
+    }
+
     public WorkflowRun run(String runId) {
         WorkflowRun run = mapper.findRun(runId);
+        hydrateRunContract(run);
+        return run;
+    }
+
+    /**
+     * Owner-scoped read. Returns null when the run is missing, when the caller is not the owner,
+     * or when the run has no recorded owner and the caller is not an admin.
+     */
+    public WorkflowRun runForPrincipal(String runId, AuthenticatedPrincipal principal) {
+        WorkflowRun run = ownedRun(runId, principal);
         hydrateRunContract(run);
         return run;
     }
@@ -155,8 +192,64 @@ public class WorkflowService {
         return mapper.findNodeRuns(runId);
     }
 
+    public List<WorkflowNodeRun> nodeRunsForPrincipal(String runId, AuthenticatedPrincipal principal) {
+        if (ownedRun(runId, principal) == null) {
+            return Collections.emptyList();
+        }
+        List<WorkflowNodeRun> nodes = mapper.findNodeRuns(runId);
+        return nodes == null ? Collections.<WorkflowNodeRun>emptyList() : nodes;
+    }
+
     public List<WorkflowRunEvent> runEvents(String runId) {
         return mapper.findRunEvents(runId);
+    }
+
+    public List<WorkflowRunEvent> runEventsForPrincipal(String runId, AuthenticatedPrincipal principal) {
+        if (ownedRun(runId, principal) == null) {
+            return Collections.emptyList();
+        }
+        List<WorkflowRunEvent> events = mapper.findRunEvents(runId);
+        return events == null ? Collections.<WorkflowRunEvent>emptyList() : events;
+    }
+
+    /** True when the principal may read the run (owner or admin). */
+    public boolean isRunAccessible(WorkflowRun run, AuthenticatedPrincipal principal) {
+        return canAccess(run, principal);
+    }
+
+    /** Loads the run and returns it only when the principal is allowed to read it. */
+    private WorkflowRun ownedRun(String runId, AuthenticatedPrincipal principal) {
+        if (runId == null || runId.trim().isEmpty() || principal == null) {
+            return null;
+        }
+        WorkflowRun run = mapper.findRun(runId);
+        return canAccess(run, principal) ? run : null;
+    }
+
+    private boolean canAccess(WorkflowRun run, AuthenticatedPrincipal principal) {
+        if (run == null || principal == null) {
+            return false;
+        }
+        if (principal.hasRole("admin")) {
+            return true;
+        }
+        // Legacy/system runs without an owner are only visible to admins.
+        if (run.getUserId() == null || run.getUserId().trim().isEmpty()) {
+            return false;
+        }
+        if (!run.getUserId().equals(principal.getUserId())) {
+            return false;
+        }
+        return run.getTenantId() != null && run.getTenantId().equals(principal.getTenantId());
+    }
+
+    /** Copies the caller identity onto a new run (no-op for internal/test callers). */
+    private void applyRunOwner(WorkflowRun run, AuthenticatedPrincipal principal) {
+        if (run == null || principal == null) {
+            return;
+        }
+        run.setUserId(principal.getUserId());
+        run.setTenantId(principal.getTenantId());
     }
 
     private void hydrateRunContract(WorkflowRun run) {
@@ -218,8 +311,16 @@ public class WorkflowService {
         return result;
     }
 
+    /** Authorization failure for workflow edits; deliberately distinct from validation errors. */
+    public static class AccessDeniedException extends IllegalArgumentException {
+        public AccessDeniedException(String message) {
+            super(message);
+        }
+    }
+
     public WorkflowVersion publishVersion(String workflowKey, String username) {
         WorkflowDefinition definition = requireDefinition(workflowKey);
+        requireEditable(definition, username);
         Map<String, Object> currentLayout = layout(workflowKey);
         validationService.validateLayout(currentLayout);
         WorkflowVersion version = new WorkflowVersion();
@@ -269,7 +370,34 @@ public class WorkflowService {
         }
     }
 
+    /**
+     * Layout write for an authenticated user. Readonly system workflows and workflows
+     * owned by somebody else are rejected before any mutation.
+     */
+    public Map<String, Object> saveLayoutForUser(String username, String workflowKey, Map<String, Object> body) {
+        requireEditable(mapper.findDefinition(workflowKey), username);
+        return saveLayoutInternal(workflowKey, body, username);
+    }
+
+    /** Internal/system layout write (seeding, best-effort refresh). No user checks. */
     public Map<String, Object> saveLayout(String workflowKey, Map<String, Object> body) {
+        return saveLayoutInternal(workflowKey, body, null);
+    }
+
+    private void requireEditable(WorkflowDefinition definition, String username) {
+        if (definition == null) {
+            return;
+        }
+        if (definition.isReadonlyFlag()) {
+            throw new AccessDeniedException("Readonly system workflows cannot be edited.");
+        }
+        if (definition.getOwnerUsername() != null
+                && !definition.getOwnerUsername().equals(username)) {
+            throw new AccessDeniedException("Workflow belongs to another user.");
+        }
+    }
+
+    private Map<String, Object> saveLayoutInternal(String workflowKey, Map<String, Object> body, String username) {
         if (mapper.findDefinition(workflowKey) == null) {
             WorkflowDefinition definition = new WorkflowDefinition();
             definition.setWorkflowKey(workflowKey);
@@ -280,6 +408,7 @@ public class WorkflowService {
             definition.setNodes(0);
             definition.setEdges(0);
             definition.setReadonlyFlag(false);
+            definition.setOwnerUsername(username);
             definition.setUpdatedAt(now());
             mapper.insertDefinition(definition);
         }
@@ -313,11 +442,17 @@ public class WorkflowService {
     }
 
     public WorkflowRun createRun(String workflowKey, String subject, Map<String, Object> inputs) {
+        return createRun(workflowKey, subject, inputs, null);
+    }
+
+    public WorkflowRun createRun(String workflowKey, String subject, Map<String, Object> inputs,
+                                 AuthenticatedPrincipal principal) {
         String key = workflowKey == null || workflowKey.trim().isEmpty() ? "daily" : workflowKey.trim();
         WorkflowVersion version = mapper.findLatestVersion(key);
         Map<String, Object> runLayout = layoutForRun(key, version);
         validationService.validateLayout(runLayout);
         Map<String, Object> safeInputs = inputs == null ? new LinkedHashMap<String, Object>() : new LinkedHashMap<>(inputs);
+        applyAuthenticatedUserId(safeInputs, principal == null ? null : principal.getUserId());
         WorkflowRun run = new WorkflowRun();
         run.setRunId(UUID.randomUUID().toString());
         run.setWorkflowKey(key);
@@ -331,6 +466,7 @@ public class WorkflowService {
         run.setControlStatus("ACTIVE");
         run.setPauseRequested(0);
         run.setCancelRequested(0);
+        applyRunOwner(run, principal);
         mapper.insertRun(run);
         recordRunEvent(run, "RUN_CREATED", null, null, "RUNNING", "Workflow run created.", null, 0);
         return run;
@@ -354,24 +490,30 @@ public class WorkflowService {
         }
     }
     public WorkflowRun start(String workflowKey, String subject) {
-        return start(workflowKey, subject, new LinkedHashMap<String, Object>(), null);
+        return start(workflowKey, subject, new LinkedHashMap<String, Object>(), (String) null, null);
     }
 
     public WorkflowRun start(String workflowKey, String subject, Map<String, Object> inputs) {
-        return start(workflowKey, subject, inputs, null);
+        return start(workflowKey, subject, inputs, (String) null, null);
     }
 
     public WorkflowRun start(String workflowKey, String subject, Map<String, Object> inputs, String idempotencyKey) {
+        return start(workflowKey, subject, inputs, idempotencyKey, null);
+    }
+
+    public WorkflowRun start(String workflowKey, String subject, Map<String, Object> inputs, String idempotencyKey,
+                             AuthenticatedPrincipal principal) {
         String key = workflowKey == null || workflowKey.trim().isEmpty() ? "daily" : workflowKey.trim();
         String normalizedIdempotencyKey = normalizeIdempotencyKey(idempotencyKey);
         WorkflowRun existing = findIdempotentRun(key, subject, normalizedIdempotencyKey);
-        if (existing != null) {
+        if (existing != null && (principal == null || isRunAccessible(existing, principal))) {
             return existing;
         }
         WorkflowVersion version = mapper.findLatestVersion(key);
         Map<String, Object> runLayout = layoutForRun(key, version);
         validationService.validateLayout(runLayout);
         Map<String, Object> safeInputs = inputs == null ? new LinkedHashMap<String, Object>() : new LinkedHashMap<>(inputs);
+        applyAuthenticatedUserId(safeInputs, principal == null ? null : principal.getUserId());
         WorkflowRun run = new WorkflowRun();
         run.setRunId(UUID.randomUUID().toString());
         run.setWorkflowKey(key);
@@ -386,6 +528,7 @@ public class WorkflowService {
         run.setControlStatus("ACTIVE");
         run.setPauseRequested(0);
         run.setCancelRequested(0);
+        applyRunOwner(run, principal);
         mapper.insertRun(run);
         recordRunEvent(run, "RUN_CREATED", null, null, "RUNNING", "Workflow run created.", null, 0);
 
@@ -416,12 +559,21 @@ public class WorkflowService {
 
     public WorkflowRun startWithStreaming(String workflowKey, String subject, Map<String, Object> inputs,
                                           org.springframework.web.servlet.mvc.method.annotation.SseEmitter emitter,
+                                          AuthenticatedPrincipal principal) {
+        return startWithStreaming(workflowKey, subject, inputs, emitter,
+                principal == null ? null : principal.getUserId(),
+                principal == null ? null : principal.getTenantId());
+    }
+
+    public WorkflowRun startWithStreaming(String workflowKey, String subject, Map<String, Object> inputs,
+                                          org.springframework.web.servlet.mvc.method.annotation.SseEmitter emitter,
                                           String userId, String tenantId) {
         String key = workflowKey == null || workflowKey.trim().isEmpty() ? "daily" : workflowKey.trim();
         WorkflowVersion version = mapper.findLatestVersion(key);
         Map<String, Object> runLayout = layoutForRun(key, version);
         validationService.validateLayout(runLayout);
         Map<String, Object> safeInputs = inputs == null ? new LinkedHashMap<String, Object>() : new LinkedHashMap<String, Object>(inputs);
+        applyAuthenticatedUserId(safeInputs, userId);
         final WorkflowRun run = new WorkflowRun();
         run.setRunId(UUID.randomUUID().toString());
         run.setWorkflowKey(key);
@@ -435,11 +587,19 @@ public class WorkflowService {
         run.setControlStatus("ACTIVE");
         run.setPauseRequested(0);
         run.setCancelRequested(0);
+        if (hasText(userId)) {
+            run.setUserId(userId.trim());
+        }
+        if (hasText(tenantId)) {
+            run.setTenantId(tenantId.trim());
+        }
         mapper.insertRun(run);
         recordRunEvent(run, "RUN_CREATED", null, null, "RUNNING", "Workflow run created (streaming).", null, 0);
         String streamUrl = langChainGateway.streamWorkflowUrl();
         String delegatedToken = issueDelegatedPortfolioReadToken(run.getRunId(), userId, tenantId, safeInputs);
-        String streamBody = langChainGateway.buildStreamBody(runLayout, subject, safeInputs, delegatedToken);
+        boolean requireApproval = requireApprovalRequested(safeInputs, runLayout);
+        String streamBody = langChainGateway.buildStreamBody(
+                runLayout, subject, safeInputs, delegatedToken, run.getRunId(), requireApproval);
         final String runId = run.getRunId();
         SseStreamReader.readSse(streamUrl, streamBody, langChainGateway.serviceAuthorizationHeader(),
                 new SseStreamReader.SseEventHandler() {
@@ -470,14 +630,18 @@ public class WorkflowService {
                     } else if ("human_interrupt".equals(eventName)) {
                         Map<String, Object> payload = parseJsonMap(data);
                         run.setStatus("PAUSED");
-                        run.setControlStatus("PAUSED");
+                        run.setControlStatus("HUMAN_INTERRUPT");
                         run.setPauseRequested(1);
+                        run.setResultJson(data == null ? "{}" : data);
                         mapper.updateRun(run);
                         recordRunEvent(run, "RUN_PAUSED", null, null, "PAUSED",
                                 "Workflow paused for human interrupt (streaming).", payload, 950000);
                         emitter.send(org.springframework.web.servlet.mvc.method.annotation.SseEmitter.event()
                                 .name("human_interrupt").data(data == null ? "{}" : data));
                     } else if ("workflow_complete".equals(eventName)) {
+                        if ("HUMAN_INTERRUPT".equals(run.getControlStatus())) {
+                            return;
+                        }
                         Map<String, Object> payload = parseJsonMap(data);
                         boolean degraded = Boolean.TRUE.equals(payload.get("degraded"))
                                 || "true".equalsIgnoreCase(String.valueOf(payload.get("degraded")));
@@ -599,6 +763,26 @@ public class WorkflowService {
         }
     }
 
+    /**
+     * The orchestrator loads preferences from final_state.userId / user_id.
+     * Streaming used to send inputs only, so an authenticated caller was dropped.
+     */
+    private static void applyAuthenticatedUserId(Map<String, Object> safeInputs, String userId) {
+        if (userId == null || userId.trim().isEmpty() || safeInputs == null) {
+            return;
+        }
+        Object existingUserId = safeInputs.get("userId");
+        Object existingUserSnake = safeInputs.get("user_id");
+        if (hasText(existingUserId) || hasText(existingUserSnake)) {
+            return;
+        }
+        safeInputs.put("userId", userId.trim());
+    }
+
+    private static boolean hasText(Object value) {
+        return value != null && !String.valueOf(value).trim().isEmpty();
+    }
+
     private String firstNonBlank(String first, String second, String fallback) {
         if (first != null && !first.trim().isEmpty()) {
             return first.trim();
@@ -633,16 +817,22 @@ public class WorkflowService {
 
 
     public WorkflowRun queueStart(String workflowKey, String subject, Map<String, Object> inputs, String idempotencyKey) {
+        return queueStart(workflowKey, subject, inputs, idempotencyKey, null);
+    }
+
+    public WorkflowRun queueStart(String workflowKey, String subject, Map<String, Object> inputs, String idempotencyKey,
+                                  AuthenticatedPrincipal principal) {
         String key = workflowKey == null || workflowKey.trim().isEmpty() ? "daily" : workflowKey.trim();
         String normalizedIdempotencyKey = normalizeIdempotencyKey(idempotencyKey);
         WorkflowRun existing = findIdempotentRun(key, subject, normalizedIdempotencyKey);
-        if (existing != null) {
+        if (existing != null && (principal == null || isRunAccessible(existing, principal))) {
             return existing;
         }
         WorkflowVersion version = mapper.findLatestVersion(key);
         Map<String, Object> runLayout = layoutForRun(key, version);
         validationService.validateLayout(runLayout);
         Map<String, Object> safeInputs = inputs == null ? new LinkedHashMap<String, Object>() : new LinkedHashMap<>(inputs);
+        applyAuthenticatedUserId(safeInputs, principal == null ? null : principal.getUserId());
         String timestamp = now();
         WorkflowRun run = new WorkflowRun();
         run.setRunId(UUID.randomUUID().toString());
@@ -659,6 +849,7 @@ public class WorkflowService {
         run.setControlStatus("QUEUED");
         run.setPauseRequested(0);
         run.setCancelRequested(0);
+        applyRunOwner(run, principal);
         mapper.insertRun(run);
         recordRunEvent(run, "RUN_CREATED", null, null, "QUEUED", "Workflow run queued.", safeInputs, 0);
         return mapper.findRun(run.getRunId());
@@ -722,14 +913,108 @@ public class WorkflowService {
     public WorkflowRun resumeRun(String runId) {
         WorkflowRun run = requireRun(runId);
         if ("PAUSED".equals(run.getStatus())) {
-            run.setStatus("QUEUED");
-            run.setControlStatus("QUEUED");
-            run.setPauseRequested(0);
-            run.setCompletedAt(null);
-            mapper.updateRun(run);
-            recordRunEvent(run, "RUN_RESUMED", null, null, "QUEUED", "Workflow run resumed into queue.", null, 3);
+            // Approval pauses resume through decideApproval, not a full requeue.
+            if ("HUMAN_INTERRUPT".equals(run.getControlStatus())) {
+                return mapper.findRun(runId);
+            }
+            if (run.getControlStatus() == null || "PAUSED".equals(run.getControlStatus())) {
+                run.setStatus("QUEUED");
+                run.setControlStatus("QUEUED");
+                run.setPauseRequested(0);
+                run.setCompletedAt(null);
+                mapper.updateRun(run);
+                recordRunEvent(run, "RUN_RESUMED", null, null, "QUEUED", "Workflow run resumed into queue.", null, 3);
+            }
         }
         return mapper.findRun(runId);
+    }
+
+    /**
+     * Continue a run paused at the orchestrator approval gate. Does not start a new execution.
+     */
+    public WorkflowRun decideApproval(String runId, boolean approved) {
+        WorkflowRun run = requireRun(runId);
+        if (!isHumanInterrupt(run)) {
+            throw new IllegalStateException("Workflow run is not awaiting human approval: " + runId);
+        }
+        Map<String, Object> resume = langChainGateway.resumeWorkflow(run.getRunId(), approved);
+        if (isResumeOk(resume)) {
+            run.setStatus("COMPLETED");
+            run.setCompletedAt(now());
+            run.setControlStatus("COMPLETED");
+            run.setPauseRequested(0);
+            Map<String, Object> result = new LinkedHashMap<>();
+            if (resume != null) {
+                result.putAll(resume);
+            }
+            if (approved) {
+                result.put("approval", "approved");
+            } else {
+                result.put("approval", "rejected");
+                result.put("rejected", true);
+                if (run.getErrorMessage() == null || run.getErrorMessage().trim().isEmpty()) {
+                    run.setErrorMessage("REJECTED");
+                }
+            }
+            run.setResultJson(toJson(result));
+            mapper.updateRun(run);
+            recordRunEvent(run, approved ? "RUN_APPROVED" : "RUN_REJECTED", null, null, "COMPLETED",
+                    approved ? "Human approval accepted; workflow resumed."
+                            : "Human approval rejected; workflow completed.",
+                    result, 1000000);
+        } else {
+            String error = resume == null ? "" : string(resume.get("error"));
+            run.setErrorMessage(error == null || error.trim().isEmpty() ? "resume failed" : error);
+            mapper.updateRun(run);
+            recordRunEvent(run, "RUN_RESUME_FAILED", null, null, "PAUSED",
+                    "Human approval resume failed.", resume, 960000);
+        }
+        return mapper.findRun(runId);
+    }
+
+    private boolean isHumanInterrupt(WorkflowRun run) {
+        return run != null && "HUMAN_INTERRUPT".equals(run.getControlStatus());
+    }
+
+    private boolean isResumeOk(Map<String, Object> resume) {
+        if (resume == null) {
+            return false;
+        }
+        Object ok = resume.get("ok");
+        if (ok instanceof Boolean) {
+            return (Boolean) ok;
+        }
+        return "true".equalsIgnoreCase(string(ok));
+    }
+
+    @SuppressWarnings("unchecked")
+    private boolean requireApprovalRequested(Map<String, Object> inputs, Map<String, Object> layout) {
+        if (isTruthyFlag(inputs, "requireApproval") || isTruthyFlag(inputs, "require_approval")) {
+            return true;
+        }
+        if (layout == null || !(layout.get("metadata") instanceof Map)) {
+            return false;
+        }
+        return isTruthyFlag((Map<String, Object>) layout.get("metadata"), "requireApproval")
+                || isTruthyFlag((Map<String, Object>) layout.get("metadata"), "require_approval");
+    }
+
+    private boolean isTruthyFlag(Map<String, Object> source, String key) {
+        if (source == null || key == null || !source.containsKey(key)) {
+            return false;
+        }
+        Object value = source.get(key);
+        if (value instanceof Boolean) {
+            return (Boolean) value;
+        }
+        if (value instanceof Number) {
+            return ((Number) value).intValue() != 0;
+        }
+        if (value == null) {
+            return false;
+        }
+        String text = String.valueOf(value).trim();
+        return "true".equalsIgnoreCase(text) || "1".equals(text) || "yes".equalsIgnoreCase(text);
     }
 
     public WorkflowRun cancelRun(String runId) {
@@ -1251,12 +1536,20 @@ public class WorkflowService {
         return workflowKey;
     }
 
+    /** Optional setter injection keeps the existing constructor contract for tests. */
+    @Autowired(required = false)
+    public void setWorkflowExecutor(@Qualifier(AsyncConfig.WORKFLOW_EXECUTOR) Executor workflowExecutor) {
+        if (workflowExecutor != null) {
+            this.workflowExecutor = workflowExecutor;
+        }
+    }
+
     private void maybePersistRefreshedLayout(String workflowKey, Map<String, Object> refreshed) {
         if (!refreshDefaultLayouts) {
             return;
         }
         Map<String, Object> snapshot = new LinkedHashMap<>(refreshed);
-        CompletableFuture.runAsync(() -> {
+        workflowExecutor.execute(() -> {
             try {
                 saveLayout(workflowKey, snapshot);
             } catch (Exception ignored) {

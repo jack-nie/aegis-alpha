@@ -1,19 +1,32 @@
 package com.aegis.alpha.service;
 
+import com.aegis.alpha.config.AsyncConfig;
 import com.aegis.alpha.domain.AgentTemplate;
-import com.aegis.alpha.service.IntentRouterService.IntentResult;
+import com.aegis.alpha.domain.HelpSessionState;
 import com.aegis.alpha.domain.WorkflowRun;
 import com.aegis.alpha.mapper.ChatMapper;
+import com.aegis.alpha.security.AuthenticatedPrincipal;
+import com.aegis.alpha.service.help.HelpAnswerCacheService;
+import com.aegis.alpha.service.help.HelpIntent;
+import com.aegis.alpha.service.help.HelpRoutingService;
+import com.aegis.alpha.service.help.HelpService;
+import com.aegis.alpha.service.help.HelpSessionStateService;
+import com.aegis.alpha.service.help.trace.HelpTrace;
+import com.aegis.alpha.service.help.trace.HelpTraceService;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.stereotype.Service;
 
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
-import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executor;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -41,48 +54,515 @@ public class ChatService {
     private final LangChainGateway langChainGateway;
     private final MarketDataService marketDataService;
     private final WorkflowService workflowService;
-    private final IntentRouterService intentRouterService;
+    private final HelpRoutingService helpRoutingService;
+    private final HelpService helpService;
+    private final HelpAnswerCacheService helpAnswerCacheService;
+    private final HelpSessionStateService helpSessionStateService;
+    private final HelpTraceService helpTraceService;
+    private final Executor workflowExecutor;
 
+    @Autowired
     public ChatService(ChatMapper mapper,
                        LangChainGateway langChainGateway,
                        MarketDataService marketDataService,
                        WorkflowService workflowService,
-                       IntentRouterService intentRouterService) {
+                       HelpRoutingService helpRoutingService,
+                       HelpService helpService,
+                       HelpAnswerCacheService helpAnswerCacheService,
+                       HelpSessionStateService helpSessionStateService,
+                       HelpTraceService helpTraceService,
+                       @Qualifier(AsyncConfig.WORKFLOW_EXECUTOR) Executor workflowExecutor) {
         this.mapper = mapper;
         this.langChainGateway = langChainGateway;
         this.marketDataService = marketDataService;
         this.workflowService = workflowService;
-        this.intentRouterService = intentRouterService;
+        this.helpRoutingService = helpRoutingService;
+        this.helpService = helpService;
+        this.helpAnswerCacheService = helpAnswerCacheService;
+        this.helpSessionStateService = helpSessionStateService;
+        this.helpTraceService = helpTraceService;
+        this.workflowExecutor = workflowExecutor;
+    }
+
+    /** Backward-compatible constructor for unit tests. */
+    public ChatService(ChatMapper mapper,
+                       LangChainGateway langChainGateway,
+                       MarketDataService marketDataService,
+                       WorkflowService workflowService,
+                       HelpRoutingService helpRoutingService,
+                       HelpService helpService,
+                       HelpAnswerCacheService helpAnswerCacheService) {
+        this(mapper, langChainGateway, marketDataService, workflowService, helpRoutingService, helpService,
+                helpAnswerCacheService, null, null, null);
+    }
+
+    /** Backward-compatible constructor for older unit tests. */
+    public ChatService(ChatMapper mapper,
+                       LangChainGateway langChainGateway,
+                       MarketDataService marketDataService,
+                       WorkflowService workflowService,
+                       HelpRoutingService helpRoutingService,
+                       HelpService helpService) {
+        this(mapper, langChainGateway, marketDataService, workflowService, helpRoutingService, helpService,
+                null, null, null, null);
     }
 
     public Object threads() {
-        return mapper.threads();
+        return threads(null);
     }
 
+    /**
+     * Thread list for the authenticated caller. A null principal keeps the legacy
+     * unscoped list for internal/test callers; HTTP callers always pass a principal.
+     */
+    public Object threads(AuthenticatedPrincipal principal) {
+        if (principal == null) {
+            return mapper.threads();
+        }
+        return mapper.threadsForPrincipal(principal.getUserId(), principal.getTenantId());
+    }
+
+    /** Backward-compatible entry point for tests / internal callers without a principal. */
     public Map<String, Object> reply(Map<String, Object> body) {
+        return reply(body, null);
+    }
+
+    public Map<String, Object> reply(Map<String, Object> body, AuthenticatedPrincipal principal) {
         String message = text(body, "message", "");
-        String threadId = UUID.randomUUID().toString();
-        mapper.insertThread(threadId, title(message));
+        String threadId = resolveThreadId(body, message, principal);
         mapper.insertMessage(UUID.randomUUID().toString(), threadId, "user", message);
 
-        /* ---- intent-based workflow routing via LLM + DB keywords ---- */
-        IntentResult intent = intentRouterService.classify(message);
-        String workflowKey = intent != null ? intent.getWorkflowKey() : null;
-        // explicit override from caller takes priority
-        String explicit = text(body, "workflowKey", "");
-        if (!explicit.isEmpty()) {
-            workflowKey = explicit;
+        HelpTrace trace = helpTraceService == null
+                ? null
+                : helpTraceService.start(UUID.randomUUID().toString(), threadId);
+        try {
+            return replyInternal(body, principal, message, threadId, trace);
+        } finally {
+            if (helpTraceService != null) {
+                helpTraceService.finish(trace);
+            }
         }
-        if (workflowKey != null) {
-            return dispatchWorkflow(workflowKey, message, threadId, body);
+    }
+
+    private Map<String, Object> replyInternal(Map<String, Object> body,
+                                              AuthenticatedPrincipal principal,
+                                              String message,
+                                              String threadId,
+                                              HelpTrace trace) {
+        HelpIntent.PageContext pageContext = HelpIntent.PageContext.fromMap(objectMap(body == null ? null : body.get("pageContext")));
+        HelpSessionState session = loadSession(threadId, principal);
+
+        /* Safety refusals first (no side effects) */
+        Map<String, Object> safety = helpService.safetyRefuse(threadId, message, null);
+        if (safety != null) {
+            markTrace(trace, HelpIntent.Domain.PRODUCT_HELP, HelpIntent.RouteAction.PLAYBOOK,
+                    text(safety, "provider", "help-safety"), false, false);
+            mergeDomainIfMissing(safety, HelpIntent.Domain.PRODUCT_HELP, HelpIntent.RouteAction.PLAYBOOK);
+            persistAssistant(threadId, text(safety, "content", ""));
+            recordSession(threadId, principal, session, message, null, safety, false);
+            return safety;
         }
 
-        /* ---- default: copilot chat ---- */
-        return copilotReply(message, threadId, body);
+        /* Explicit workflowKey override takes priority */
+        String explicit = text(body, "workflowKey", "");
+        if (!explicit.isEmpty()) {
+            Map<String, Object> response = dispatchWorkflow(explicit, message, threadId, body, principal, trace);
+            decorateResearch(response, explicit);
+            recordSession(threadId, principal, session, message, null, response, false);
+            return response;
+        }
+
+        HelpIntent.Result intent = helpRoutingService.classifyExtended(message, pageContext);
+        applyPreferredDomain(body, intent);
+        applySessionRunId(intent, session);
+
+        /* Public help answer cache (entity-gated; never private run/portfolio) */
+        if (helpAnswerCacheService != null) {
+            Map<String, Object> cached = helpAnswerCacheService.getIfAllowed(message, intent);
+            if (cached != null) {
+                cached.put("threadId", threadId);
+                cached.put("cacheHit", true);
+                markTrace(trace, intent, text(cached, "provider", "help-cache"), true,
+                        Boolean.TRUE.equals(cached.get("escalateHuman")));
+                persistAssistant(threadId, text(cached, "content", ""));
+                recordSession(threadId, principal, session, message, intent, cached, false);
+                return cached;
+            }
+        }
+
+        /* Roles always come from the authenticated principal, never from the request body. */
+        List<String> roles = rolesOf(principal);
+        Map<String, Object> helpResponse = null;
+
+        switch (intent.getRouteAction()) {
+            case DISPATCH_WORKFLOW:
+                if (intent.getWorkflowKey() != null && !intent.getWorkflowKey().isEmpty()) {
+                    Map<String, Object> response = dispatchWorkflow(intent.getWorkflowKey(), message, threadId, body, principal, trace);
+                    decorateFromIntent(response, intent);
+                    recordSession(threadId, principal, session, message, intent, response, false);
+                    return response;
+                }
+                break;
+            case CLARIFY:
+                Map<String, Object> clarify = helpService.clarify(threadId, intent);
+                markTrace(trace, intent, text(clarify, "provider", "help-clarify"), false, false);
+                persistAssistant(threadId, text(clarify, "content", ""));
+                recordSession(threadId, principal, session, message, intent, clarify, true);
+                return clarify;
+            case PLAYBOOK: {
+                helpResponse = helpService.answerFromPlaybook(threadId, message, intent);
+                if (helpResponse == null) {
+                    helpResponse = helpService.answerFromKnowledge(threadId, message, intent, roles);
+                }
+                if (helpResponse == null) {
+                    helpResponse = helpService.answerFromHelpLoop(threadId, message, intent, roles);
+                }
+                break;
+            }
+            case HELP_GRAPH:
+                if (intent.getDomain() == HelpIntent.Domain.RUN_DIAGNOSIS) {
+                    Map<String, Object> diagnosis = helpService.diagnoseRun(threadId, message, intent, principal);
+                    markTrace(trace, intent, text(diagnosis, "provider", "help-diagnosis"), false,
+                            Boolean.TRUE.equals(diagnosis.get("escalateHuman")));
+                    markRetrievalRounds(trace, diagnosis);
+                    persistAssistant(threadId, text(diagnosis, "content", ""));
+                    recordSession(threadId, principal, session, message, intent, diagnosis, false);
+                    return diagnosis;
+                }
+                helpResponse = helpService.answerFromPlaybook(threadId, message, intent);
+                if (helpResponse == null) {
+                    helpResponse = helpService.answerFromHelpLoop(threadId, message, intent, roles);
+                }
+                break;
+            case KNOWLEDGE_RAG:
+                helpResponse = helpService.answerFromKnowledge(threadId, message, intent, roles);
+                if (helpResponse == null) {
+                    helpResponse = helpService.answerFromHelpLoop(threadId, message, intent, roles);
+                }
+                break;
+            case COPILOT:
+            default:
+                break;
+        }
+
+        if (helpResponse != null) {
+            if (helpAnswerCacheService != null) {
+                helpAnswerCacheService.putIfAllowed(message, intent, helpResponse);
+            }
+            markTrace(trace, intent, text(helpResponse, "provider", "help"), false,
+                    Boolean.TRUE.equals(helpResponse.get("escalateHuman")));
+            markRetrievalRounds(trace, helpResponse);
+            persistAssistant(threadId, text(helpResponse, "content", ""));
+            recordSession(threadId, principal, session, message, intent, helpResponse, false);
+            return helpResponse;
+        }
+
+        Map<String, Object> copilot = copilotReply(message, threadId, body);
+        decorateFromIntent(copilot, intent);
+        markTrace(trace, intent, "copilot", false, false);
+        recordSession(threadId, principal, session, message, intent, copilot, false);
+        return copilot;
     }
 
     /* ================================================================ *
-     * Intent routing  –  only the 6 seeded keys are valid targets.
+     * Session state / trace helpers (P1/P2)
+     * ================================================================ */
+
+    private HelpSessionState loadSession(String threadId, AuthenticatedPrincipal principal) {
+        if (helpSessionStateService == null || principal == null) {
+            return null;
+        }
+        try {
+            return helpSessionStateService.load(threadId, principal);
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    /**
+     * Multi-turn continuity: a follow-up such as "它为什么失败" can omit runId.
+     * When the thread's last outcome was a run diagnosis, reuse that run so the
+     * clarification gate is not re-triggered on every turn.
+     */
+    private void applySessionRunId(HelpIntent.Result intent, HelpSessionState session) {
+        if (intent == null || session == null) {
+            return;
+        }
+        String lastRunId = session.getLastRunId();
+        if (lastRunId == null || lastRunId.trim().isEmpty()) {
+            return;
+        }
+        if (!"RUN_DIAGNOSIS".equalsIgnoreCase(session.getLastDomain())) {
+            return;
+        }
+        if (intent.getEntities() == null) {
+            intent.setEntities(new HelpIntent.Entities());
+        }
+        if (intent.getEntities().getRunId() != null && !intent.getEntities().getRunId().trim().isEmpty()) {
+            return;
+        }
+        intent.getEntities().setRunId(lastRunId.trim());
+        if (intent.getRouteAction() == HelpIntent.RouteAction.CLARIFY) {
+            intent.setRouteAction(HelpIntent.RouteAction.HELP_GRAPH);
+            intent.setNeedsClarification(false);
+            intent.setClarificationPrompt(null);
+        }
+    }
+
+    private void recordSession(String threadId,
+                               AuthenticatedPrincipal principal,
+                               HelpSessionState session,
+                               String message,
+                               HelpIntent.Result intent,
+                               Map<String, Object> response,
+                               boolean pendingClarification) {
+        if (helpSessionStateService == null || principal == null) {
+            return;
+        }
+        try {
+            HelpSessionState state = session != null ? session : HelpSessionState.forThread(threadId);
+            if (state.getGoal() == null || state.getGoal().trim().isEmpty()) {
+                state.setGoal(message);
+            }
+            String domain = intent != null && intent.getDomain() != null
+                    ? intent.getDomain().name()
+                    : text(response, "domain", null);
+            String routeAction = intent != null && intent.getRouteAction() != null
+                    ? intent.getRouteAction().name()
+                    : text(response, "routeAction", null);
+            String runId = text(response, "runId", null);
+            if ((runId == null || runId.trim().isEmpty())
+                    && intent != null && intent.getEntities() != null) {
+                runId = intent.getEntities().getRunId();
+            }
+            helpSessionStateService.mergeAfterRoute(state, domain, routeAction, runId, pendingClarification);
+            if (pendingClarification) {
+                helpSessionStateService.mergeCheckpoint(state, "{\"pending\":\"run_id\"}");
+            } else if (intent != null && intent.getDomain() == HelpIntent.Domain.RUN_DIAGNOSIS) {
+                /* A successful diagnosis consumes the pending run-id checkpoint. */
+                helpSessionStateService.mergeCheckpoint(state, "");
+            }
+            helpSessionStateService.save(state, principal);
+        } catch (Exception ignored) {
+            /* Session state must never break a chat response. */
+        }
+    }
+
+    private void markTrace(HelpTrace trace,
+                           HelpIntent.Result intent,
+                           String provider,
+                           boolean cacheHit,
+                           boolean escalated) {
+        if (helpTraceService == null || trace == null) {
+            return;
+        }
+        if (intent != null) {
+            helpTraceService.markRoute(trace,
+                    intent.getDomain() == null ? null : intent.getDomain().name(),
+                    intent.getRouteAction() == null ? null : intent.getRouteAction().name());
+        }
+        markTrace(trace, null, null, provider, cacheHit, escalated);
+    }
+
+    private void markTrace(HelpTrace trace,
+                           HelpIntent.Domain domain,
+                           HelpIntent.RouteAction action,
+                           String provider,
+                           boolean cacheHit,
+                           boolean escalated) {
+        if (helpTraceService == null || trace == null) {
+            return;
+        }
+        if (domain != null || action != null) {
+            helpTraceService.markRoute(trace,
+                    domain == null ? null : domain.name(),
+                    action == null ? null : action.name());
+        }
+        if (provider != null && !provider.trim().isEmpty()) {
+            helpTraceService.markProvider(trace, provider);
+        }
+        if (cacheHit) {
+            helpTraceService.markCacheHit(trace);
+        }
+        if (escalated) {
+            helpTraceService.markEscalated(trace);
+        }
+    }
+
+    private void markRetrievalRounds(HelpTrace trace, Map<String, Object> response) {
+        if (helpTraceService == null || trace == null || response == null) {
+            return;
+        }
+        Object helpLoop = response.get("helpLoop");
+        if (helpLoop instanceof Map) {
+            Object rounds = ((Map<?, ?>) helpLoop).get("retrievalRounds");
+            if (rounds instanceof Number) {
+                helpTraceService.markRetrievalRounds(trace, ((Number) rounds).intValue());
+            }
+        }
+    }
+
+    /**
+     * Roles are only ever taken from the authenticated principal. Anything the client puts in the
+     * request body (roles / role) is ignored so a caller cannot self-elevate to admin.
+     */
+    private List<String> rolesOf(AuthenticatedPrincipal principal) {
+        if (principal == null || principal.getRoles() == null) {
+            return Collections.emptyList();
+        }
+        return principal.getRoles();
+    }
+
+    private void applyPreferredDomain(Map<String, Object> body, HelpIntent.Result intent) {
+        String preferred = text(body, "preferredDomain", "");
+        if (preferred.isEmpty() || intent == null) {
+            return;
+        }
+        try {
+            HelpIntent.Domain domain = HelpIntent.Domain.valueOf(preferred.trim().toUpperCase(Locale.ROOT));
+            if (domain == HelpIntent.Domain.PRODUCT_HELP
+                    && intent.getRouteAction() == HelpIntent.RouteAction.COPILOT) {
+                intent.setDomain(domain);
+                intent.setRouteAction(HelpIntent.RouteAction.PLAYBOOK);
+            } else if (domain == HelpIntent.Domain.RUN_DIAGNOSIS
+                    && intent.getRouteAction() == HelpIntent.RouteAction.COPILOT) {
+                intent.setDomain(domain);
+                if (intent.getEntities() == null || intent.getEntities().getRunId() == null) {
+                    intent.setRouteAction(HelpIntent.RouteAction.CLARIFY);
+                    intent.setNeedsClarification(true);
+                    intent.setClarificationPrompt("请提供运行 ID（runId），或从「运行中心」打开对应 run 后再问我。");
+                } else {
+                    intent.setRouteAction(HelpIntent.RouteAction.HELP_GRAPH);
+                }
+            }
+        } catch (IllegalArgumentException ignored) {
+            // ignore invalid preferredDomain
+        }
+    }
+
+    /**
+     * Resolves (and enforces) thread ownership.
+     *
+     * <ul>
+     *   <li>new thread: created with the caller as owner;</li>
+     *   <li>existing thread with a matching owner: reused;</li>
+     *   <li>legacy thread with no owner rows: claimed by the caller;</li>
+     *   <li>existing thread owned by somebody else: rejected.</li>
+     * </ul>
+     *
+     * A null principal keeps the legacy unchecked behaviour for internal/test callers; every HTTP
+     * path resolves a principal first.
+     */
+    private String resolveThreadId(Map<String, Object> body, String message, AuthenticatedPrincipal principal) {
+        String existing = text(body, "threadId", "");
+        if (existing.isEmpty()) {
+            String threadId = UUID.randomUUID().toString();
+            if (principal == null) {
+                mapper.insertThread(threadId, title(message));
+            } else {
+                mapper.insertThreadOwned(threadId, title(message),
+                        principal.getUserId(), principal.getTenantId());
+            }
+            return threadId;
+        }
+        if (principal == null) {
+            return existing;
+        }
+        Map<String, Object> owner = mapper.findThreadOwner(existing);
+        if (owner == null) {
+            /* Client-proposed thread id that does not exist yet: create it for this caller. */
+            mapper.insertThreadOwned(existing, title(message),
+                    principal.getUserId(), principal.getTenantId());
+            return existing;
+        }
+        String ownerUserId = ownerText(owner, "user_id", "userId");
+        String ownerTenantId = ownerText(owner, "tenant_id", "tenantId");
+        if (ownerUserId.isEmpty() && ownerTenantId.isEmpty()) {
+            /* Legacy thread created before ownership tracking: claim it. */
+            mapper.updateThreadOwner(existing, principal.getUserId(), principal.getTenantId());
+            return existing;
+        }
+        if (!sameOwner(ownerUserId, principal.getUserId()) || !sameOwner(ownerTenantId, principal.getTenantId())) {
+            throw new IllegalArgumentException("thread belongs to another user");
+        }
+        return existing;
+    }
+
+    private static String ownerText(Map<String, Object> owner, String... keys) {
+        if (owner == null || keys == null) {
+            return "";
+        }
+        for (String key : keys) {
+            Object value = owner.get(key);
+            if (value != null) {
+                String text = String.valueOf(value).trim();
+                if (!text.isEmpty()) {
+                    return text;
+                }
+            }
+        }
+        return "";
+    }
+
+    private static boolean sameOwner(String ownerSide, String principalSide) {
+        String left = ownerSide == null ? "" : ownerSide.trim();
+        String right = principalSide == null ? "" : principalSide.trim();
+        return left.equals(right);
+    }
+
+    private void persistAssistant(String threadId, String content) {
+        mapper.insertMessage(UUID.randomUUID().toString(), threadId, "assistant",
+                content == null ? "" : content);
+    }
+
+    private void decorateFromIntent(Map<String, Object> response, HelpIntent.Result intent) {
+        if (response == null || intent == null) {
+            return;
+        }
+        Map<String, Object> envelope = intent.toEnvelopeFields();
+        for (Map.Entry<String, Object> entry : envelope.entrySet()) {
+            if (!response.containsKey(entry.getKey()) || response.get(entry.getKey()) == null) {
+                response.put(entry.getKey(), entry.getValue());
+            }
+        }
+        if (!response.containsKey("provider") || response.get("provider") == null) {
+            if (Boolean.TRUE.equals(response.get("routedToWorkflow"))) {
+                response.put("provider", "workflow-router");
+            } else {
+                response.put("provider", "copilot");
+            }
+        }
+    }
+
+    private void decorateResearch(Map<String, Object> response, String workflowKey) {
+        if (response == null) {
+            return;
+        }
+        response.put("domain", HelpIntent.Domain.RESEARCH.name());
+        response.put("complexity", HelpIntent.Complexity.L2.name());
+        response.put("routeAction", HelpIntent.RouteAction.DISPATCH_WORKFLOW.name());
+        response.put("provider", "workflow-router");
+        if (workflowKey != null) {
+            response.put("workflowKey", workflowKey);
+        }
+    }
+
+    private void mergeDomainIfMissing(Map<String, Object> response,
+                                      HelpIntent.Domain domain,
+                                      HelpIntent.RouteAction action) {
+        if (!response.containsKey("domain")) {
+            response.put("domain", domain.name());
+        }
+        if (!response.containsKey("routeAction")) {
+            response.put("routeAction", action.name());
+        }
+        if (!response.containsKey("complexity")) {
+            response.put("complexity", HelpIntent.Complexity.L0.name());
+        }
+    }
+
+    /* ================================================================ *
+     * Intent routing  –  only the seeded keys are valid targets.
      * ================================================================ */
 
     String resolveWorkflowKey(Map<String, Object> body, String message) {
@@ -164,7 +644,11 @@ public class ChatService {
     private Map<String, Object> dispatchWorkflow(String workflowKey,
                                                   String message,
                                                   String threadId,
-                                                  Map<String, Object> body) {
+                                                  Map<String, Object> body,
+                                                  AuthenticatedPrincipal principal,
+                                                  HelpTrace trace) {
+        markTrace(trace, HelpIntent.Domain.RESEARCH, HelpIntent.RouteAction.DISPATCH_WORKFLOW,
+                "workflow-router", false, false);
         String ticker = tickerFrom(body, objectMap(body == null ? null : body.get("state")), message);
         String subject = ticker.isEmpty() ? message : ticker;
 
@@ -176,18 +660,30 @@ public class ChatService {
         }
         Map<String, Object> extraState = objectMap(body == null ? null : body.get("state"));
         inputs.putAll(extraState);
+        Map<String, Object> pageContext = objectMap(body == null ? null : body.get("pageContext"));
+        if (!pageContext.isEmpty()) {
+            inputs.put("pageContext", pageContext);
+        }
 
         WorkflowRun run;
         try {
-            run = workflowService.createRun(workflowKey, subject, inputs);
+            run = workflowService.createRun(workflowKey, subject, inputs, principal);
         } catch (Exception ex) {
             /* If workflow layout is not published or invalid, fall back to copilot */
-            return copilotReply(message, threadId, body);
+            Map<String, Object> fallback = copilotReply(message, threadId, body);
+            fallback.put("domain", HelpIntent.Domain.RESEARCH.name());
+            fallback.put("routeAction", HelpIntent.RouteAction.COPILOT.name());
+            return fallback;
         }
 
         final String runId = run.getRunId();
         final Map<String, Object> safeInputs = new LinkedHashMap<>(inputs);
-        CompletableFuture.runAsync(() -> workflowService.executeAsync(run, safeInputs, workflowKey));
+        if (workflowExecutor == null) {
+            /* Only direct unit construction reaches this branch; Spring always injects the bounded pool. */
+            workflowService.executeAsync(run, safeInputs, workflowKey);
+        } else {
+            workflowExecutor.execute(() -> workflowService.executeAsync(run, safeInputs, workflowKey));
+        }
 
         String reply = String.format("\u5df2\u81ea\u52a8\u8def\u7531\u5230\u5de5\u4f5c\u6d41 [%s]\uff0c\u8fd0\u884c ID: %s\uff0c\u72b6\u6001: %s",
                 workflowKey, runId, "RUNNING");
@@ -201,11 +697,19 @@ public class ChatService {
         response.put("runId", runId);
         response.put("runStatus", "RUNNING");
         response.put("routedToWorkflow", true);
+        response.put("ok", true);
+        response.put("domain", HelpIntent.Domain.RESEARCH.name());
+        response.put("complexity", HelpIntent.Complexity.L2.name());
+        response.put("routeAction", HelpIntent.RouteAction.DISPATCH_WORKFLOW.name());
+        response.put("provider", "workflow-router");
+        response.put("needsClarification", false);
+        response.put("escalateHuman", false);
+        response.put("cacheHit", false);
         return response;
     }
 
     /* ================================================================ *
-     * Default copilot chat (unchanged logic)
+     * Default copilot chat
      * ================================================================ */
 
     private Map<String, Object> copilotReply(String message, String threadId, Map<String, Object> body) {
@@ -244,11 +748,16 @@ public class ChatService {
         response.put("message", reply);
         response.put("content", reply);
         response.put("routedToWorkflow", false);
+        response.put("ok", true);
+        response.put("provider", "copilot");
+        response.put("needsClarification", false);
+        response.put("escalateHuman", false);
+        response.put("cacheHit", false);
         return response;
     }
 
     /* ================================================================ *
-     * Helpers (mostly unchanged from original)
+     * Helpers
      * ================================================================ */
 
     private Map<String, Object> marketOverview(String ticker) {
@@ -298,9 +807,14 @@ public class ChatService {
         }
         String msg = message == null ? "" : message;
 
+        // Resolve Chinese names inside free-text (e.g. "分析一下生益科技" -> 600183.SH)
         String chineseResolved = marketDataService.resolveAShareSymbolPublic(msg);
-        if (chineseResolved != null && !chineseResolved.equals(msg) && !chineseResolved.isEmpty()) {
-            return cleanTicker(chineseResolved);
+        if (chineseResolved != null && !chineseResolved.trim().isEmpty()
+                && !chineseResolved.trim().equals(msg.trim())) {
+            String cleaned = cleanTicker(chineseResolved);
+            if (!cleaned.isEmpty()) {
+                return cleaned;
+            }
         }
 
         String normalized = marketDataService.normalizeSymbolPublic(msg);

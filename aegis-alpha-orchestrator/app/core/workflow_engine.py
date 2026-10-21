@@ -7,7 +7,7 @@ import logging
 import uuid
 from collections import defaultdict, OrderedDict
 from datetime import datetime, timezone
-from typing import Annotated, Any, AsyncIterator
+from typing import Annotated, Any, AsyncIterator, Optional
 from typing_extensions import TypedDict
 
 from langgraph.checkpoint.memory import MemorySaver
@@ -20,10 +20,14 @@ try:
     HAS_SQLITE_CHECKPOINTER = True
 except ImportError:
     HAS_SQLITE_CHECKPOINTER = False
+from langgraph.errors import GraphInterrupt
 from langgraph.types import interrupt, Command
 
 from ..models.workflow import Node, Edge, TraceEntry
 from ..models.responses import NodeResult, WorkflowResult, SSEEvent
+from .checkpointer_lifecycle import ensure_async_checkpointer
+from .context_assembly import apply_trace_usage, memory_hit_count
+from .memory_selector import load_run_memory, read_store_value
 from .memory_store import MemoryStoreManager
 from .node_executor import NodeExecutor
 from .tool_registry import resolve_agent_roles, tools_for_roles
@@ -109,7 +113,7 @@ class WorkflowEngine:
         tool_registry: dict[str, Any] | None = None,
     ):
         self._node_executor = node_executor
-        self._checkpointer = checkpointer
+        self._checkpointer = ensure_async_checkpointer(checkpointer)
         self._tools = tools or []
         self._tool_registry = tool_registry
         self._store = store
@@ -176,6 +180,174 @@ class WorkflowEngine:
             "edges": edges,
         }
 
+    async def _persist_thread_layout(
+        self,
+        thread_id: str,
+        *,
+        require_approval: bool,
+        nodes: list[Node],
+        edges: list[Edge],
+    ) -> None:
+        """Remember layout in memory and, when a store exists, in SQLite."""
+        self._remember_thread(
+            thread_id,
+            require_approval=require_approval,
+            nodes=nodes,
+            edges=edges,
+        )
+        if self._store is None:
+            return
+        payload = {
+            "nodes": [node.model_dump() for node in nodes],
+            "edges": [edge.model_dump() for edge in edges],
+            "require_approval": bool(require_approval),
+        }
+        try:
+            await self._store.aput(
+                ("thread", thread_id),
+                "layout",
+                payload,
+                ttl_seconds=0,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[THINKING] Failed to persist thread layout thread_id=%s error=%s",
+                thread_id,
+                exc,
+            )
+
+    async def _load_thread_layout(
+        self, thread_id: str
+    ) -> tuple[list[Node], list[Edge], bool] | None:
+        """Rebuild nodes/edges/require_approval from the durable thread layout."""
+        if self._store is None:
+            return None
+        try:
+            payload = await read_store_value(self._store, ("thread", thread_id), "layout")
+        except Exception as exc:
+            logger.warning(
+                "[THINKING] Failed to load thread layout thread_id=%s error=%s",
+                thread_id,
+                exc,
+            )
+            return None
+        if not isinstance(payload, dict):
+            return None
+        raw_nodes = payload.get("nodes")
+        raw_edges = payload.get("edges")
+        if not isinstance(raw_nodes, list) or not isinstance(raw_edges, list):
+            return None
+        if not raw_nodes:
+            return None
+        nodes = [Node.model_validate(item) for item in raw_nodes]
+        edges = [Edge.model_validate(item) for item in raw_edges]
+        return nodes, edges, bool(payload.get("require_approval"))
+
+    async def _execution_state_for_node(
+        self,
+        *,
+        node: Node,
+        handler: str,
+        workflow_state: WorkflowState,
+        store: BaseStore | None,
+    ) -> dict[str, Any]:
+        """Copy final_state and inject memoryContext for every node, including start/end.
+
+        Control nodes do not call the model, but the run trace still records how many
+        memory items were injected, and a later model node sees the same snippets.
+        """
+        del node, handler
+        final_state = dict(workflow_state.get("final_state") or {})
+        if store is None:
+            return final_state
+        user_id = final_state.get("userId") or final_state.get("user_id")
+        symbol = final_state.get("ticker") or final_state.get("symbol")
+        memory_context = await load_run_memory(store, user_id=user_id, symbol=symbol)
+        if not isinstance(memory_context, dict):
+            memory_context = {"snippets": [], "hitCount": 0}
+        return {**final_state, "memoryContext": memory_context}
+
+    @staticmethod
+    def _annotate_trace(
+        trace_entry: dict[str, Any],
+        result_data: dict[str, Any] | None,
+        exec_state: dict[str, Any],
+    ) -> dict[str, Any]:
+        traced = apply_trace_usage(trace_entry, result_data)
+        if not isinstance(traced, dict):
+            traced = trace_entry
+        traced["memoryHits"] = memory_hit_count(exec_state if isinstance(exec_state, dict) else {})
+        return traced
+
+    @staticmethod
+    def _node_result_from_cache(payload: Any) -> NodeResult | None:
+        """Accept a flat NodeResult dump. aget Items are unwrapped by read_store_value."""
+        if not isinstance(payload, dict):
+            return None
+        if not any(key in payload for key in ("ok", "handler", "summary", "node_id")):
+            return None
+        try:
+            allowed = NodeResult.model_fields
+            return NodeResult.model_validate(
+                {key: value for key, value in payload.items() if key in allowed}
+            )
+        except Exception:
+            return None
+
+    def _result_from_graph_output(self, graph_out: Any) -> WorkflowResult:
+        """Map ainvoke output to WorkflowResult. Interrupts stay ok so resume can continue."""
+        if not isinstance(graph_out, dict):
+            graph_out = {}
+        interrupted = bool(graph_out.get("__interrupt__"))
+        inner = dict(graph_out.get("final_state") or {})
+        if interrupted:
+            inner["interrupted"] = True
+        trace: list[TraceEntry] = []
+        for entry in graph_out.get("trace") or []:
+            if isinstance(entry, dict):
+                trace.append(TraceEntry(**entry))
+        return WorkflowResult(
+            ok=True,
+            error=None,
+            final_state=inner,
+            trace=trace,
+            node_outputs=graph_out.get("node_outputs") or {},
+            state=dict(inner),
+        )
+
+    async def _result_from_interrupt(
+        self,
+        graph: Any,
+        config: dict[str, Any],
+        fallback_state: dict[str, Any],
+    ) -> WorkflowResult:
+        """GraphInterrupt means the checkpoint already holds the pause. Do not fail the run."""
+        final_state: dict[str, Any] = {"interrupted": True}
+        trace: list[TraceEntry] = []
+        node_outputs: dict[str, Any] = {}
+        try:
+            snapshot = await graph.aget_state(config)
+            values = getattr(snapshot, "values", None) or {}
+            if isinstance(values, dict):
+                final_state = dict(values.get("final_state") or {})
+                final_state["interrupted"] = True
+                for entry in values.get("trace") or []:
+                    if isinstance(entry, dict):
+                        trace.append(TraceEntry(**entry))
+                node_outputs = values.get("node_outputs") or {}
+        except Exception as exc:
+            logger.info("[THINKING] Interrupt snapshot unavailable: %s", exc)
+            if isinstance(fallback_state, dict):
+                final_state = {**fallback_state, "interrupted": True}
+        return WorkflowResult(
+            ok=True,
+            error=None,
+            final_state=final_state,
+            trace=trace,
+            node_outputs=node_outputs,
+            state=dict(final_state),
+        )
+
     @classmethod
     def _get_cached_graph(cls, key: str) -> Any | None:
         if key in cls._graph_cache:
@@ -191,6 +363,12 @@ class WorkflowEngine:
             if len(cls._graph_cache) >= _GRAPH_CACHE_MAX:
                 cls._graph_cache.popitem(last=False)
         cls._graph_cache[key] = graph
+
+    def _graph_run_kwargs(self) -> dict[str, Any]:
+        """Sync durability only when a checkpointer will actually create the future."""
+        if self._checkpointer is None:
+            return {}
+        return {"durability": "sync"}
 
     def build_graph(self, nodes: list[Node], edges: list[Edge], require_approval: bool = False) -> Any:
         """Build and compile a LangGraph StateGraph with caching."""
@@ -362,7 +540,9 @@ class WorkflowEngine:
         handler = node.data.handler or node.data.function_name or "logic"
         is_agent_with_tools = handler == "general.agent" and self._has_tools_capability()
 
-        async def node_fn(state: WorkflowState, *, store: BaseStore | None = None) -> dict:
+        # Optional[BaseStore] is the annotation LangGraph injects. `BaseStore | None`
+        # is not recognized, so the store argument stayed empty and memory never loaded.
+        async def node_fn(state: WorkflowState, *, store: Optional[BaseStore] = None) -> dict:
             started_at = datetime.now(timezone.utc).isoformat()
             subject = state.get("subject", "Aegis Alpha workflow")
             node_label = node.data.label or node.data.title or node.id
@@ -371,43 +551,45 @@ class WorkflowEngine:
             prior_for_tools = _messages_for_tool_continuation(messages)
             mid_tool_loop = bool(prior_for_tools)
 
+            exec_state = await self._execution_state_for_node(
+                node=node,
+                handler=handler,
+                workflow_state=state,
+                store=store,
+            )
+
             # Skip ticker cache mid tool-loop so we re-enter with ToolMessages.
             if store and handler != "start" and handler != "end" and not mid_tool_loop:
                 try:
-                    ticker = state.get("final_state", {}).get("ticker", "") or state.get("final_state", {}).get("symbol", "")
+                    ticker = exec_state.get("ticker", "") or exec_state.get("symbol", "")
                     cache_key = f"{handler}:v2"
                     if ticker:
-                        cached = await store.aget(("ticker", ticker), cache_key)
-                        if cached and isinstance(cached, dict) and cached.get("value"):
-                            ttl_remaining = cached.get("_ttl_remaining") or cached.get("ttl_remaining")
-                            if ttl_remaining is None or ttl_remaining > 60:
-                                logger.info(f"[THINKING] Cache hit for ticker={ticker} handler={handler}, skipping LLM")
-                                cached_data = cached.get("value", cached)
-                                if isinstance(cached_data, dict):
-                                    result = NodeResult(**{k: v for k, v in cached_data.items() if k in NodeResult.model_fields})
-                                else:
-                                    result = NodeResult(
-                                        ok=True, status="cached", handler=handler,
-                                        node_id=node.id, node_name=node_label,
-                                        subject=subject, summary=str(cached_data)[:200],
-                                        confidence=0.8, provider="cache", model="cache",
-                                    )
-                                trace_entry = {
+                        cached_data = await read_store_value(store, ("ticker", ticker), cache_key)
+                        result = self._node_result_from_cache(cached_data)
+                        if result is not None:
+                            logger.info(f"[THINKING] Cache hit for ticker={ticker} handler={handler}, skipping LLM")
+                            trace_entry = self._annotate_trace(
+                                {
                                     "nodeId": result.node_id, "nodeName": result.node_name,
                                     "handler": result.handler, "status": result.status,
                                     "ok": result.ok, "degraded": True,
                                     "startedAt": started_at,
                                     "completedAt": datetime.now(timezone.utc).isoformat(),
                                     "durationMs": 0,
-                                }
-                                state_update = {node.id: result.model_dump()}
-                                if result.handler:
-                                    state_update[result.handler] = result.model_dump()
-                                return {
-                                    "final_state": state_update,
-                                    "trace": [trace_entry],
-                                    "node_outputs": {node.id: result.model_dump()},
-                                }
+                                },
+                                result.data,
+                                exec_state,
+                            )
+                            state_update = {node.id: result.model_dump()}
+                            if result.handler:
+                                state_update[result.handler] = result.model_dump()
+                            return {
+                                "final_state": state_update,
+                                "trace": [trace_entry],
+                                "node_outputs": {node.id: result.model_dump()},
+                            }
+                except GraphInterrupt:
+                    raise
                 except Exception as cache_err:
                     logger.warning(f"[THINKING] Store read error for node {node.id}: {cache_err}")
 
@@ -419,6 +601,7 @@ class WorkflowEngine:
                     return await self._run_agent_tool_turn(
                         node=node,
                         state=state,
+                        exec_state=exec_state,
                         subject=subject,
                         node_label=node_label,
                         handler=handler,
@@ -428,6 +611,8 @@ class WorkflowEngine:
                         started_at=started_at,
                         store=store,
                     )
+                except GraphInterrupt:
+                    raise
                 except Exception as e:
                     logger.error(
                         f"[THINKING] Agent tool-loop failed, falling back to execute: "
@@ -437,9 +622,11 @@ class WorkflowEngine:
             try:
                 result = await self._node_executor.execute(
                     node=node,
-                    state=state.get("final_state", {}),
+                    state=exec_state,
                     subject=subject,
                 )
+            except GraphInterrupt:
+                raise
             except Exception as e:
                 logger.error(f"[THINKING] Workflow node exception: id={node.id} handler={handler} label={node_label} error={e}")
                 result = NodeResult(
@@ -448,17 +635,21 @@ class WorkflowEngine:
                     subject=subject, summary=str(e), duration_ms=0,
                 )
 
-            trace_entry = {
-                "nodeId": result.node_id,
-                "nodeName": result.node_name,
-                "handler": result.handler,
-                "status": result.status,
-                "ok": result.ok,
-                "degraded": result.degraded,
-                "startedAt": started_at,
-                "completedAt": datetime.now(timezone.utc).isoformat(),
-                "durationMs": result.duration_ms,
-            }
+            trace_entry = self._annotate_trace(
+                {
+                    "nodeId": result.node_id,
+                    "nodeName": result.node_name,
+                    "handler": result.handler,
+                    "status": result.status,
+                    "ok": result.ok,
+                    "degraded": result.degraded,
+                    "startedAt": started_at,
+                    "completedAt": datetime.now(timezone.utc).isoformat(),
+                    "durationMs": result.duration_ms,
+                },
+                result.data,
+                exec_state,
+            )
             logger.info(f"[THINKING] Workflow node completed: id={node.id} handler={result.handler} label={node_label} status={result.status} ok={result.ok} duration={result.duration_ms}ms")
 
             if store and handler != "start" and handler != "end":
@@ -495,6 +686,7 @@ class WorkflowEngine:
         *,
         node: Node,
         state: WorkflowState,
+        exec_state: dict[str, Any],
         subject: str,
         node_label: str,
         handler: str,
@@ -505,7 +697,7 @@ class WorkflowEngine:
         store: BaseStore | None,
     ) -> dict:
         """Execute one general.agent turn: request tools or produce final NodeResult."""
-        final_state = state.get("final_state") or {}
+        final_state = exec_state if isinstance(exec_state, dict) else (state.get("final_state") or {})
         tool_rounds = final_state.get("tool_rounds") or {}
         if not isinstance(tool_rounds, dict):
             tool_rounds = {}
@@ -534,20 +726,24 @@ class WorkflowEngine:
                 f"[THINKING] Agent requesting tools: id={node.id} round={next_round}/{MAX_TOOL_ROUNDS} "
                 f"tools={tool_names}"
             )
-            trace_entry = {
-                "nodeId": node.id,
-                "nodeName": node_label,
-                "handler": handler,
-                "status": "awaiting_tools",
-                "ok": True,
-                "degraded": False,
-                "startedAt": started_at,
-                "completedAt": datetime.now(timezone.utc).isoformat(),
-                "durationMs": int(
-                    (datetime.now(timezone.utc) - datetime.fromisoformat(started_at)).total_seconds()
-                    * 1000
-                ),
-            }
+            trace_entry = self._annotate_trace(
+                {
+                    "nodeId": node.id,
+                    "nodeName": node_label,
+                    "handler": handler,
+                    "status": "awaiting_tools",
+                    "ok": True,
+                    "degraded": False,
+                    "startedAt": started_at,
+                    "completedAt": datetime.now(timezone.utc).isoformat(),
+                    "durationMs": int(
+                        (datetime.now(timezone.utc) - datetime.fromisoformat(started_at)).total_seconds()
+                        * 1000
+                    ),
+                },
+                None,
+                final_state,
+            )
             # messages reducer concatenates; seed Human only on first loop entry.
             return {
                 "messages": agent_result.messages_to_append,
@@ -581,17 +777,21 @@ class WorkflowEngine:
                 }
             )
 
-        trace_entry = {
-            "nodeId": result.node_id,
-            "nodeName": result.node_name,
-            "handler": result.handler,
-            "status": result.status,
-            "ok": result.ok,
-            "degraded": result.degraded,
-            "startedAt": started_at,
-            "completedAt": datetime.now(timezone.utc).isoformat(),
-            "durationMs": result.duration_ms,
-        }
+        trace_entry = self._annotate_trace(
+            {
+                "nodeId": result.node_id,
+                "nodeName": result.node_name,
+                "handler": result.handler,
+                "status": result.status,
+                "ok": result.ok,
+                "degraded": result.degraded,
+                "startedAt": started_at,
+                "completedAt": datetime.now(timezone.utc).isoformat(),
+                "durationMs": result.duration_ms,
+            },
+            result.data,
+            final_state,
+        )
         logger.info(
             f"[THINKING] Agent tool-loop final: id={node.id} status={result.status} "
             f"ok={result.ok} rounds={current_round}"
@@ -642,7 +842,9 @@ class WorkflowEngine:
         logger.info(f"[THINKING] Workflow execution starting: subject={subject} nodes={[n.id for n in nodes]} require_approval={require_approval}")
         graph = self.build_graph(nodes, edges, require_approval=require_approval)
         tid = thread_id or str(uuid.uuid4())
-        self._remember_thread(tid, require_approval=require_approval, nodes=nodes, edges=edges)
+        await self._persist_thread_layout(
+            tid, require_approval=require_approval, nodes=nodes, edges=edges
+        )
         config = {"configurable": {"thread_id": tid}}
         initial_state: WorkflowState = {
             "final_state": state,
@@ -654,16 +856,19 @@ class WorkflowEngine:
         }
 
         try:
-            final_state = await graph.ainvoke(initial_state, config=config)
+            final_state = await graph.ainvoke(
+                initial_state, config=config, **self._graph_run_kwargs()
+            )
             node_ids = [n.id for n in nodes]
             logger.info(f"[THINKING] Workflow execution completed: subject={subject} nodes={node_ids} ok=True")
-            return WorkflowResult(
-                ok=True,
-                final_state=final_state.get("final_state", {}),
-                trace=[TraceEntry(**t) for t in final_state.get("trace", [])],
-                node_outputs=final_state.get("node_outputs", {}),
-                state=final_state.get("final_state", {}),
+            return self._result_from_graph_output(final_state)
+        except GraphInterrupt:
+            logger.info(
+                "[THINKING] Workflow paused for approval: subject=%s thread_id=%s",
+                subject,
+                tid,
             )
+            return await self._result_from_interrupt(graph, config, state)
         except Exception as e:
             logger.error(f"[THINKING] Workflow execution failed: subject={subject} error={e}")
             return WorkflowResult(ok=False, error=str(e), final_state=state)
@@ -681,7 +886,9 @@ class WorkflowEngine:
         logger.info(f"[THINKING] Workflow streaming starting: subject={subject} nodes={[n.id for n in nodes]} require_approval={require_approval}")
         graph = self.build_graph(nodes, edges, require_approval=require_approval)
         tid = thread_id or str(uuid.uuid4())
-        self._remember_thread(tid, require_approval=require_approval, nodes=nodes, edges=edges)
+        await self._persist_thread_layout(
+            tid, require_approval=require_approval, nodes=nodes, edges=edges
+        )
         config = {"configurable": {"thread_id": tid}}
         initial_state: WorkflowState = {
             "final_state": state,
@@ -693,14 +900,25 @@ class WorkflowEngine:
         }
 
         degraded_reasons: list[str] = []
+        saw_interrupt = False
         try:
-            async for chunk in graph.astream(initial_state, config=config, stream_mode="updates"):
+            async for chunk in graph.astream(
+                initial_state,
+                config=config,
+                stream_mode="updates",
+                **self._graph_run_kwargs(),
+            ):
+                if not isinstance(chunk, dict):
+                    continue
                 for node_name, update in chunk.items():
                     if node_name == "__interrupt__":
+                        saw_interrupt = True
                         yield SSEEvent(
                             event="human_interrupt",
-                            data={"message": "Workflow paused for approval", "ok": True},
+                            data={"message": "Workflow paused for approval", "ok": True, "interrupted": True},
                         )
+                        continue
+                    if not isinstance(update, dict):
                         continue
                     trace_entry = (update.get("trace") or [{}])[0]
                     if _is_tools_node_name(str(node_name)):
@@ -747,7 +965,11 @@ class WorkflowEngine:
                                 "durationMs": node_duration,
                             },
                         )
+                if saw_interrupt:
+                    break
 
+            if saw_interrupt:
+                return
             if degraded_reasons:
                 # Dedupe reasons
                 unique_reasons = list(dict.fromkeys(degraded_reasons))
@@ -755,6 +977,11 @@ class WorkflowEngine:
             yield SSEEvent(
                 event="workflow_complete",
                 data={"ok": True, "degraded": bool(degraded_reasons)},
+            )
+        except GraphInterrupt:
+            yield SSEEvent(
+                event="human_interrupt",
+                data={"message": "Workflow paused for approval", "ok": True, "interrupted": True},
             )
         except Exception as e:
             logger.error(f"[THINKING] Workflow streaming failed: subject={subject} error={e}")
@@ -771,7 +998,9 @@ class WorkflowEngine:
     ) -> AsyncIterator[SSEEvent]:
         graph = self.build_graph(nodes, edges, require_approval=require_approval)
         tid = thread_id or str(uuid.uuid4())
-        self._remember_thread(tid, require_approval=require_approval, nodes=nodes, edges=edges)
+        await self._persist_thread_layout(
+            tid, require_approval=require_approval, nodes=nodes, edges=edges
+        )
         config = {"configurable": {"thread_id": tid}}
         initial_state: WorkflowState = {
             "final_state": state,
@@ -787,9 +1016,26 @@ class WorkflowEngine:
             None,
         )
 
+        saw_interrupt = False
         try:
-            async for chunk in graph.astream(initial_state, config=config, stream_mode="updates"):
+            async for chunk in graph.astream(
+                initial_state,
+                config=config,
+                stream_mode="updates",
+                **self._graph_run_kwargs(),
+            ):
+                if not isinstance(chunk, dict):
+                    continue
                 for node_name, update in chunk.items():
+                    if node_name == "__interrupt__":
+                        saw_interrupt = True
+                        yield SSEEvent(
+                            event="human_interrupt",
+                            data={"message": "Workflow paused for approval", "ok": True, "interrupted": True},
+                        )
+                        continue
+                    if not isinstance(update, dict):
+                        continue
                     trace_entry = (update.get("trace") or [{}])[0]
 
                     if aggregate_node and node_name == aggregate_node.id:
@@ -839,8 +1085,17 @@ class WorkflowEngine:
                                 "durationMs": node_duration,
                             },
                         )
+                if saw_interrupt:
+                    break
 
+            if saw_interrupt:
+                return
             yield SSEEvent(event="workflow_complete", data={"ok": True})
+        except GraphInterrupt:
+            yield SSEEvent(
+                event="human_interrupt",
+                data={"message": "Workflow paused for approval", "ok": True, "interrupted": True},
+            )
         except Exception as e:
             logger.error(f"[THINKING] Workflow token streaming failed: subject={subject} error={e}")
             yield SSEEvent(event="error", data={"ok": False, "error": str(e)})
@@ -860,11 +1115,23 @@ class WorkflowEngine:
         When unknown, defaults require_approval=True because resume is used for
         approval-gate interrupts.
         """
-        meta = self._thread_meta.get(thread_id, {})
+        meta = dict(self._thread_meta.get(thread_id) or {})
+        had_layout = bool(meta.get("nodes")) and bool(meta.get("edges"))
         if nodes is None:
             nodes = meta.get("nodes")
         if edges is None:
             edges = meta.get("edges")
+        loaded_require: bool | None = None
+        if nodes is None or edges is None:
+            loaded = await self._load_thread_layout(thread_id)
+            if loaded is not None:
+                nodes, edges, loaded_require = loaded
+                self._remember_thread(
+                    thread_id,
+                    require_approval=loaded_require,
+                    nodes=nodes,
+                    edges=edges,
+                )
         if nodes is None or edges is None:
             return WorkflowResult(
                 ok=False,
@@ -872,7 +1139,11 @@ class WorkflowEngine:
             )
 
         if require_approval is None:
-            if "require_approval" in meta:
+            if had_layout and "require_approval" in meta:
+                require_approval = bool(meta["require_approval"])
+            elif loaded_require is not None:
+                require_approval = loaded_require
+            elif "require_approval" in meta:
                 require_approval = bool(meta["require_approval"])
             else:
                 # Resume targets approval interrupts; keep approval_gate in the graph.
@@ -886,14 +1157,12 @@ class WorkflowEngine:
             final_state = await graph.ainvoke(
                 LgCommand(resume=resume_value or {"approved": True}),
                 config=config,
+                **self._graph_run_kwargs(),
             )
-            return WorkflowResult(
-                ok=True,
-                final_state=final_state.get("final_state", {}),
-                trace=[TraceEntry(**t) for t in final_state.get("trace", [])],
-                node_outputs=final_state.get("node_outputs", {}),
-                state=final_state.get("final_state", {}),
-            )
+            return self._result_from_graph_output(final_state)
+        except GraphInterrupt:
+            logger.info("[THINKING] Workflow resume paused again: thread_id=%s", thread_id)
+            return await self._result_from_interrupt(graph, config, {})
         except Exception as e:
             logger.error(f"[THINKING] Workflow resume failed: thread_id={thread_id} error={e}")
             return WorkflowResult(ok=False, error=str(e), final_state={})

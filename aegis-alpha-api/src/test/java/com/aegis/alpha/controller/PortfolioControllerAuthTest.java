@@ -74,6 +74,7 @@ class PortfolioControllerAuthTest {
                 "tenant-1",
                 Collections.singletonList("portfolio:read"),
                 -1_000L);
+        when(authService.me(anyString())).thenReturn(null);
 
         assertThat(controller.isReadAuthorized("Bearer " + token)).isFalse();
     }

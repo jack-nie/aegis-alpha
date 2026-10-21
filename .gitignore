@@ -9,6 +9,8 @@ dist/
 .env
 .env*.local
 .ace-tool/
+.commandcode/
+.firecrawl/
 
 # Temporary fix/patch scripts
 fix_*.py

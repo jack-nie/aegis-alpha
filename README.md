@@ -1,14 +1,16 @@
 # Aegis Alpha Platform
 
-Aegis Alpha Platform is an enterprise-style investment research and agent workflow orchestration system. It combines portfolio workflows, market-data hydration, LangGraph-based agent execution, backtest history, audit traces, and model governance surfaces.
+Aegis Alpha is an investment research and AI agent workflow orchestration platform. It covers portfolio management, market-data hydration, LangGraph-based agent execution, backtests, audit traces, recommendation governance, and model governance.
 
 ## Modules
 
-- `aegis-alpha-api` - Spring Boot API, workflow runtime, portfolio/backtest/governance services.
-- `aegis-alpha-web` - Next.js web application.
-- `aegis-alpha-orchestrator` - Node/LangGraph execution engine.
+| Module | Stack | Role |
+|--------|--------|------|
+| `aegis-alpha-api` | Spring Boot / Java 17 / MyBatis / MySQL | REST API, auth, portfolio/backtest/governance, workflow runtime glue |
+| `aegis-alpha-web` | Next.js 15 / React 19 / JSX / Tailwind | Web console (App Router) |
+| `aegis-alpha-orchestrator` | Python 3.11 / FastAPI / LangGraph | Agent execution, intent routing, streaming workflow engine |
 
-The runtime still accepts existing `AEGIS_ALPHA_*` environment variables for compatibility with earlier local configuration.
+Runtime still accepts existing `AEGIS_ALPHA_*` environment variables for local compatibility.
 
 ## Local Start
 
@@ -30,19 +32,42 @@ http://127.0.0.1:5174
 
 ## Verification
 
+Unit/build checks (no running services required for API/orchestrator tests; web needs `npm`):
+
 ```powershell
-Push-Location .\aegis-alpha-api
-mvn test
-Pop-Location
+# API
+Push-Location .\aegis-alpha-api; mvn -B -ntp test; Pop-Location
 
+# Orchestrator (mock LLM; no real model key required)
 Push-Location .\aegis-alpha-orchestrator
-npm run smoke
-npm run test:market-data
+$env:AEGIS_ALPHA_LANGCHAIN_MOCK = "true"
+$env:AEGIS_ALPHA_LANGCHAIN_API_KEY = "test-key"
+$env:AEGIS_ALPHA_NODE_EXECUTION_TOKEN = "local-workflow-node-token"
+python -m pytest tests -q --tb=short
 Pop-Location
 
-Push-Location .\aegis-alpha-web
-npm run build
-Pop-Location
+# Web
+Push-Location .\aegis-alpha-web; npm ci; npm run test:portfolio-list; npm run build; Pop-Location
+```
 
+Runtime smoke / health (services must already be up via `.\start-aegis-alpha.ps1`):
+
+```powershell
+# Full smoke (frontend + API auth guard + orchestrator health + token auth)
+.\scripts\smoke-aegis-alpha.ps1
+
+# Same checks, health-only entry point
+.\scripts\health-check.ps1
+```
+
+Optional URL / token overrides:
+
+```powershell
+$env:AEGIS_ALPHA_FRONTEND_URL = "http://127.0.0.1:5174"
+$env:AEGIS_ALPHA_BACKEND_URL = "http://127.0.0.1:5178"
+$env:AEGIS_ALPHA_ORCHESTRATOR_URL = "http://127.0.0.1:8787"
+$env:AEGIS_ALPHA_NODE_EXECUTION_TOKEN = "local-workflow-node-token"
 .\scripts\smoke-aegis-alpha.ps1
 ```
+
+Default ports: web `5174`, API `5178`, orchestrator `8787`.

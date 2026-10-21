@@ -107,6 +107,8 @@ CREATE TABLE IF NOT EXISTS workflow_version (
 
 CREATE TABLE IF NOT EXISTS workflow_run (
   run_id VARCHAR(64) PRIMARY KEY,
+  user_id VARCHAR(64),
+  tenant_id VARCHAR(64),
   workflow_key VARCHAR(128) NOT NULL,
   trace_id VARCHAR(64) NOT NULL,
   status VARCHAR(32) NOT NULL,
@@ -125,6 +127,7 @@ CREATE TABLE IF NOT EXISTS workflow_run (
   node_count INT NOT NULL DEFAULT 0,
   INDEX idx_workflow_run_key (workflow_key),
   INDEX idx_workflow_run_status (status, queued_at),
+  INDEX idx_workflow_run_owner (user_id, tenant_id),
   INDEX idx_workflow_run_idempotency (workflow_key, subject, idempotency_key)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
@@ -328,6 +331,8 @@ CREATE TABLE IF NOT EXISTS market_snapshot (
 
 CREATE TABLE IF NOT EXISTS chat_thread (
   thread_id VARCHAR(64) PRIMARY KEY,
+  user_id VARCHAR(64),
+  tenant_id VARCHAR(64),
   title VARCHAR(200) NOT NULL,
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
@@ -340,3 +345,31 @@ CREATE TABLE IF NOT EXISTS chat_message (
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   INDEX idx_chat_message_thread (thread_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+/* ================================================================== *
+ * Help agent thread state (goal / last run / pending clarification).
+ * Only read/written by the help layer; ownership columns mirror chat_thread.
+ * ================================================================== */
+CREATE TABLE IF NOT EXISTS help_thread_state (
+  thread_id VARCHAR(64) PRIMARY KEY,
+  user_id VARCHAR(64),
+  tenant_id VARCHAR(64),
+  goal VARCHAR(1024),
+  last_run_id VARCHAR(64),
+  last_domain VARCHAR(64),
+  last_route_action VARCHAR(64),
+  pending_clarification TINYINT NOT NULL DEFAULT 0,
+  checkpoint_json MEDIUMTEXT,
+  updated_at VARCHAR(32) NOT NULL DEFAULT ''
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+/* ================================================================== *
+ * Incremental upgrades for databases created before ownership tracking.
+ * spring.sql.init.continue-on-error is true, so re-running these on an
+ * already-migrated schema fails harmlessly (duplicate column / index).
+ * ================================================================== */
+ALTER TABLE chat_thread ADD COLUMN user_id VARCHAR(64);
+ALTER TABLE chat_thread ADD COLUMN tenant_id VARCHAR(64);
+ALTER TABLE workflow_run ADD COLUMN user_id VARCHAR(64);
+ALTER TABLE workflow_run ADD COLUMN tenant_id VARCHAR(64);
+ALTER TABLE workflow_run ADD INDEX idx_workflow_run_owner (user_id, tenant_id);

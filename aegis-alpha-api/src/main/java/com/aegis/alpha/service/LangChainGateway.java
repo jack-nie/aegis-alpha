@@ -177,6 +177,15 @@ public class LangChainGateway {
      */
     public String buildStreamBody(Map<String, Object> layout, String subject, Map<String, Object> inputs,
                                   String delegatedToken) {
+        return buildStreamBody(layout, subject, inputs, delegatedToken, null, false);
+    }
+
+    /**
+     * Stream body with a stable thread id (the workflow run id) and an explicit approval flag.
+     * {@code requireApproval} is always written so the orchestrator sees the requirement even when false.
+     */
+    public String buildStreamBody(Map<String, Object> layout, String subject, Map<String, Object> inputs,
+                                  String delegatedToken, String threadId, boolean requireApproval) {
         Map<String, Object> body = new LinkedHashMap<>();
         if (apiKey != null && !apiKey.trim().isEmpty()) {
             body.put("apiKey", apiKey);
@@ -195,10 +204,49 @@ public class LangChainGateway {
         if (delegatedToken != null && !delegatedToken.trim().isEmpty()) {
             body.put("delegatedToken", delegatedToken.trim());
         }
+        if (threadId != null && !threadId.trim().isEmpty()) {
+            body.put("threadId", threadId.trim());
+        }
+        body.put("requireApproval", requireApproval);
         try {
             return objectMapper.writeValueAsString(body);
         } catch (Exception ex) {
             throw new IllegalStateException("Failed to build stream body", ex);
+        }
+    }
+
+    /**
+     * Resume a paused approval thread. Does not throw: disabled or failed calls return ok=false.
+     */
+    @SuppressWarnings("unchecked")
+    public Map<String, Object> resumeWorkflow(String threadId, boolean approved) {
+        Map<String, Object> failed = new LinkedHashMap<>();
+        failed.put("ok", false);
+        if (!enabled) {
+            failed.put("error", "LangGraph disabled");
+            return failed;
+        }
+        try {
+            Map<String, Object> resumeValue = new LinkedHashMap<>();
+            resumeValue.put("approved", approved);
+            Map<String, Object> body = new LinkedHashMap<>();
+            body.put("threadId", threadId);
+            body.put("resumeValue", resumeValue);
+            HttpHeaders headers = new HttpHeaders();
+            headers.setContentType(MediaType.APPLICATION_JSON);
+            applyServiceAuth(headers);
+            HttpEntity<Map<String, Object>> request = new HttpEntity<>(body, headers);
+            Object response = restTemplate.postForObject(
+                    trimSlash(engineUrl) + "/resume-workflow", request, Object.class);
+            if (response instanceof Map) {
+                return (Map<String, Object>) response;
+            }
+            failed.put("error", "Unexpected resume response");
+            return failed;
+        } catch (Exception ex) {
+            log.warn("[LangChainGateway] resumeWorkflow failed threadId={} error={}", threadId, ex.getMessage());
+            failed.put("error", ex.getMessage());
+            return failed;
         }
     }
 
@@ -228,6 +276,43 @@ public class LangChainGateway {
             }
             return null;
         } catch (Exception ex) {
+            return null;
+        }
+    }
+
+    /**
+     * Call orchestrator POST /help/execute (retrieve→grade→≤3→draft/escalate).
+     * Returns null when disabled or remote call fails.
+     */
+    @SuppressWarnings("unchecked")
+    public Map<String, Object> executeHelp(String message, java.util.List<String> principalRoles,
+                                           Map<String, Object> intentEnvelope) {
+        if (!enabled) {
+            return null;
+        }
+        try {
+            Map<String, Object> body = new LinkedHashMap<>();
+            body.put("message", message);
+            body.put("roles", principalRoles == null ? java.util.Collections.emptyList() : principalRoles);
+            if (intentEnvelope != null) {
+                body.put("intent", intentEnvelope);
+            }
+            if (apiKey != null && !apiKey.trim().isEmpty()) {
+                body.put("apiKey", apiKey);
+            }
+            body.put("model", defaultModel);
+            HttpHeaders headers = new HttpHeaders();
+            headers.setContentType(MediaType.APPLICATION_JSON);
+            applyServiceAuth(headers);
+            HttpEntity<Map<String, Object>> request = new HttpEntity<>(body, headers);
+            Object response = shortTimeoutRestTemplate.postForObject(
+                    trimSlash(engineUrl) + "/help/execute", request, Object.class);
+            if (response instanceof Map) {
+                return (Map<String, Object>) response;
+            }
+            return null;
+        } catch (Exception ex) {
+            log.debug("[LangChainGateway] executeHelp failed: {}", ex.getMessage());
             return null;
         }
     }

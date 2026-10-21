@@ -5,6 +5,10 @@ import java.util.Map;
 
 public class WorkflowRun {
     private String runId;
+    /** Owner of the run; null for legacy/system runs created before ownership tracking. */
+    private String userId;
+    /** Tenant of the owner of the run. */
+    private String tenantId;
     private String workflowKey;
     private String traceId;
     private String status;
@@ -28,6 +32,10 @@ public class WorkflowRun {
 
     public String getRunId() { return runId; }
     public void setRunId(String runId) { this.runId = runId; }
+    public String getUserId() { return userId; }
+    public void setUserId(String userId) { this.userId = userId; }
+    public String getTenantId() { return tenantId; }
+    public void setTenantId(String tenantId) { this.tenantId = tenantId; }
     public String getWorkflowKey() { return workflowKey; }
     public void setWorkflowKey(String workflowKey) { this.workflowKey = workflowKey; }
     public String getTraceId() { return traceId; }

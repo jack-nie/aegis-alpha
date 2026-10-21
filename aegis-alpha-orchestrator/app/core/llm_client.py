@@ -12,6 +12,7 @@ from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 
 from ..config import Settings
+from .context_assembly import normalize_token_usage
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +79,7 @@ class LLMResponse:
         data: dict | None = None,
         content: str = "",
         raw: Any = None,
+        token_usage: dict | None = None,
     ):
         self.summary = summary
         self.signals = signals or []
@@ -86,6 +88,7 @@ class LLMResponse:
         self.data = data or {}
         self.content = content or summary
         self.raw = raw
+        self.token_usage = token_usage
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -179,16 +182,22 @@ class LLMClient:
             use_structured = tools is None and not self._is_aggregate_handler(system)
             if use_structured:
                 try:
-                    structured_llm = client.with_structured_output(AnalystResult)
+                    # include_raw keeps the AIMessage so usage_metadata survives parsing.
+                    # A bare AnalystResult has no token counts, and finance plus aggregate
+                    # both take this branch.
+                    structured_llm = client.with_structured_output(AnalystResult, include_raw=True)
                     response = await structured_llm.ainvoke(messages)
-                    if isinstance(response, AnalystResult):
+                    parsed, usage = self._structured_payload(response)
+                    if isinstance(parsed, AnalystResult):
                         return LLMResponse(
-                            summary=response.summary,
-                            signals=[s.model_dump() for s in response.signals],
-                            sources=[s.model_dump() for s in response.sources],
-                            confidence=self._clamp_confidence(response.confidence),
-                            data=response.data,
-                            content=response.summary,
+                            summary=parsed.summary,
+                            signals=[s.model_dump() for s in parsed.signals],
+                            sources=[s.model_dump() for s in parsed.sources],
+                            confidence=self._clamp_confidence(parsed.confidence),
+                            data=parsed.data,
+                            content=parsed.summary,
+                            raw=response,
+                            token_usage=normalize_token_usage(usage),
                         )
                 except Exception as struct_err:
                     logger.warning(f"Structured output failed, falling back to text parsing: {struct_err}")
@@ -196,6 +205,7 @@ class LLMClient:
             response = await client.ainvoke(messages)
             content = response.content if hasattr(response, "content") else str(response)
             usage = getattr(response, "usage_metadata", None)
+            token_usage = normalize_token_usage(usage)
 
             if tools and hasattr(response, "tool_calls") and response.tool_calls:
                 tool_messages = []
@@ -208,6 +218,7 @@ class LLMClient:
                     summary=f"Called tool: {tc.get('name', 'unknown')}",
                     content=str(response.content) if response.content else "",
                     data={"tool_calls": tool_messages},
+                    token_usage=token_usage,
                 )
 
             return self._normalize_content(content, usage)
@@ -394,8 +405,9 @@ class LLMClient:
 
     def _normalize_content(self, content: str, usage: Any = None) -> LLMResponse:
         """Normalize LLM response content to structured format."""
+        token_usage = normalize_token_usage(usage)
         if not content:
-            return LLMResponse(summary="No response from LLM")
+            return LLMResponse(summary="No response from LLM", token_usage=token_usage)
 
         # Strip markdown code fences
         cleaned = content.strip()
@@ -409,7 +421,7 @@ class LLMClient:
         # Try direct JSON parse
         try:
             data = json.loads(cleaned)
-            return self._dict_to_response(data, content)
+            return self._dict_to_response(data, content, token_usage)
         except json.JSONDecodeError:
             pass
 
@@ -419,6 +431,7 @@ class LLMClient:
                 summary=cleaned[:2000],
                 content=cleaned,
                 confidence=0.75,
+                token_usage=token_usage,
             )
 
         # Try extracting embedded JSON
@@ -426,7 +439,7 @@ class LLMClient:
         if match:
             try:
                 data = json.loads(match.group())
-                return self._dict_to_response(data, content)
+                return self._dict_to_response(data, content, token_usage)
             except json.JSONDecodeError:
                 pass
 
@@ -435,6 +448,7 @@ class LLMClient:
             summary=cleaned[:2000],
             content=cleaned,
             confidence=0.5,
+            token_usage=token_usage,
         )
 
     def _is_markdown_report(self, text: str) -> bool:
@@ -444,7 +458,12 @@ class LLMClient:
         markers = ["# ", "## ", "**", "| "]
         return any(marker in text for marker in markers)
 
-    def _dict_to_response(self, data: dict, raw_content: str) -> LLMResponse:
+    def _dict_to_response(
+        self,
+        data: dict,
+        raw_content: str,
+        token_usage: dict | None = None,
+    ) -> LLMResponse:
         """Convert dict to LLMResponse."""
         return LLMResponse(
             summary=data.get("summary", ""),
@@ -454,6 +473,7 @@ class LLMClient:
             data=data.get("data", {}),
             content=data.get("content", data.get("summary", "")),
             raw=raw_content,
+            token_usage=token_usage,
         )
 
     @staticmethod
@@ -463,6 +483,24 @@ class LLMClient:
             return max(0.0, min(1.0, float(value)))
         except (TypeError, ValueError):
             return 0.5
+
+    @staticmethod
+    def _structured_payload(response: Any) -> tuple[Any, Any]:
+        """Split structured output into (parsed model, usage_metadata).
+
+        ``include_raw=True`` returns ``{"raw", "parsed", "parsing_error"}``.
+        Usage lives on the raw message, not on the parsed AnalystResult.
+        """
+        if isinstance(response, dict) and ("parsed" in response or "parsing_error" in response):
+            parsed = response.get("parsed")
+            raw = response.get("raw")
+            usage = getattr(raw, "usage_metadata", None) if raw is not None else None
+            if usage is None and isinstance(raw, dict):
+                usage = raw.get("usage_metadata")
+            return parsed, usage
+        if isinstance(response, AnalystResult):
+            return response, getattr(response, "usage_metadata", None)
+        return None, None
 
     @staticmethod
     def _is_aggregate_handler(system_prompt: str) -> bool:
