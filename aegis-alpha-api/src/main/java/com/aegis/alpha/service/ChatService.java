@@ -50,6 +50,11 @@ public class ChatService {
             "earnings_reaction", "watchlist_digest"
     )));
 
+    /** Identity fields that must never be taken from the client-supplied {@code state}. */
+    private static final Set<String> CLIENT_IDENTITY_KEYS = Collections.unmodifiableSet(new HashSet<String>(Arrays.asList(
+            "userId", "user_id", "tenantId", "tenant_id", "roles", "role", "username"
+    )));
+
     private final ChatMapper mapper;
     private final LangChainGateway langChainGateway;
     private final MarketDataService marketDataService;
@@ -257,7 +262,7 @@ public class ChatService {
             return helpResponse;
         }
 
-        Map<String, Object> copilot = copilotReply(message, threadId, body);
+        Map<String, Object> copilot = copilotReply(message, threadId, body, principal);
         decorateFromIntent(copilot, intent);
         markTrace(trace, intent, "copilot", false, false);
         recordSession(threadId, principal, session, message, intent, copilot, false);
@@ -658,8 +663,7 @@ public class ChatService {
             inputs.put("ticker", ticker);
             inputs.put("symbol", ticker);
         }
-        Map<String, Object> extraState = objectMap(body == null ? null : body.get("state"));
-        inputs.putAll(extraState);
+        inputs.putAll(trustedState(body, principal));
         Map<String, Object> pageContext = objectMap(body == null ? null : body.get("pageContext"));
         if (!pageContext.isEmpty()) {
             inputs.put("pageContext", pageContext);
@@ -670,7 +674,7 @@ public class ChatService {
             run = workflowService.createRun(workflowKey, subject, inputs, principal);
         } catch (Exception ex) {
             /* If workflow layout is not published or invalid, fall back to copilot */
-            Map<String, Object> fallback = copilotReply(message, threadId, body);
+            Map<String, Object> fallback = copilotReply(message, threadId, body, principal);
             fallback.put("domain", HelpIntent.Domain.RESEARCH.name());
             fallback.put("routeAction", HelpIntent.RouteAction.COPILOT.name());
             return fallback;
@@ -712,7 +716,8 @@ public class ChatService {
      * Default copilot chat
      * ================================================================ */
 
-    private Map<String, Object> copilotReply(String message, String threadId, Map<String, Object> body) {
+    private Map<String, Object> copilotReply(String message, String threadId, Map<String, Object> body,
+                                             AuthenticatedPrincipal principal) {
         AgentTemplate copilot = new AgentTemplate();
         copilot.setAgentId("aegis-alpha-copilot");
         copilot.setName("Aegis Alpha Copilot");
@@ -723,7 +728,7 @@ public class ChatService {
         copilot.setModelName(text(body, "modelName", ""));
         copilot.setToolsJson("[\"market-data\",\"portfolio\",\"news\",\"workflow\"]");
 
-        Map<String, Object> state = objectMap(body == null ? null : body.get("state"));
+        Map<String, Object> state = trustedState(body, principal);
         state.put("message", message);
         String ticker = tickerFrom(body, state, message);
         if (!ticker.isEmpty()) {
@@ -771,6 +776,27 @@ public class ChatService {
             unavailable.put("error", ex.getMessage() == null ? String.valueOf(ex) : ex.getMessage());
             return unavailable;
         }
+    }
+
+    /**
+     * Client {@code state} with every identity field removed. Identity (user / tenant / roles) is
+     * re-applied only from the authenticated principal so a caller cannot impersonate another user
+     * in workflow inputs, memory namespaces or agent prompts.
+     */
+    private Map<String, Object> trustedState(Map<String, Object> body, AuthenticatedPrincipal principal) {
+        Map<String, Object> state = objectMap(body == null ? null : body.get("state"));
+        for (String key : CLIENT_IDENTITY_KEYS) {
+            state.remove(key);
+        }
+        if (principal != null) {
+            if (principal.getUserId() != null) {
+                state.put("userId", principal.getUserId());
+            }
+            if (principal.getTenantId() != null) {
+                state.put("tenantId", principal.getTenantId());
+            }
+        }
+        return state;
     }
 
     @SuppressWarnings("unchecked")
