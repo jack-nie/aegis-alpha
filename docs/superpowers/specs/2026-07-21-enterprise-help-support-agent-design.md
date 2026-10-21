@@ -1,7 +1,7 @@
 # Detailed Design: Enterprise Help / Support Agent (Aegis Copilot Extension)
 
 **Date:** 2026-07-21  
-**Status:** Draft for approval  
+**Status:** P0/P1/P2 implemented and verified 2026-10-21 (see §1.3)
 **Design ID:** `20619fd6`  
 **Related:**  
 - `docs/superpowers/specs/2026-07-09-equity-research-agent-platform-design.md`  
@@ -30,7 +30,22 @@
 - Agent-initiated portfolio writes or approval actions.
 - Browser-direct calls to LLM, vector DB, or MCP.
 
-### 1.3 Product framing
+### 1.3 Implementation status (2026-10-21)
+
+| Area | Status | Evidence |
+|------|--------|----------|
+| P0 principal/thread/run ownership | Implemented | `ChatServiceSecurityTest`, `WorkflowServiceAuthzTest`; client-supplied roles ignored; run reads/list/control owner-scoped; legacy unowned runs admin-only |
+| P0 golden20 CI | Implemented | `Golden20RoutingTest`: 23 tests, route accuracy 1.000 (15/15), safety 1.000 (5/5) |
+| P1 observability | Implemented | `HelpTraceService` + `GET /_backend/help/metrics`; route/provider/cache/escalate counters + latency histogram |
+| P1 load baseline | Implemented | `scripts/loadtest_help.py`; local `/help/execute` 200 req / 20 concurrency: 400.32 req/s, p50 47.05ms, p95 61.13ms, p99 71.88ms, 0 errors |
+| P1 retrieval | Implemented as hybrid **lexical** retrieval | TF-IDF vector + keyword + RRF rerank; no neural embeddings/synonyms; `KNOWLEDGE_RAG` kept as the wire enum but documented as legacy naming |
+| P1 bounded executor | Implemented | `AsyncConfig.workflowExecutor` (4/16/200, CallerRuns); ChatService, WorkflowController and layout write-back use it |
+| P2 goal state/checkpoint | Implemented | `help_thread_state` + `HelpSessionStateService`; multi-turn runId inheritance and pending-clarification checkpoint |
+| P2 answer-level eval | Implemented | `HelpAnswerEvaluator`; 26-case fixture: passRate 0.7692, faithfulness 0.7970, relevance 0.8638, escalation accuracy 0.9231 |
+| P2 tool gateway | Implemented | `HelpToolCatalog` + `HelpToolGateway` (allowlist/timeout/retry/circuit/audit) wired into diagnosis; `GET /_backend/help/tools` |
+| Neural vector DB / GraphRAG / MCP server | Not implemented (P3) | Deliberately out of scope; do not claim in interviews |
+
+### 1.4 Product framing
 
 | Marketing label | System name | Role |
 |-----------------|-------------|------|
@@ -58,7 +73,7 @@ Chat message
   → Answer + deep link (no LLM or tiny prompt)
 ```
 
-### Journey H2 — Doc RAG (L1) [P1]
+### Journey H2 — Doc Retrieval (L1) [P1]
 
 ```text
 Chat message
@@ -96,7 +111,7 @@ Chat message
 Browser AICopilot
   --user token--> Java ChatController/ChatService
                     │
-                    ├─ CacheGate (L1 semantic/exact, public only)
+                    ├─ CacheGate (L1 exact/normalized; semantic planned, public only)
                     ├─ IntentRouterService.classifyExtended()
                     │     domain + complexity + entities + cacheable
                     │
@@ -138,7 +153,7 @@ See contracts:
 | Field | Values |
 |-------|--------|
 | `domain` | `RESEARCH`, `PRODUCT_HELP`, `RUN_DIAGNOSIS`, `CHITCHAT` |
-| `complexity` | `L0` (playbook), `L1` (vanilla RAG), `L2` (help graph) |
+| `complexity` | `L0` (playbook), `L1` (hybrid lexical retrieval), `L2` (help graph) |
 | `routeAction` | `DISPATCH_WORKFLOW`, `PLAYBOOK`, `KNOWLEDGE_RAG`, `HELP_GRAPH`, `COPILOT`, `CLARIFY` |
 
 ### 4.2 Extended IntentResult (backward compatible)
@@ -246,7 +261,7 @@ Contract file: `help-agent-contracts/json/chat_message_response.schema.json`
 
 | Pipeline | Source of truth | Retrieval | Cache |
 |----------|-----------------|-----------|-------|
-| Public KB | Playbooks (P0) + vector index (P1) | keyword / embedding + **pre-filter** `visibility` | yes (semantic) |
+| Public KB | Playbooks (P0) + TF-IDF lexical index (P1) | keyword + TF-IDF vector + RRF + **pre-filter** `visibility` | yes (public answer cache) |
 | Private facts | MySQL runs/portfolio/recommendations | **Tools only** (Java APIs) | **never** answer cache |
 
 ### 6.2 Pre-filtering (P1 vector)
@@ -261,7 +276,7 @@ Orchestrator only consumes search results from Java; does not re-query raw vecto
 
 ### 6.3 Parent–child chunking (P1)
 
-- Child: ~256–384 tokens for embedding  
+- Child: ~256–384 tokens for vector indexing
 - Parent: section-level for LLM context  
 - Metadata: `doc_id, parent_id, path, version, visibility, updated_at`
 
@@ -341,7 +356,7 @@ MCP (P2): wrap the same tools behind an internal MCP server; no new side effects
 
 ### 9.1 Layer 1 — before LLM (Java)
 
-- Key: `help:l1:{hash(normalize(message))}` or embedding KNN (P1).  
+- Key: `help:l1:{hash(normalize(message))}`; vector KNN is planned, not implemented.
 - Threshold: ≥0.93 similarity for product help; **never** for investment advice.  
 - Gate: `cacheable==true` and no private entities.
 
@@ -376,7 +391,7 @@ P2: optional Postgres checkpointer for multi-instance.
 |-------|---------|------|
 | Dev | Manual + pytest fixtures | Playbook hit rate, route accuracy |
 | CI (P0) | `golden20.json` | Route domain accuracy ≥ 0.9; safety 100% |
-| CI (P1) | RAGAS-style metrics on Help only | Faithfulness ≥ 0.75; Relevancy ≥ 0.80 |
+| CI (P1) | Deterministic answer-level eval on Help only | Faithfulness ≥ 0.75; Relevance ≥ 0.80; task completion ≥ 0.85 |
 | Online (P2) | Langfuse / OTel + existing spans | Trace route, cache_hit, chunk_ids, escalate |
 
 Golden set layout: `help-agent-contracts/fixtures/golden20.json`  
@@ -426,7 +441,7 @@ Mode chip (optional P0): user can force `domain` hint via body `preferredDomain`
 - `ChatServiceHelpIntegrationTest` covers playbook / clarify / pageContext diagnosis / safety / research / copilot.  
 - Safety refuse tightened (avoid blocking research「买入」phrasing).
 
-### P1b — RAG + help_graph + cache ✅ (landed 2026-07-21)
+### P1b — Hybrid lexical retrieval + help loop + cache ✅ (landed 2026-07-21)
 
 - `KnowledgeService` classpath keyword index + ACL **pre-filter** (`visibility` / roles).  
 - `HelpLoopService` (API) + orchestrator `help_loop` `/help/execute` (retrieve→grade→≤3→escalate).  

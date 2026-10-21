@@ -4,8 +4,12 @@ import com.aegis.alpha.domain.WorkflowNodeRun;
 import com.aegis.alpha.domain.WorkflowRun;
 import com.aegis.alpha.domain.WorkflowRunEvent;
 import com.aegis.alpha.mapper.WorkflowMapper;
+import com.aegis.alpha.security.AuthenticatedPrincipal;
 import com.aegis.alpha.service.LangChainGateway;
 import com.aegis.alpha.service.WorkflowService;
+import com.aegis.alpha.service.help.tool.HelpToolCatalog;
+import com.aegis.alpha.service.help.tool.HelpToolGateway;
+import com.aegis.alpha.service.help.tool.HelpToolResult;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
@@ -17,7 +21,7 @@ import java.util.Locale;
 import java.util.Map;
 
 /**
- * Product help (playbook), knowledge RAG, help-loop, and run diagnosis for ChatService.
+ * Product help (playbook), hybrid lexical knowledge retrieval, help-loop, and run diagnosis for ChatService.
  */
 @Service
 public class HelpService {
@@ -36,6 +40,7 @@ public class HelpService {
     private final KnowledgeService knowledgeService;
     private final HelpLoopService helpLoopService;
     private final LangChainGateway langChainGateway;
+    private final HelpToolGateway helpToolGateway;
 
     @Autowired
     public HelpService(PlaybookService playbookService,
@@ -43,22 +48,36 @@ public class HelpService {
                        WorkflowMapper workflowMapper,
                        KnowledgeService knowledgeService,
                        HelpLoopService helpLoopService,
-                       LangChainGateway langChainGateway) {
+                       LangChainGateway langChainGateway,
+                       HelpToolGateway helpToolGateway) {
         this.playbookService = playbookService;
         this.workflowService = workflowService;
         this.workflowMapper = workflowMapper;
         this.knowledgeService = knowledgeService;
         this.helpLoopService = helpLoopService;
         this.langChainGateway = langChainGateway;
+        this.helpToolGateway = helpToolGateway;
     }
 
-    /** Test helper when gateway is unused. */
+    /** Test helper when the LLM gateway is unused. */
+    public HelpService(PlaybookService playbookService,
+                       WorkflowService workflowService,
+                       WorkflowMapper workflowMapper,
+                       KnowledgeService knowledgeService,
+                       HelpLoopService helpLoopService,
+                       LangChainGateway langChainGateway) {
+        this(playbookService, workflowService, workflowMapper, knowledgeService, helpLoopService,
+                langChainGateway, null);
+    }
+
+    /** Test helper when both the LLM gateway and the tool gateway are unused. */
     public HelpService(PlaybookService playbookService,
                        WorkflowService workflowService,
                        WorkflowMapper workflowMapper,
                        KnowledgeService knowledgeService,
                        HelpLoopService helpLoopService) {
-        this(playbookService, workflowService, workflowMapper, knowledgeService, helpLoopService, null);
+        this(playbookService, workflowService, workflowMapper, knowledgeService, helpLoopService,
+                null, null);
     }
 
     public Map<String, Object> answerFromPlaybook(String threadId, String message, HelpIntent.Result intent) {
@@ -214,6 +233,19 @@ public class HelpService {
      * P1 diagnosis: run header + problem nodes first + recent events + suggested actions.
      */
     public Map<String, Object> diagnoseRun(String threadId, String message, HelpIntent.Result intent) {
+        return diagnoseRun(threadId, message, intent, null);
+    }
+
+    /**
+     * Owner-scoped diagnosis. With a principal the run, its nodes and its events are read through
+     * the scoped workflow service, so a caller can only diagnose runs they own (or, for admins,
+     * any run). A missing run and a run owned by somebody else produce the same generic answer:
+     * the chat must not become a probe for other users' run ids, node names or event payloads.
+     *
+     * <p>A null principal keeps the legacy unscoped behaviour used by internal callers and tests.</p>
+     */
+    public Map<String, Object> diagnoseRun(String threadId, String message, HelpIntent.Result intent,
+                                           AuthenticatedPrincipal principal) {
         String runId = intent != null && intent.getEntities() != null
                 ? intent.getEntities().getRunId()
                 : null;
@@ -222,6 +254,21 @@ public class HelpService {
         }
         runId = runId.trim();
 
+        if (principal != null) {
+            WorkflowRun owned;
+            try {
+                owned = readRunTool(runId, principal);
+            } catch (ToolUnavailableException ex) {
+                return toolUnavailableDiagnosis(threadId, runId, intent, ex.getMessage());
+            }
+            if (owned == null) {
+                return accessDeniedDiagnosis(threadId, runId, intent);
+            }
+            return buildDiagnosis(threadId, message, intent, owned,
+                    readNodeRunsTool(runId, principal),
+                    readRunEventsTool(runId, principal));
+        }
+
         WorkflowRun run;
         try {
             run = workflowService.run(runId);
@@ -229,30 +276,18 @@ public class HelpService {
             run = null;
         }
         if (run == null) {
-            String body = "未找到运行 `" + runId + "`。请确认 runId 是否正确，或在运行中心刷新列表后再试。\n\n"
-                    + "路径提示：`/runs/" + runId + "`\n\n"
-                    + DEFAULT_DISCLAIMER;
-            Map<String, Object> response = buildResponse(
-                    threadId,
-                    body,
-                    intent,
-                    "help-diagnosis",
-                    HelpIntent.RouteAction.HELP_GRAPH,
-                    sourceRef("run", runId, "missing-run", "/runs/" + runId),
-                    false,
-                    DEFAULT_DISCLAIMER
-            );
-            response.put("ok", false);
-            response.put("escalateHuman", true);
-            response.put("runId", runId);
-            response.put("diagnosis", diagnosisMeta("RUN_NOT_FOUND", runId, null, null,
-                    Collections.singletonList("确认 runId 后重试"), true));
-            return response;
+            return runNotFoundDiagnosis(threadId, runId, intent);
         }
+        return buildDiagnosis(threadId, message, intent, run, safeNodeRuns(runId), safeRunEvents(runId));
+    }
 
+    private Map<String, Object> buildDiagnosis(String threadId,
+                                               String message,
+                                               HelpIntent.Result intent,
+                                               WorkflowRun run,
+                                               List<WorkflowNodeRun> nodes,
+                                               List<WorkflowRunEvent> events) {
         String status = run.getStatus() == null ? "UNKNOWN" : run.getStatus().toUpperCase(Locale.ROOT);
-        List<WorkflowNodeRun> nodes = safeNodeRuns(runId);
-        List<WorkflowRunEvent> events = safeRunEvents(runId);
         List<WorkflowNodeRun> problemNodes = filterProblemNodes(nodes);
         List<String> suggestedActions = buildSuggestedActions(status, run, problemNodes, message);
         String focus = detectFocus(message, status);
@@ -702,6 +737,166 @@ public class HelpService {
         } catch (Exception ex) {
             return new ArrayList<WorkflowRunEvent>();
         }
+    }
+
+    /** Scoped reads: empty when the principal may not read the run. */
+    private List<WorkflowNodeRun> safeScopedNodeRuns(String runId, AuthenticatedPrincipal principal) {
+        try {
+            List<WorkflowNodeRun> nodes = workflowService.nodeRunsForPrincipal(runId, principal);
+            return nodes == null ? new ArrayList<WorkflowNodeRun>() : nodes;
+        } catch (Exception ex) {
+            return new ArrayList<WorkflowNodeRun>();
+        }
+    }
+
+    private List<WorkflowRunEvent> safeScopedRunEvents(String runId, AuthenticatedPrincipal principal) {
+        try {
+            List<WorkflowRunEvent> events = workflowService.runEventsForPrincipal(runId, principal);
+            return events == null ? new ArrayList<WorkflowRunEvent>() : events;
+        } catch (Exception ex) {
+            return new ArrayList<WorkflowRunEvent>();
+        }
+    }
+
+    /**
+     * Reads a run through the unified read-only tool gateway when available.
+     * Returns null for "missing or not authorized"; throws {@link ToolUnavailableException}
+     * for timeout / circuit-open / transport failures so the answer can distinguish
+     * "you cannot see this" from "the diagnosis backend is temporarily unavailable".
+     */
+    private WorkflowRun readRunTool(String runId, AuthenticatedPrincipal principal) {
+        if (helpToolGateway == null) {
+            return workflowService.runForPrincipal(runId, principal);
+        }
+        HelpToolResult result = helpToolGateway.execute(
+                HelpToolCatalog.GET_WORKFLOW_RUN,
+                principal.getUserId(),
+                () -> {
+                    WorkflowRun run = workflowService.runForPrincipal(runId, principal);
+                    if (run == null) {
+                        throw new IllegalArgumentException("run_not_found");
+                    }
+                    return Collections.<String, Object>singletonMap("run", run);
+                });
+        if (!result.isOk()) {
+            String error = result.getError() == null ? "" : result.getError();
+            if (error.contains("run_not_found")) {
+                return null;
+            }
+            throw new ToolUnavailableException(result.isCircuitOpen() ? "circuit_open" : error);
+        }
+        Object run = result.getData() == null ? null : result.getData().get("run");
+        return run instanceof WorkflowRun ? (WorkflowRun) run : null;
+    }
+
+    @SuppressWarnings("unchecked")
+    private List<WorkflowNodeRun> readNodeRunsTool(String runId, AuthenticatedPrincipal principal) {
+        if (helpToolGateway == null) {
+            return safeScopedNodeRuns(runId, principal);
+        }
+        HelpToolResult result = helpToolGateway.execute(
+                HelpToolCatalog.GET_WORKFLOW_RUN_NODES,
+                principal.getUserId(),
+                () -> Collections.<String, Object>singletonMap(
+                        "nodes", workflowService.nodeRunsForPrincipal(runId, principal)));
+        if (!result.isOk()) {
+            return new ArrayList<WorkflowNodeRun>();
+        }
+        Object nodes = result.getData() == null ? null : result.getData().get("nodes");
+        return nodes instanceof List ? (List<WorkflowNodeRun>) nodes : new ArrayList<WorkflowNodeRun>();
+    }
+
+    @SuppressWarnings("unchecked")
+    private List<WorkflowRunEvent> readRunEventsTool(String runId, AuthenticatedPrincipal principal) {
+        if (helpToolGateway == null) {
+            return safeScopedRunEvents(runId, principal);
+        }
+        HelpToolResult result = helpToolGateway.execute(
+                HelpToolCatalog.GET_WORKFLOW_RUN_EVENTS,
+                principal.getUserId(),
+                () -> Collections.<String, Object>singletonMap(
+                        "events", workflowService.runEventsForPrincipal(runId, principal)));
+        if (!result.isOk()) {
+            return new ArrayList<WorkflowRunEvent>();
+        }
+        Object events = result.getData() == null ? null : result.getData().get("events");
+        return events instanceof List ? (List<WorkflowRunEvent>) events : new ArrayList<WorkflowRunEvent>();
+    }
+
+    private Map<String, Object> toolUnavailableDiagnosis(String threadId, String runId,
+                                                         HelpIntent.Result intent, String reason) {
+        String body = "诊断服务暂时不可用，请稍后重试。若持续失败，请在运行中心查看节点详情或联系平台支持。";
+        Map<String, Object> response = buildResponse(
+                threadId,
+                body,
+                intent,
+                "help-diagnosis",
+                HelpIntent.RouteAction.HELP_GRAPH,
+                null,
+                false,
+                DEFAULT_DISCLAIMER
+        );
+        response.put("ok", false);
+        response.put("escalateHuman", true);
+        response.put("runId", runId);
+        response.put("diagnosis", diagnosisMeta("TOOL_UNAVAILABLE", runId, null, null,
+                Collections.singletonList("稍后重试或打开运行中心"), true));
+        response.put("toolError", reason == null ? "tool_unavailable" : reason);
+        return response;
+    }
+
+    /** Internal signal for a read-only tool outage (timeout / circuit open / transport). */
+    private static final class ToolUnavailableException extends RuntimeException {
+        private ToolUnavailableException(String message) {
+            super(message);
+        }
+    }
+
+    /** Generic "not found" answer for callers that do not authenticate through a principal. */
+    private Map<String, Object> runNotFoundDiagnosis(String threadId, String runId, HelpIntent.Result intent) {
+        String body = "未找到运行 `" + runId + "`。请确认 runId 是否正确，或在运行中心刷新列表后再试。\n\n"
+                + "路径提示：`/runs/" + runId + "`\n\n"
+                + DEFAULT_DISCLAIMER;
+        Map<String, Object> response = buildResponse(
+                threadId,
+                body,
+                intent,
+                "help-diagnosis",
+                HelpIntent.RouteAction.HELP_GRAPH,
+                sourceRef("run", runId, "missing-run", "/runs/" + runId),
+                false,
+                DEFAULT_DISCLAIMER
+        );
+        response.put("ok", false);
+        response.put("escalateHuman", true);
+        response.put("runId", runId);
+        response.put("diagnosis", diagnosisMeta("RUN_NOT_FOUND", runId, null, null,
+                Collections.singletonList("确认 runId 后重试"), true));
+        return response;
+    }
+
+    /**
+     * Generic answer for a run the caller cannot read. Deliberately identical for "does not exist"
+     * and "belongs to someone else", and carries no run status, node names or event payloads.
+     */
+    private Map<String, Object> accessDeniedDiagnosis(String threadId, String runId, HelpIntent.Result intent) {
+        String body = "未找到运行或无权访问该运行。";
+        Map<String, Object> response = buildResponse(
+                threadId,
+                body,
+                intent,
+                "help-diagnosis",
+                HelpIntent.RouteAction.HELP_GRAPH,
+                null,
+                false,
+                DEFAULT_DISCLAIMER
+        );
+        response.put("ok", false);
+        response.put("escalateHuman", true);
+        response.put("runId", runId);
+        response.put("diagnosis", diagnosisMeta("ACCESS_DENIED", runId, null, null,
+                Collections.singletonList("确认 runId 后重试，或联系管理员确认是否有该运行的访问权限"), true));
+        return response;
     }
 
     private Map<String, Object> buildResponse(

@@ -60,7 +60,7 @@ class ApiContractTest {
         langChainResult.put("message", "Mock LangChain result");
         langChainResult.put("content", "Mock LangChain result");
         when(langChainGateway.runAgent(any(), anyMap(), anyMap(), anyString())).thenReturn(langChainResult);
-        when(langChainGateway.executeNode(any(), anyMap(), anyMap(), anyString())).thenReturn(langChainResult);
+        when(langChainGateway.executeNode(any(), anyMap(), anyMap(), anyString(), any())).thenReturn(langChainResult);
         when(langChainGateway.classifyIntent(anyString(), any())).thenReturn(null);
         when(marketDataService.quote(anyString())).thenReturn(marketQuote());
         when(marketDataService.financials(anyString())).thenReturn(marketFinancials());
@@ -455,7 +455,7 @@ class ApiContractTest {
     @Test
     void durableRuntimePublishesQueuesControlsDispatchesAndRetriesRuns() throws Exception {
         AtomicInteger flakyAttempts = new AtomicInteger();
-        when(langChainGateway.executeNode(any(), anyMap(), anyMap(), anyString())).thenAnswer(invocation -> {
+        when(langChainGateway.executeNode(any(), anyMap(), anyMap(), anyString(), any())).thenAnswer(invocation -> {
             Map<String, Object> node = invocation.getArgument(2);
             if ("flaky".equals(node.get("id")) && flakyAttempts.incrementAndGet() == 1) {
                 throw new IllegalStateException("transient model failure");
@@ -568,7 +568,7 @@ class ApiContractTest {
 
     @Test
     void governanceMaterializesModelEvidenceAndRecommendationReview() throws Exception {
-        when(langChainGateway.executeNode(any(), anyMap(), anyMap(), anyString())).thenAnswer(invocation -> {
+        when(langChainGateway.executeNode(any(), anyMap(), anyMap(), anyString(), any())).thenAnswer(invocation -> {
             Map<String, Object> node = invocation.getArgument(2);
             Map<String, Object> data = objectMap(node.get("data"));
             String handler = data == null ? "" : String.valueOf(data.get("handler"));
