@@ -152,6 +152,31 @@ class WorkflowServiceAuthzTest {
     }
 
     @Test
+    void createRunOverridesForgedUserIdInInputs() throws Exception {
+        when(mapper.findDefinition("daily")).thenReturn(dailyDefinition());
+        java.util.Map<String, Object> inputs = new LinkedHashMap<String, Object>();
+        inputs.put("userId", "victim");
+        inputs.put("user_id", "victim");
+
+        service.createRun("daily", "AAPL", inputs, principal("u-1", "tenant-1"));
+
+        ArgumentCaptor<WorkflowRun> captor = ArgumentCaptor.forClass(WorkflowRun.class);
+        verify(mapper).insertRun(captor.capture());
+        java.util.Map<?, ?> stored = new com.fasterxml.jackson.databind.ObjectMapper()
+                .readValue(captor.getValue().getInputsJson(), java.util.Map.class);
+        assertThat(stored.get("userId")).isEqualTo("u-1");
+        assertThat(stored.containsKey("user_id")).isFalse();
+    }
+
+    @Test
+    void applyAuthenticatedUserIdAlwaysWins() {
+        java.util.Map<String, Object> inputs = new LinkedHashMap<String, Object>();
+        inputs.put("userId", "victim");
+        WorkflowService.applyAuthenticatedUserId(inputs, "u-1");
+        assertThat(inputs.get("userId")).isEqualTo("u-1");
+    }
+
+    @Test
     void createRunWithoutPrincipalKeepsLegacyUnownedRun() {
         when(mapper.findDefinition("daily")).thenReturn(dailyDefinition());
 
