@@ -1253,6 +1253,7 @@ public class WorkflowService {
         state.put("subject", run.getSubject());
         // Sync path: same portfolio:read delegation as streaming (fail soft)
         String delegatedToken = issueDelegatedPortfolioReadToken(run.getRunId(), null, null, inputs);
+        List<String> degradedNodes = new ArrayList<>();
 
         int index = 0;
         for (Map<String, Object> node : orderedNodes) {
@@ -1288,6 +1289,15 @@ public class WorkflowService {
                 try {
                     long started = System.currentTimeMillis();
                     Map<String, Object> output = executeNode(node, state, run, delegatedToken);
+                    if (output != null && Boolean.FALSE.equals(output.get("ok"))) {
+                        /* Orchestrator reported failure: retry per retryPolicy instead of storing it as success. */
+                        Object error = output.get("error") != null ? output.get("error") : output.get("summary");
+                        throw new IllegalStateException("Node returned ok=false"
+                                + (error == null ? "" : ": " + String.valueOf(error)));
+                    }
+                    if (output != null && Boolean.TRUE.equals(output.get("degraded"))) {
+                        degradedNodes.add(nodeId(node));
+                    }
                     long elapsed = System.currentTimeMillis() - started;
                     if (timeoutMs > 0 && elapsed > timeoutMs) {
                         throw new IllegalStateException("Node timed out after " + elapsed + "ms; timeout=" + timeoutMs + "ms");
@@ -1338,7 +1348,16 @@ public class WorkflowService {
         run.setControlStatus("COMPLETED");
         run.setPauseRequested(0);
         run.setCancelRequested(0);
+        if (!degradedNodes.isEmpty() && (run.getErrorMessage() == null || run.getErrorMessage().trim().isEmpty())) {
+            run.setErrorMessage("DEGRADED");
+        }
         mapper.updateRun(run);
+        if (!degradedNodes.isEmpty()) {
+            Map<String, Object> degradedPayload = new LinkedHashMap<>();
+            degradedPayload.put("nodes", degradedNodes);
+            recordRunEvent(run, "RUN_DEGRADED", null, null, "COMPLETED",
+                    "Workflow completed with degraded (local) node results.", degradedPayload, 999999);
+        }
         recordRunEvent(run, "RUN_COMPLETED", null, null, "COMPLETED", "Workflow run completed.", state, 1000000);
         cacheService.put("aegis:workflow:run:" + run.getRunId(), run, Duration.ofHours(2));
     }

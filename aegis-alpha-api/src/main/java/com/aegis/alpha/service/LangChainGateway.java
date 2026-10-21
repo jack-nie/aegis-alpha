@@ -95,8 +95,10 @@ public class LangChainGateway {
                 return callLangGraph(agent, state, node, subject, "/execute-node", delegatedToken);
             } catch (Exception ex) {
                 String handler = handler(node);
-                log.warn("[LangChainGateway] Orchestrator call failed for handler={}, subject={}, error={}", handler, subject, ex.getMessage());
-                return localStructuredNode(agent, state, node, subject, "LangGraph call failed: " + ex.getMessage());
+                log.warn("[LangChainGateway] Orchestrator call failed for handler={}, errorType={}", handler, ex.getClass().getSimpleName());
+                /* Enabled-but-failed is a failure, not a local result: let the caller retry / fail the node. */
+                throw new OrchestratorCallException("Orchestrator execute-node failed for handler " + handler
+                        + ": " + ex.getClass().getSimpleName(), ex);
             }
         }
         return localStructuredNode(agent, state, node, subject, "LangGraph disabled. Set AEGIS_ALPHA_LANGCHAIN_ENABLED=true to use the external engine.");
@@ -244,7 +246,7 @@ public class LangChainGateway {
                     trimSlash(engineUrl) + "/execute-workflow", new HttpEntity<String>(body, headers), Object.class);
         } catch (Exception ex) {
             log.warn("[LangChainGateway] execute-workflow failed: type={}", ex.getClass().getSimpleName());
-            throw new IllegalStateException("Orchestrator execute-workflow call failed: " + ex.getClass().getSimpleName(), ex);
+            throw new OrchestratorCallException("Orchestrator execute-workflow call failed: " + ex.getClass().getSimpleName(), ex);
         }
         if (!(response instanceof Map)) {
             throw new IllegalStateException("Unexpected execute-workflow response");
@@ -376,7 +378,8 @@ public class LangChainGateway {
         result.put("summary", localSummary(handler, subject, state));
         result.put("signals", java.util.Arrays.asList(signal("handler", handler), signal("subject", subject)));
         result.put("sources", java.util.Collections.singletonList(source("Local deterministic workflow fallback", "local")));
-        result.put("confidence", "finance.stock_recommendation_aggregate".equals(handler) ? 0.67 : 0.58);
+        /* No model ran, so there is no confidence to report (was a fabricated 0.58 / 0.67). */
+        result.put("confidence", null);
         Map<String, Object> data = new LinkedHashMap<>();
         data.put("reason", reason);
         data.put("fallback", true);
