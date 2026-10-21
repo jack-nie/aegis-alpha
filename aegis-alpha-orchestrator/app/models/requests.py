@@ -15,7 +15,7 @@ class WorkflowRequest(BaseModel):
     edges: list[Edge] = Field(default_factory=list)
     state: dict[str, Any] = Field(default_factory=dict)
     subject: str = "Aegis Alpha workflow"
-    require_approval: bool = False
+    require_approval: bool = Field(default=False, alias="requireApproval")
     thread_id: str | None = Field(default=None, alias="threadId")
     api_key: str | None = Field(default=None, alias="apiKey")
     base_url: str | None = Field(default=None, alias="baseUrl")

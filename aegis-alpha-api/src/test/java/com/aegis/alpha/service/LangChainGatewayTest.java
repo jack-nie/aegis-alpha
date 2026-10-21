@@ -82,6 +82,94 @@ class LangChainGatewayTest {
 
         String withoutToken = gateway.buildStreamBody(layout, "subject", inputs, null);
         assertThat(withoutToken.contains("delegatedToken"), is(false));
+        assertThat(withoutToken.contains("\"requireApproval\":false"), is(true));
+    }
+
+    @Test
+    void buildStreamBodyIncludesThreadIdAndRequireApproval() throws Exception {
+        LangChainGateway gateway = new LangChainGateway(
+                new ObjectMapper(),
+                false,
+                "http://127.0.0.1:8787",
+                "openai",
+                "deepseek-v4-flash",
+                "test-key",
+                "http://example.test/v1"
+        );
+        Map<String, Object> layout = new LinkedHashMap<String, Object>();
+        layout.put("nodes", java.util.Collections.emptyList());
+        layout.put("edges", java.util.Collections.emptyList());
+        Map<String, Object> inputs = new LinkedHashMap<String, Object>();
+        inputs.put("ticker", "AAPL");
+
+        String body = gateway.buildStreamBody(layout, "subject", inputs, "deleg-token-1", "thread-9", true);
+        assertThat(body.contains("\"threadId\":\"thread-9\""), is(true));
+        assertThat(body.contains("\"requireApproval\":true"), is(true));
+        assertThat(body.contains("\"delegatedToken\":\"deleg-token-1\""), is(true));
+
+        String withoutThread = gateway.buildStreamBody(layout, "subject", inputs, null, "  ", false);
+        assertThat(withoutThread.contains("threadId"), is(false));
+        assertThat(withoutThread.contains("\"requireApproval\":false"), is(true));
+    }
+
+    @Test
+    void resumeWorkflowPostsDecisionWhenEnabled() throws Exception {
+        final java.util.concurrent.atomic.AtomicReference<String> seenBody =
+                new java.util.concurrent.atomic.AtomicReference<String>();
+        final java.util.concurrent.atomic.AtomicReference<String> seenPath =
+                new java.util.concurrent.atomic.AtomicReference<String>();
+        server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/resume-workflow", exchange -> {
+            seenPath.set(exchange.getRequestURI().getPath());
+            java.io.ByteArrayOutputStream buffer = new java.io.ByteArrayOutputStream();
+            byte[] chunk = new byte[1024];
+            int read;
+            java.io.InputStream requestStream = exchange.getRequestBody();
+            while ((read = requestStream.read(chunk)) != -1) {
+                buffer.write(chunk, 0, read);
+            }
+            seenBody.set(new String(buffer.toByteArray(), StandardCharsets.UTF_8));
+            byte[] response = "{\"ok\":true,\"final_state\":{\"approval_status\":\"approved\"}}"
+                    .getBytes(StandardCharsets.UTF_8);
+            exchange.getResponseHeaders().set("Content-Type", "application/json");
+            exchange.sendResponseHeaders(200, response.length);
+            try (OutputStream output = exchange.getResponseBody()) {
+                output.write(response);
+            }
+        });
+        server.start();
+
+        String url = "http://127.0.0.1:" + server.getAddress().getPort();
+        LangChainGateway gateway = new LangChainGateway(
+                new ObjectMapper(),
+                true,
+                url,
+                "openai",
+                "deepseek-v4-flash",
+                "test-key",
+                "http://example.test/v1"
+        );
+
+        Map<String, Object> result = gateway.resumeWorkflow("run-1", true);
+        assertThat(seenPath.get(), is("/resume-workflow"));
+        assertThat(seenBody.get().contains("\"threadId\":\"run-1\""), is(true));
+        assertThat(seenBody.get().contains("\"approved\":true"), is(true));
+        assertThat(result.get("ok"), is(true));
+    }
+
+    @Test
+    void resumeWorkflowReturnsOkFalseWhenDisabled() {
+        LangChainGateway gateway = new LangChainGateway(
+                new ObjectMapper(),
+                false,
+                "http://127.0.0.1:8787",
+                "openai",
+                "deepseek-v4-flash",
+                "test-key",
+                "http://example.test/v1"
+        );
+        Map<String, Object> result = gateway.resumeWorkflow("run-1", false);
+        assertThat(result.get("ok"), is(false));
     }
 
     private void summaryOnlyResponse(HttpExchange exchange) throws IOException {

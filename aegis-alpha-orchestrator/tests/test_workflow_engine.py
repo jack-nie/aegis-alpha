@@ -631,3 +631,117 @@ async def test_finance_handler_does_not_enter_tool_loop(mock_node_executor):
     assert result.ok is True
     mock_node_executor.invoke_agent_with_tools.assert_not_awaited()
     mock_node_executor.execute.assert_awaited()
+
+
+def test_workflow_request_accepts_require_approval_alias():
+    from app.models.requests import WorkflowRequest
+
+    body = WorkflowRequest.model_validate({
+        "requireApproval": True,
+        "threadId": "run-1",
+        "nodes": [],
+        "edges": [],
+    })
+    assert body.require_approval is True
+    assert body.thread_id == "run-1"
+    by_name = WorkflowRequest.model_validate({"require_approval": False})
+    assert by_name.require_approval is False
+
+
+@pytest.mark.asyncio
+async def test_durable_approval_resume_reloads_layout_after_restart():
+    """Approval pause survives a process restart: layout comes from the store, not memory."""
+    import os
+    import tempfile
+
+    from app.core.checkpointer_lifecycle import close_checkpointer, open_checkpointer
+    from app.core.persistent_store import PersistentStore
+    from app.core.workflow_engine import WorkflowEngine
+    from app.models.responses import NodeResult
+
+    WorkflowEngine._graph_cache.clear()
+    close_checkpointer()
+
+    class FakeExecutor:
+        def __init__(self):
+            self.calls = []
+
+        async def execute(self, node, state, subject="", **kwargs):
+            self.calls.append(node.id)
+            return NodeResult(
+                ok=True,
+                summary="node",
+                node_id=node.id,
+                handler=node.data.handler or "logic",
+                node_name=node.id,
+                subject=subject or "",
+            )
+
+    executor = FakeExecutor()
+    nodes = [
+        Node(id="start", data=NodeData(handler="start", nodeType="start")),
+        Node(id="market", data=NodeData(handler="finance.market_analysis")),
+        Node(id="aggregate", data=NodeData(handler="finance.stock_recommendation_aggregate")),
+        Node(id="end", data=NodeData(handler="end", nodeType="end")),
+    ]
+    edges = [
+        Edge(source="start", target="market"),
+        Edge(source="market", target="aggregate"),
+        Edge(source="aggregate", target="end"),
+    ]
+    thread_id = "durable-approval-thread"
+    temp_dir = tempfile.TemporaryDirectory()
+    store = None
+    store_reopened = None
+    try:
+        checkpoint_path = os.path.join(temp_dir.name, "checkpoints.db")
+        store_path = os.path.join(temp_dir.name, "store.db")
+        checkpointer = open_checkpointer(checkpoint_path)
+        store = PersistentStore(store_path)
+        engine = WorkflowEngine(executor, store=store, checkpointer=checkpointer)
+
+        paused = await engine.execute_workflow(
+            nodes=nodes,
+            edges=edges,
+            state={"ticker": "AAPL"},
+            subject="approval resume",
+            require_approval=True,
+            thread_id=thread_id,
+        )
+
+        assert paused.ok is True, paused.error
+        assert "market" in executor.calls
+        assert "aggregate" not in executor.calls
+        assert (paused.final_state or {}).get("approval_status") is None
+
+        calls_before_resume = list(executor.calls)
+        engine._thread_meta.clear()
+        WorkflowEngine._graph_cache.clear()
+        await store.close()
+        store = None
+        close_checkpointer()
+
+        checkpointer_reopened = open_checkpointer(checkpoint_path)
+        store_reopened = PersistentStore(store_path)
+        resumed_engine = WorkflowEngine(
+            executor,
+            store=store_reopened,
+            checkpointer=checkpointer_reopened,
+        )
+        resumed = await resumed_engine.resume_workflow(
+            thread_id,
+            {"approved": True},
+        )
+
+        assert resumed.ok is True, resumed.error
+        assert "aggregate" in executor.calls
+        assert executor.calls.index("aggregate") >= len(calls_before_resume)
+        assert (resumed.final_state or {}).get("approval_status") == "approved"
+    finally:
+        WorkflowEngine._graph_cache.clear()
+        if store is not None:
+            await store.close()
+        if store_reopened is not None:
+            await store_reopened.close()
+        close_checkpointer()
+        temp_dir.cleanup()

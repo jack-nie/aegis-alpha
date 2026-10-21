@@ -23,6 +23,8 @@ async def test_put_and_get(store):
     item = await store.aget(("test", "ns1"), "key1")
     assert item is not None
     assert item.value["value"] == "hello"
+    # Omitting ttl_seconds still uses the store default (fixture: 3600s).
+    assert item.value["_expires_at"] >= time.time() + 3500
 
 
 @pytest.mark.asyncio
@@ -70,10 +72,11 @@ async def test_ttl_no_expiry():
         db_path = os.path.join(tmpdir, "no_ttl_test.db")
         s = PersistentStore(db_path, default_ttl_seconds=0)
         await s._ensure_db()
-        await s.aput(("test", "persist"), "key1", {"value": "forever"}, ttl_seconds=0)
+        await s.aput(("test", "persist"), "key1", {"value": "forever", "_expires_at": time.time() - 10}, ttl_seconds=0)
         item = await s.aget(("test", "persist"), "key1")
         assert item is not None
         assert item.value["value"] == "forever"
+        assert "_expires_at" not in item.value
         await s.close()
 
 
@@ -89,6 +92,13 @@ async def test_cleanup_expired():
         time.sleep(1.1)
         count = await s.cleanup_expired()
         assert count >= 1
+        # Cleanup must drop the cache row, not only the SQLite row.
+        cached = await s._memory.aget(("test", "cleanup"), "exp1")
+        assert cached is None
+        kept = await s.aget(("test", "cleanup"), "keep1")
+        assert kept is not None
+        assert kept.value["value"] == "stay"
+        assert await s.aget(("test", "cleanup"), "exp1") is None
         await s.close()
 
 
