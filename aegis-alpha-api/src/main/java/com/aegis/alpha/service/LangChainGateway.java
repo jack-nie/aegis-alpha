@@ -39,7 +39,7 @@ public class LangChainGateway {
                             @Value("${aegis.langchain.base-url:}") String baseUrl,
                             @Value("${aegis.langchain.connect-timeout-ms:3000}") int connectTimeoutMs,
                             @Value("${aegis.langchain.read-timeout-ms:30000}") int readTimeoutMs,
-                            @Value("${aegis.dify.node-execution-token:local-workflow-node-token}") String serviceToken) {
+                            @Value("${aegis.dify.node-execution-token:}") String serviceToken) {
         this.objectMapper = objectMapper;
         this.restTemplate = restTemplate(connectTimeoutMs, readTimeoutMs);
         this.shortTimeoutRestTemplate = restTemplate(2000, 5000);

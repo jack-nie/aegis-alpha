@@ -38,6 +38,14 @@ async def lifespan(app: FastAPI):
     logger.info(f"Starting Aegis Alpha Orchestrator on port {settings.port}")
     logger.info(f"Provider: {settings.provider}, Model: {settings.model}")
     logger.info(f"Mock mode: {settings.is_mock_mode}")
+    problem = settings.service_token_problem
+    if problem:
+        logger.warning(
+            "Service token unusable (%s): non-public routes will be rejected. "
+            "Set AEGIS_ALPHA_NODE_EXECUTION_TOKEN (example value only with AEGIS_ALPHA_DEV_MODE=true "
+            "or AEGIS_ALPHA_LANGCHAIN_MOCK=true).",
+            problem,
+        )
     await market_data.start()
     await memory_store_manager.initialize()
     yield
@@ -60,7 +68,7 @@ app = FastAPI(
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=settings.cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -83,12 +91,13 @@ async def service_auth_middleware(request: Request, call_next):
     if any(path == p or path.startswith(p + "/") for p in _PUBLIC_PATH_PREFIXES):
         return await call_next(request)
 
-    expected = (settings.node_execution_token or "").strip()
-    if not expected:
+    problem = settings.service_token_problem
+    if problem:
         return JSONResponse(
             status_code=503,
-            content={"ok": False, "error": "service_token_not_configured", "code": "AUTHZ_DENIED"},
+            content={"ok": False, "error": problem, "code": "AUTHZ_DENIED"},
         )
+    expected = (settings.node_execution_token or "").strip()
 
     provided = _extract_bearer(request.headers.get("authorization"))
     if provided != expected:
