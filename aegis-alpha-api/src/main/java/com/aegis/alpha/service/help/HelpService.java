@@ -11,6 +11,7 @@ import com.aegis.alpha.service.help.tool.HelpToolCatalog;
 import com.aegis.alpha.service.help.tool.HelpToolGateway;
 import com.aegis.alpha.service.help.tool.HelpToolResult;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.util.ArrayList;
@@ -41,6 +42,10 @@ public class HelpService {
     private final HelpLoopService helpLoopService;
     private final LangChainGateway langChainGateway;
     private final HelpToolGateway helpToolGateway;
+
+    /** Off by default: remote /help/execute may only re-draft from Java-selected chunks. */
+    @Value("${aegis.help.remote-generation-enabled:false}")
+    private boolean remoteGenerationEnabled = false;
 
     @Autowired
     public HelpService(PlaybookService playbookService,
@@ -149,41 +154,14 @@ public class HelpService {
     }
 
     /**
-     * L2 help loop: try orchestrator /help/execute when available; else local HelpLoopService.
+     * L2 help loop. The local {@link HelpLoopService} is the single retrieval/grading implementation
+     * (ACL pre-filtered, same corpus as knowledge answers), so sources do not depend on whether the
+     * orchestrator is reachable. When {@code aegis.help.remote-generation-enabled} is on, the
+     * orchestrator may only re-draft the answer from the chunks Java already selected; any remote
+     * failure / {@code ok=false} / escalation keeps the local answer.
      */
     public Map<String, Object> answerFromHelpLoop(String threadId, String message, HelpIntent.Result intent,
                                                   List<String> principalRoles) {
-        Map<String, Object> remote = null;
-        if (langChainGateway != null) {
-            try {
-                remote = langChainGateway.executeHelp(message, principalRoles, intent == null ? null : intent.toEnvelopeFields());
-            } catch (Exception ignored) {
-                remote = null;
-            }
-        }
-        if (remote != null && remote.get("content") != null && !String.valueOf(remote.get("content")).trim().isEmpty()) {
-            Map<String, Object> response = buildResponse(
-                    threadId,
-                    String.valueOf(remote.get("content")),
-                    intent,
-                    "help-loop-orch",
-                    HelpIntent.RouteAction.HELP_GRAPH,
-                    null,
-                    false,
-                    remote.get("disclaimer") == null ? null : String.valueOf(remote.get("disclaimer"))
-            );
-            response.put("ok", !Boolean.FALSE.equals(remote.get("ok")));
-            response.put("escalateHuman", Boolean.TRUE.equals(remote.get("escalate"))
-                    || Boolean.TRUE.equals(remote.get("escalateHuman")));
-            if (remote.get("sourceRefs") instanceof List) {
-                response.put("sourceRefs", remote.get("sourceRefs"));
-            }
-            if (remote.get("helpLoop") != null) {
-                response.put("helpLoop", remote.get("helpLoop"));
-            }
-            return response;
-        }
-
         HelpLoopService.LoopResult loop = helpLoopService.run(message, principalRoles);
         Map<String, Object> response = buildResponse(
                 threadId,
@@ -206,7 +184,32 @@ public class HelpService {
         }
         response.put("sourceRefs", refs);
         response.put("helpLoop", loop.toDiagnostics());
+
+        if (remoteGenerationEnabled && langChainGateway != null && loop.ok
+                && loop.chunks != null && !loop.chunks.isEmpty()) {
+            Map<String, Object> remote = null;
+            try {
+                remote = langChainGateway.executeHelp(message, principalRoles,
+                        intent == null ? null : intent.toEnvelopeFields(), loop.chunks);
+            } catch (Exception ignored) {
+                remote = null;
+            }
+            if (remote != null
+                    && !Boolean.FALSE.equals(remote.get("ok"))
+                    && !Boolean.TRUE.equals(remote.get("escalate"))
+                    && !Boolean.TRUE.equals(remote.get("escalateHuman"))
+                    && remote.get("content") != null
+                    && !String.valueOf(remote.get("content")).trim().isEmpty()) {
+                response.put("content", String.valueOf(remote.get("content")));
+                response.put("message", String.valueOf(remote.get("content")));
+                response.put("provider", "help-loop-orch");
+            }
+        }
         return response;
+    }
+
+    void setRemoteGenerationEnabled(boolean remoteGenerationEnabled) {
+        this.remoteGenerationEnabled = remoteGenerationEnabled;
     }
 
     public Map<String, Object> clarify(String threadId, HelpIntent.Result intent) {

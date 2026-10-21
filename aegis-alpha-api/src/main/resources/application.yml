@@ -62,6 +62,10 @@ aegis:
     cache-max-entries: ${AEGIS_ALPHA_ROUTER_CACHE_MAX_ENTRIES:500}
     breaker-failure-threshold: ${AEGIS_ALPHA_ROUTER_BREAKER_FAILURES:3}
     breaker-open-ms: ${AEGIS_ALPHA_ROUTER_BREAKER_OPEN_MS:30000}
+  help:
+    # Local HelpLoopService is the single retrieval implementation. When true, the orchestrator
+    # /help/execute may re-draft the answer from the Java-selected chunks (falls back to local).
+    remote-generation-enabled: ${AEGIS_ALPHA_HELP_REMOTE_GENERATION_ENABLED:false}
   dify:
     enabled: ${AEGIS_ALPHA_DIFY_ENABLED:false}
     base-url: ${AEGIS_ALPHA_DIFY_BASE_URL:https://api.dify.ai/v1}

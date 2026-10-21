@@ -286,12 +286,14 @@ public class LangChainGateway {
     }
 
     /**
-     * Call orchestrator POST /help/execute (retrieve→grade→≤3→draft/escalate).
+     * Call orchestrator POST /help/execute to draft an answer from Java-selected, ACL pre-filtered
+     * {@code chunks} (the orchestrator holds no corpus of its own).
      * Returns null when disabled or remote call fails.
      */
     @SuppressWarnings("unchecked")
     public Map<String, Object> executeHelp(String message, java.util.List<String> principalRoles,
-                                           Map<String, Object> intentEnvelope) {
+                                           Map<String, Object> intentEnvelope,
+                                           java.util.List<Map<String, Object>> chunks) {
         if (!enabled) {
             return null;
         }
@@ -302,6 +304,7 @@ public class LangChainGateway {
             if (intentEnvelope != null) {
                 body.put("intent", intentEnvelope);
             }
+            body.put("chunks", chunks == null ? java.util.Collections.emptyList() : chunks);
             if (apiKey != null && !apiKey.trim().isEmpty()) {
                 body.put("apiKey", apiKey);
             }
