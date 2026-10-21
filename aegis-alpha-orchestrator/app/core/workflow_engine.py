@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import uuid
@@ -30,7 +31,7 @@ from .context_assembly import apply_trace_usage, memory_hit_count
 from .memory_selector import load_run_memory, read_store_value
 from .memory_store import MemoryStoreManager
 from .node_executor import NodeExecutor
-from .tool_registry import resolve_agent_roles, tools_for_roles
+from .tool_registry import TOOL_SPECS, resolve_agent_roles, tools_for_roles
 
 logger = logging.getLogger(__name__)
 
@@ -156,6 +157,30 @@ class WorkflowEngine:
             "functionName": data.function_name or "",
             "nodeType": data.node_type or "",
         }
+
+    @classmethod
+    def _node_result_cache_key(cls, node: Node, handler: str) -> str:
+        """Per-ticker node result cache key, bound to the node's executable content.
+
+        Uses a stable sha256 (not ``hash()``, which is salted per process) so two nodes sharing a
+        handler but with different prompts never read each other's cached result.
+        """
+        payload = json.dumps(cls._node_content_fingerprint(node), sort_keys=True, default=str)
+        digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+        return f"{handler}:v3:{digest}"
+
+    def _node_reads_portfolio(self, node: Node) -> bool:
+        """True when the node is a tool-bound agent that can call portfolio_read tools.
+
+        Such results are user-specific and must not live in the per-ticker cache.
+        """
+        if (node.data.handler or "") != "general.agent" or not self._has_tools_capability():
+            return False
+        for bound in self._tools_for_node(node):
+            spec = TOOL_SPECS.get(getattr(bound, "name", ""))
+            if spec is not None and spec.sandbox_class == "portfolio_read":
+                return True
+        return False
 
     @classmethod
     def _topology_hash(cls, nodes: list[Node], edges: list[Edge]) -> str:
@@ -577,11 +602,13 @@ class WorkflowEngine:
                 store=store,
             )
 
+            # Portfolio-reading agents are user-specific: never served from / written to the ticker cache.
+            cacheable = handler != "start" and handler != "end" and not self._node_reads_portfolio(node)
             # Skip ticker cache mid tool-loop so we re-enter with ToolMessages.
-            if store and handler != "start" and handler != "end" and not mid_tool_loop:
+            if store and cacheable and not mid_tool_loop:
                 try:
                     ticker = exec_state.get("ticker", "") or exec_state.get("symbol", "")
-                    cache_key = f"{handler}:v2"
+                    cache_key = self._node_result_cache_key(node, handler)
                     if ticker:
                         cached_data = await read_store_value(store, ("ticker", ticker), cache_key)
                         result = self._node_result_from_cache(cached_data)
@@ -591,7 +618,8 @@ class WorkflowEngine:
                                 {
                                     "nodeId": result.node_id, "nodeName": result.node_name,
                                     "handler": result.handler, "status": result.status,
-                                    "ok": result.ok, "degraded": True,
+                                    "ok": result.ok, "degraded": result.degraded,
+                                    "cacheHit": True,
                                     "startedAt": started_at,
                                     "completedAt": datetime.now(timezone.utc).isoformat(),
                                     "durationMs": 0,
@@ -671,10 +699,10 @@ class WorkflowEngine:
             )
             logger.info(f"[THINKING] Workflow node completed: id={node.id} handler={result.handler} label={node_label} status={result.status} ok={result.ok} duration={result.duration_ms}ms")
 
-            if store and handler != "start" and handler != "end":
+            if store and cacheable:
                 try:
                     ticker = state.get("final_state", {}).get("ticker", "") or state.get("final_state", {}).get("symbol", "")
-                    cache_key = f"{handler}:v2"
+                    cache_key = self._node_result_cache_key(node, handler)
                     if ticker and result.ok:
                         await store.aput(
                             ("ticker", ticker), cache_key,
@@ -816,10 +844,10 @@ class WorkflowEngine:
             f"ok={result.ok} rounds={current_round}"
         )
 
-        if store and handler != "start" and handler != "end":
+        if store and handler != "start" and handler != "end" and not self._node_reads_portfolio(node):
             try:
                 ticker = final_state.get("ticker", "") or final_state.get("symbol", "")
-                cache_key = f"{handler}:v2"
+                cache_key = self._node_result_cache_key(node, handler)
                 if ticker and result.ok:
                     await store.aput(
                         ("ticker", ticker),

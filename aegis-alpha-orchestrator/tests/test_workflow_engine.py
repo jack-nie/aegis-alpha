@@ -854,3 +854,101 @@ def test_gate_helpers_are_fail_closed():
     assert is_explicit_approval({"approved": True}) is True
     for value in (None, {}, {"approved": False}, {"approved": "true"}, {"approved": 1}, "approved"):
         assert is_explicit_approval(value) is False
+
+
+# ---------------- P1-10: node result cache key + portfolio agents not cached ----------------
+
+
+def test_node_result_cache_key_binds_prompt_and_is_stable(mock_node_executor):
+    from app.core.workflow_engine import WorkflowEngine
+
+    a = Node(id="n1", data=NodeData(handler="finance.market_analysis", prompt="analyze A"))
+    a2 = Node(id="n1", data=NodeData(handler="finance.market_analysis", prompt="analyze A"))
+    b = Node(id="n1", data=NodeData(handler="finance.market_analysis", prompt="analyze B"))
+    key_a = WorkflowEngine._node_result_cache_key(a, "finance.market_analysis")
+    assert key_a == WorkflowEngine._node_result_cache_key(a2, "finance.market_analysis")
+    assert key_a != WorkflowEngine._node_result_cache_key(b, "finance.market_analysis")
+    assert key_a.startswith("finance.market_analysis:v3:")
+
+
+def test_portfolio_agent_is_not_cacheable(mock_node_executor):
+    from app.core.workflow_engine import WorkflowEngine
+
+    class _Tool:
+        def __init__(self, name):
+            self.name = name
+
+    registry = {
+        "get_stock_quote": _Tool("get_stock_quote"),
+        "get_portfolio_positions": _Tool("get_portfolio_positions"),
+        "get_portfolio_summary": _Tool("get_portfolio_summary"),
+    }
+    engine = WorkflowEngine(mock_node_executor, tool_registry=registry)
+    portfolio_agent = Node(id="pa", data=NodeData(handler="general.agent", agentId="specialist_portfolio"))
+    research_agent = Node(id="ra", data=NodeData(handler="general.agent", agentId="specialist_fundamentals"))
+    plain_node = Node(id="pn", data=NodeData(handler="finance.portfolio_review"))
+    assert engine._node_reads_portfolio(portfolio_agent) is True
+    assert engine._node_reads_portfolio(research_agent) is False
+    assert engine._node_reads_portfolio(plain_node) is False
+
+
+@pytest.mark.asyncio
+async def test_same_handler_different_prompt_does_not_hit_cache_and_hit_is_not_degraded(tmp_path):
+    from langgraph.checkpoint.memory import MemorySaver
+
+    from app.config import Settings
+    from app.core.memory_store import MemoryStoreManager
+    from app.core.workflow_engine import WorkflowEngine
+    from app.models.responses import NodeResult
+
+    calls: list[str] = []
+
+    async def _execute(node, state, subject="", **kwargs):
+        calls.append(node.data.prompt or "")
+        return NodeResult(
+            ok=True, status="completed", handler=node.data.handler, node_id=node.id,
+            node_name=node.id, subject=subject, summary=f"ran {node.data.prompt}",
+        )
+
+    executor = type("Executor", (), {})()
+    executor.execute = AsyncMock(side_effect=_execute)
+    manager = MemoryStoreManager(Settings(
+        AEGIS_ALPHA_LANGCHAIN_API_KEY="test",
+        AEGIS_ALPHA_DATA_DIR=str(tmp_path),
+        AEGIS_ALPHA_STORE_TTL_SECONDS=3600,
+    ))
+    await manager.initialize()
+
+    def _graph(prompt):
+        nodes = [
+            Node(id="start", data=NodeData(handler="start", nodeType="start")),
+            Node(id="n1", data=NodeData(handler="finance.market_analysis", prompt=prompt)),
+            Node(id="end", data=NodeData(handler="end", nodeType="end")),
+        ]
+        edges = [Edge(source="start", target="n1"), Edge(source="n1", target="end")]
+        return nodes, edges
+
+    try:
+        WorkflowEngine._graph_cache.clear()
+        engine = WorkflowEngine(executor, store=manager.store, checkpointer=MemorySaver())
+        for prompt in ("prompt A", "prompt B"):
+            nodes, edges = _graph(prompt)
+            result = await engine.execute_workflow(nodes, edges, {"ticker": "AAPL"}, "AAPL", require_approval=False)
+            assert result.ok, result.error
+        assert calls.count("prompt A") == 1
+        assert calls.count("prompt B") == 1
+
+        nodes, edges = _graph("prompt A")
+        result = await engine.execute_workflow(nodes, edges, {"ticker": "AAPL"}, "AAPL", require_approval=False)
+        assert result.ok, result.error
+        assert calls.count("prompt A") == 1, "identical node should be served from cache"
+        hit = [
+            {**(t.model_dump() if hasattr(t, "model_dump") else dict(t)), **(getattr(t, "model_extra", None) or {})}
+            for t in result.trace
+        ]
+        n1 = [t for t in hit if t.get("nodeId") == "n1" or t.get("node_id") == "n1"]
+        assert n1 and n1[-1].get("cacheHit") is True
+        assert n1[-1].get("degraded") is False
+    finally:
+        await manager.close()
+        WorkflowEngine._graph_cache.clear()
