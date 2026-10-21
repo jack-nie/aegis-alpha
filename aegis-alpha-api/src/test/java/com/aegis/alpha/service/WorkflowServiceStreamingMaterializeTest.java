@@ -1,6 +1,9 @@
 package com.aegis.alpha.service;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.aegis.alpha.domain.WorkflowNodeRun;
+import com.aegis.alpha.domain.WorkflowRunEvent;
 import com.aegis.alpha.domain.WorkflowDefinition;
 import com.aegis.alpha.domain.WorkflowRun;
 import com.aegis.alpha.mapper.AgentMapper;
@@ -15,6 +18,11 @@ import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicReference;
@@ -300,6 +308,101 @@ class WorkflowServiceStreamingMaterializeTest {
         assertThat(result.getStatus()).isEqualTo("COMPLETED");
         verify(langChainGateway, times(1)).buildStreamBody(
                 any(), eq("soft-fail"), any(), isNull(), eq(result.getRunId()), eq(false));
+    }
+
+    /** P1-16: replays the SSE contract fixture shared with the Python orchestrator tests. */
+    @Test
+    void streamingContractFixtureMaterializesNodeRunsAndStableEventOrder() throws Exception {
+        JsonNode fixture = objectMapper.readTree(Files.readAllBytes(contractFixture()));
+        StringBuilder sse = new StringBuilder();
+        List<String> expectedNodeIds = new ArrayList<>();
+        for (JsonNode ev : fixture.get("events")) {
+            String name = ev.get("event").asText();
+            if ("node_update".equals(name)) {
+                expectedNodeIds.add(ev.get("data").get("nodeId").asText());
+            }
+            sse.append("event: ").append(name).append("\n")
+                    .append("data: ").append(objectMapper.writeValueAsString(ev.get("data"))).append("\n\n");
+        }
+        byte[] responseBytes = sse.toString().getBytes(StandardCharsets.UTF_8);
+        server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/stream", exchange -> {
+            exchange.getResponseHeaders().set("Content-Type", "text/event-stream");
+            exchange.sendResponseHeaders(200, responseBytes.length);
+            try (OutputStream os = exchange.getResponseBody()) {
+                os.write(responseBytes);
+            }
+        });
+        server.start();
+        when(langChainGateway.streamWorkflowUrl()).thenReturn("http://127.0.0.1:" + server.getAddress().getPort() + "/stream");
+        when(langChainGateway.buildStreamBody(any(), any(), any(), nullable(String.class), nullable(String.class), anyBoolean())).thenReturn("{}");
+        when(langChainGateway.serviceAuthorizationHeader()).thenReturn(null);
+
+        Map<String, Object> inputs = new HashMap<>();
+        inputs.put("ticker", "AAPL");
+        WorkflowRun result = service.startWithStreaming("daily", "AAPL analysis", inputs, new SseEmitter(30_000L));
+
+        assertThat(result.getStatus()).isEqualTo("COMPLETED");
+        assertThat(result.getResultJson()).isNotBlank().contains("\"recommendation\"").contains("HOLD");
+        assertThat(result.getNodeCount()).isEqualTo(expectedNodeIds.size());
+
+        ArgumentCaptor<WorkflowNodeRun> nodeRuns = ArgumentCaptor.forClass(WorkflowNodeRun.class);
+        verify(mapper, times(expectedNodeIds.size())).insertNodeRun(nodeRuns.capture());
+        List<String> insertedIds = new ArrayList<>();
+        int lastSort = -1;
+        for (WorkflowNodeRun nodeRun : nodeRuns.getAllValues()) {
+            insertedIds.add(nodeRun.getNodeId());
+            assertThat(nodeRun.getSortOrder()).isGreaterThan(lastSort);
+            lastSort = nodeRun.getSortOrder();
+        }
+        assertThat(insertedIds).containsExactlyElementsOf(expectedNodeIds);
+        verify(agentTraceService, times(expectedNodeIds.size()))
+                .recordNodeSpan(any(WorkflowRun.class), any(WorkflowNodeRun.class), anyString(), any(), any());
+
+        ArgumentCaptor<WorkflowRunEvent> events = ArgumentCaptor.forClass(WorkflowRunEvent.class);
+        verify(mapper, atLeastOnce()).insertRunEvent(events.capture());
+        List<String> eventNodeIds = new ArrayList<>();
+        int previous = Integer.MIN_VALUE;
+        for (WorkflowRunEvent ev : events.getAllValues()) {
+            assertThat(ev.getSortOrder()).as("event order must be stable: %s", ev.getEventType()).isGreaterThan(previous);
+            previous = ev.getSortOrder();
+            if ("NODE_COMPLETED".equals(ev.getEventType())) {
+                eventNodeIds.add(ev.getNodeId());
+                assertThat(ev.getNodeRunId()).isNotBlank();
+            }
+        }
+        assertThat(eventNodeIds).containsExactlyElementsOf(expectedNodeIds);
+    }
+
+    @Test
+    void repeatedNodeUpdateUpdatesExistingNodeRun() {
+        Map<String, WorkflowNodeRun> streamed = new java.util.LinkedHashMap<>();
+        WorkflowRun run = new WorkflowRun();
+        run.setRunId("run-1");
+        Map<String, Object> first = new HashMap<>();
+        first.put("nodeId", "agent");
+        first.put("ok", true);
+        WorkflowNodeRun a = service.upsertStreamedNodeRun(run, first, streamed, new HashMap<>(), 1);
+        Map<String, Object> second = new HashMap<>(first);
+        second.put("ok", false);
+        WorkflowNodeRun b = service.upsertStreamedNodeRun(run, second, streamed, new HashMap<>(), 2);
+        assertThat(b).isSameAs(a);
+        assertThat(b.getStatus()).isEqualTo("FAILED");
+        assertThat(b.getSortOrder()).isEqualTo(100);
+        verify(mapper, times(1)).insertNodeRun(any(WorkflowNodeRun.class));
+        verify(mapper, times(1)).updateNodeRun(any(WorkflowNodeRun.class));
+    }
+
+    private static Path contractFixture() {
+        Path dir = Paths.get(System.getProperty("user.dir")).toAbsolutePath();
+        while (dir != null) {
+            Path candidate = dir.resolve("docs/superpowers/specs/help-agent-contracts/fixtures/stream_workflow_complete.json");
+            if (Files.exists(candidate)) {
+                return candidate;
+            }
+            dir = dir.getParent();
+        }
+        throw new IllegalStateException("stream_workflow_complete.json contract fixture not found");
     }
 
     private static WorkflowRun copyRun(WorkflowRun source) {
