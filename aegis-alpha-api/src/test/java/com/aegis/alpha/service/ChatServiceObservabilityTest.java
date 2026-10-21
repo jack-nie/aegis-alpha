@@ -51,6 +51,8 @@ class ChatServiceObservabilityTest {
     @BeforeEach
     void setUp() {
         chatMapper = mock(ChatMapper.class);
+        /* Unstubbed findThreadOwner returns an empty map (legacy thread); let the conditional claim succeed. */
+        when(chatMapper.updateThreadOwner(anyString(), anyString(), anyString())).thenReturn(1);
         langChainGateway = mock(LangChainGateway.class);
         marketDataService = mock(MarketDataService.class);
         workflowService = mock(WorkflowService.class);
