@@ -107,12 +107,14 @@ public class IntentRouterService {
         String cacheKey = normalizeForCache(message) + "|" + definitionsFingerprint;
         CachedClassification cached = cachedClassification(cacheKey);
         if (cached != null) {
+            com.aegis.alpha.service.help.RoutingTelemetry.markCacheHit();
             return cached.result;
         }
         if (breakerOpen()) {
             return null;
         }
         Map<String, Object> response;
+        com.aegis.alpha.service.help.RoutingTelemetry.markLlmCall();
         try {
             response = langChainGateway.classifyIntent(message, workflowsPayload(definitions));
         } catch (Exception ex) {
@@ -299,6 +301,8 @@ public class IntentRouterService {
             definitionsFingerprint = fingerprint(cachedDefinitions);
             return cachedDefinitions;
         } catch (Exception ex) {
+            log.warn("[IntentRouter] loading workflow definitions failed: {}; using {} cached definitions",
+                    ex.getClass().getSimpleName(), cachedDefinitions == null ? 0 : cachedDefinitions.size());
             return cachedDefinitions != null ? cachedDefinitions : Collections.<WorkflowDefinition>emptyList();
         }
     }

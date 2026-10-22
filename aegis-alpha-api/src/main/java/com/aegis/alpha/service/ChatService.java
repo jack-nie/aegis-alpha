@@ -32,6 +32,7 @@ import java.util.regex.Pattern;
 
 @Service
 public class ChatService {
+    private static final org.slf4j.Logger log = org.slf4j.LoggerFactory.getLogger(ChatService.class);
     private static final Pattern TICKER_PATTERN = Pattern.compile("\\b[A-Z]{1,5}(?:[._-][A-Z])?\\b");
 
 
@@ -125,9 +126,20 @@ public class ChatService {
         HelpTrace trace = helpTraceService == null
                 ? null
                 : helpTraceService.start(UUID.randomUUID().toString(), threadId);
+        String previousTraceId = org.slf4j.MDC.get("traceId");
+        if (trace != null) {
+            org.slf4j.MDC.put("traceId", trace.getTraceId());
+        }
         try {
             return replyInternal(body, principal, message, threadId, trace);
         } finally {
+            if (trace != null) {
+                if (previousTraceId == null) {
+                    org.slf4j.MDC.remove("traceId");
+                } else {
+                    org.slf4j.MDC.put("traceId", previousTraceId);
+                }
+            }
             if (helpTraceService != null) {
                 helpTraceService.finish(trace);
             }
@@ -156,6 +168,9 @@ public class ChatService {
         /* Explicit workflowKey override takes priority */
         String explicit = text(body, "workflowKey", "");
         if (!explicit.isEmpty()) {
+            com.aegis.alpha.service.help.RoutingTelemetry.logRoute(trace == null ? null : trace.getTraceId(),
+                    HelpIntent.Domain.RESEARCH.name(), HelpIntent.RouteAction.DISPATCH_WORKFLOW.name(),
+                    "explicit_workflow_key", 1.0d, 0L, false, false, message);
             Map<String, Object> response = dispatchWorkflow(explicit, message, threadId, body, principal, trace);
             decorateResearch(response, explicit);
             recordSession(threadId, principal, session, message, null, response, false);
@@ -264,7 +279,8 @@ public class ChatService {
         }
         try {
             return helpSessionStateService.load(threadId, principal);
-        } catch (Exception ignored) {
+        } catch (Exception ex) {
+            log.warn("[ChatService] help session load failed: {}", ex.getClass().getSimpleName());
             return null;
         }
     }
@@ -333,8 +349,9 @@ public class ChatService {
                 helpSessionStateService.mergeCheckpoint(state, "");
             }
             helpSessionStateService.save(state, principal);
-        } catch (Exception ignored) {
+        } catch (Exception ex) {
             /* Session state must never break a chat response. */
+            log.warn("[ChatService] help session save failed: {}", ex.getClass().getSimpleName());
         }
     }
 
