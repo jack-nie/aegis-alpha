@@ -47,6 +47,8 @@ aegis:
     # User-authored layout limits (待确认): prompt/systemPrompt max length; modelName whitelist (empty = any).
     max-prompt-chars: ${AEGIS_ALPHA_WORKFLOW_MAX_PROMPT_CHARS:8000}
     allowed-model-names: ${AEGIS_ALPHA_WORKFLOW_ALLOWED_MODEL_NAMES:}
+    # 待确认: node retries allowed per run across all nodes (java-fallback node loop; the only retry layer).
+    run-retry-budget: ${AEGIS_ALPHA_WORKFLOW_RUN_RETRY_BUDGET:4}
     # Bounded workflow executor (streaming runs, async starts).
     executor:
       core-size: ${AEGIS_ALPHA_WORKFLOW_EXECUTOR_CORE:4}
