@@ -1060,6 +1060,21 @@ public class WorkflowService {
 
         Map<String, Object> resume = langChainGateway.resumeWorkflow(run.getRunId(), approved);
         if (isResumeOk(resume)) {
+            /* P2-13 / Phase-1 leftover: nodes that ran after the approval gate are materialized
+             * as node runs + NODE_* events (same for runs started streaming or non-streaming). */
+            int resumedNodes = materializeResumeTrace(run, resume);
+            if (resumedNodes > 0) {
+                run.setNodeCount((run.getNodeCount() == null ? 0 : run.getNodeCount()) + resumedNodes);
+            }
+            if (isInterruptedAgain(resume)) {
+                run.setStatus("PAUSED");
+                run.setControlStatus("HUMAN_INTERRUPT");
+                run.setPauseRequested(1);
+                mapper.updateRun(run);
+                recordRunEvent(run, "RUN_PAUSED", null, null, "PAUSED",
+                        "Workflow paused for human approval again after resume.", null, 990000);
+                return mapper.findRun(runId);
+            }
             run.setStatus(approved ? "COMPLETED" : "REJECTED");
             run.setCompletedAt(now());
             run.setControlStatus(approved ? "COMPLETED" : "REJECTED");
@@ -1094,6 +1109,44 @@ public class WorkflowService {
                     "Human approval resume failed.", resume, 960000);
         }
         return mapper.findRun(runId);
+    }
+
+    /** Insert node runs for trace entries of the resumed graph that were not recorded before the pause. */
+    @SuppressWarnings("unchecked")
+    private int materializeResumeTrace(WorkflowRun run, Map<String, Object> resume) {
+        if (resume == null || !(resume.get("trace") instanceof List)) {
+            return 0;
+        }
+        try {
+            List<Object> trace = (List<Object>) resume.get("trace");
+            Map<String, Object> nodeOutputs = resume.get("node_outputs") instanceof Map
+                    ? (Map<String, Object>) resume.get("node_outputs") : new LinkedHashMap<String, Object>();
+            java.util.Set<String> recorded = new java.util.HashSet<String>();
+            int maxSort = 0;
+            List<WorkflowNodeRun> existing = mapper.findNodeRuns(run.getRunId());
+            if (existing != null) {
+                for (WorkflowNodeRun nodeRun : existing) {
+                    if (nodeRun.getNodeId() != null) {
+                        recorded.add(nodeRun.getNodeId());
+                    }
+                    if (nodeRun.getSortOrder() != null) {
+                        maxSort = Math.max(maxSort, nodeRun.getSortOrder());
+                    }
+                }
+            }
+            Map<String, Object> layout = layoutForRun(run.getWorkflowKey(), run.getWorkflowVersionId());
+            return materializeOrchestratorTrace(run, layout, trace, nodeOutputs, recorded, maxSort, 956000);
+        } catch (Exception ex) {
+            log.warn("[WorkflowService] resume trace materialization failed runId={} error={}",
+                    run.getRunId(), ex.getClass().getSimpleName());
+            return 0;
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private boolean isInterruptedAgain(Map<String, Object> resume) {
+        Object finalState = resume.get("final_state");
+        return finalState instanceof Map && Boolean.TRUE.equals(((Map<String, Object>) finalState).get("interrupted"));
     }
 
     private boolean isApprovalDecidedOrInFlight(WorkflowRun run) {
@@ -1260,13 +1313,25 @@ public class WorkflowService {
     }
 
     /** Persist one node run + NODE_COMPLETED/NODE_FAILED event per orchestrator trace entry, in order. */
-    @SuppressWarnings("unchecked")
     private int materializeOrchestratorTrace(WorkflowRun run, Map<String, Object> layout, List<Object> trace,
                                              Map<String, Object> nodeOutputs) {
+        return materializeOrchestratorTrace(run, layout, trace, nodeOutputs, null, 0, 0);
+    }
+
+    /**
+     * Same as above. When {@code skipNodeIds} is non-null, node ids in it and repeated ids within the
+     * trace are skipped (resume path: only nodes that ran after the pause); node sort orders start
+     * after {@code sortBase}, event sequences after {@code eventBase}. Returns the number inserted.
+     */
+    @SuppressWarnings("unchecked")
+    private int materializeOrchestratorTrace(WorkflowRun run, Map<String, Object> layout, List<Object> trace,
+                                             Map<String, Object> nodeOutputs, java.util.Set<String> skipNodeIds,
+                                             int sortBase, int eventBase) {
         Map<String, Map<String, Object>> layoutNodes = new LinkedHashMap<>();
-        for (Map<String, Object> node : castList(layout.get("nodes"))) {
+        for (Map<String, Object> node : castList(layout == null ? null : layout.get("nodes"))) {
             layoutNodes.put(nodeId(node), node);
         }
+        java.util.Set<String> skip = skipNodeIds == null ? null : new java.util.HashSet<String>(skipNodeIds);
         int sort = 0;
         for (Object raw : trace) {
             if (!(raw instanceof Map)) {
@@ -1276,6 +1341,9 @@ public class WorkflowService {
             String nodeId = string(entry.get("nodeId"));
             if (nodeId == null || nodeId.isEmpty()) {
                 nodeId = string(entry.get("node_id"));
+            }
+            if (skip != null && nodeId != null && !skip.add(nodeId)) {
+                continue;
             }
             sort += 1;
             Map<String, Object> layoutNode = layoutNodes.get(nodeId);
@@ -1296,10 +1364,11 @@ public class WorkflowService {
             nodeRun.setOutputJson(toJson(output == null ? entry : output));
             nodeRun.setStartedAt(firstNonBlank(string(entry.get("startedAt")), null, now()));
             nodeRun.setCompletedAt(firstNonBlank(string(entry.get("completedAt")), null, now()));
-            nodeRun.setSortOrder(sort * 100);
+            nodeRun.setSortOrder(sortBase + sort * 100);
             mapper.insertNodeRun(nodeRun);
             recordRunEvent(run, ok ? "NODE_COMPLETED" : "NODE_FAILED", nodeRun, nodeId,
-                    ok ? "COMPLETED" : "FAILED", ok ? "Node completed." : "Node failed.", entry, sort * 100 + 1);
+                    ok ? "COMPLETED" : "FAILED", ok ? "Node completed." : "Node failed.", entry,
+                    eventBase + sort * 100 + 1);
         }
         return sort;
     }
