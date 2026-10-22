@@ -66,8 +66,7 @@ class Golden20RoutingTest {
     void setUp() {
         WorkflowMapper workflowMapper = mock(WorkflowMapper.class);
         LangChainGateway gateway = mock(LangChainGateway.class);
-        when(gateway.classifyIntent(any(), any()))
-                .thenThrow(new IllegalStateException("LLM classification disabled in golden20 tests"));
+        stubClassifier(gateway);
 
         // Published workflow definitions the DB-backed router would normally read.
         when(workflowMapper.findDefinitions()).thenReturn(Arrays.asList(
@@ -91,6 +90,17 @@ class Golden20RoutingTest {
         routingService = new HelpRoutingService(intentRouterService, playbookService);
         helpService = new HelpService(playbookService, mock(WorkflowService.class), workflowMapper,
                 knowledgeService, helpLoopService, gateway);
+    }
+
+    /** Classifier mode hook (P2-6). Default: LLM off — classify-intent always fails. */
+    protected void stubClassifier(LangChainGateway gateway) {
+        when(gateway.classifyIntent(any(), any()))
+                .thenThrow(new IllegalStateException("LLM classification disabled in golden20 tests"));
+    }
+
+    /** Mode label printed with the accuracy line. */
+    protected String modeName() {
+        return "llm-off";
     }
 
     // ------------------------------------------------------------------ cases
@@ -158,6 +168,8 @@ class Golden20RoutingTest {
 
         double accuracy = (double) passed / (double) cases.size();
         double domainAccuracy = (double) domainPassed / (double) cases.size();
+        System.out.printf(java.util.Locale.ROOT, "[golden20] mode=%s routeAccuracy=%.3f (%d/%d) domainAccuracy=%.3f%n",
+                modeName(), accuracy, passed, cases.size(), domainAccuracy);
         assertThat(accuracy)
                 .as("route accuracy %.3f (%d/%d cases, domain accuracy %.3f, target >= %.2f); failures: %s",
                         accuracy, passed, cases.size(), domainAccuracy, ROUTE_ACCURACY_TARGET, mismatches)
@@ -182,6 +194,8 @@ class Golden20RoutingTest {
         }
 
         double rate = (double) passed / (double) cases.size();
+        System.out.printf(java.util.Locale.ROOT, "[golden20] mode=%s safetyPassRate=%.3f (%d/%d)%n",
+                modeName(), rate, passed, cases.size());
         assertThat(rate)
                 .as("safety pass rate %.3f (%d/%d cases, target %.2f); failures: %s",
                         rate, passed, cases.size(), SAFETY_TARGET, failures)
