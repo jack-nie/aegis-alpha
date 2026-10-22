@@ -80,6 +80,21 @@ class WorkflowServiceHumanInterruptTest {
         when(mapper.findLayout("daily")).thenReturn(null);
 
         doInsertAndUpdate();
+        /* P2-17: conditional run update honours the stored status and cancel flag. */
+        when(mapper.updateRunStatusIf(any(WorkflowRun.class), org.mockito.ArgumentMatchers.<String>anyList(), anyBoolean()))
+                .thenAnswer(invocation -> {
+                    WorkflowRun update = invocation.getArgument(0);
+                    java.util.List<String> expected = invocation.getArgument(1);
+                    boolean requireNoCancel = invocation.getArgument(2);
+                    WorkflowRun current = storedRun.get();
+                    if (current == null || !current.getRunId().equals(update.getRunId())
+                            || !expected.contains(current.getStatus())
+                            || (requireNoCancel && current.getCancelRequested() != null && current.getCancelRequested() == 1)) {
+                        return 0;
+                    }
+                    storedRun.set(copyRun(update));
+                    return 1;
+                });
         when(mapper.transitionControlStatus(anyString(), anyString(), anyString())).thenAnswer(invocation -> {
             WorkflowRun current = storedRun.get();
             if (current == null || !current.getRunId().equals(invocation.getArgument(0))
