@@ -148,12 +148,17 @@ public class WorkflowService {
         mapper.deleteEditableDefinition(workflowKey);
     }
 
+    /** P2-23: default and maximum page size of the run list. */
+    static final int DEFAULT_RUN_PAGE_SIZE = 50;
+    static final int MAX_RUN_PAGE_SIZE = 200;
+
     public List<WorkflowRun> runs() {
-        List<WorkflowRun> runs = mapper.findRuns();
-        for (WorkflowRun run : runs) {
-            hydrateRunContract(run);
-        }
-        return runs;
+        return runs(null, null);
+    }
+
+    /** Unscoped page (internal/test callers). */
+    public List<WorkflowRun> runs(Integer limit, Integer offset) {
+        return hydrate(mapper.findRunsPage(null, null, true, pageLimit(limit), pageOffset(offset)));
     }
 
     /**
@@ -161,17 +166,45 @@ public class WorkflowService {
      * internal/test callers; HTTP callers always pass a principal.
      */
     public List<WorkflowRun> runsForPrincipal(AuthenticatedPrincipal principal) {
-        List<WorkflowRun> runs = runs();
+        return runsForPrincipal(principal, null, null);
+    }
+
+    /** P2-23: paged (default 50, max 200), newest first; owners are filtered in SQL so pages are exact. */
+    public List<WorkflowRun> runsForPrincipal(AuthenticatedPrincipal principal, Integer limit, Integer offset) {
         if (principal == null) {
-            return runs;
+            return runs(limit, offset);
         }
+        boolean admin = principal.hasRole("admin");
+        List<WorkflowRun> page = mapper.findRunsPage(principal.getUserId(), principal.getTenantId(), admin,
+                pageLimit(limit), pageOffset(offset));
         List<WorkflowRun> visible = new ArrayList<WorkflowRun>();
-        for (WorkflowRun run : runs) {
+        for (WorkflowRun run : page == null ? Collections.<WorkflowRun>emptyList() : page) {
             if (canAccess(run, principal)) {
                 visible.add(run);
             }
         }
-        return visible;
+        return hydrate(visible);
+    }
+
+    private List<WorkflowRun> hydrate(List<WorkflowRun> runs) {
+        if (runs == null) {
+            return new ArrayList<WorkflowRun>();
+        }
+        for (WorkflowRun run : runs) {
+            hydrateRunContract(run);
+        }
+        return runs;
+    }
+
+    static int pageLimit(Integer limit) {
+        if (limit == null || limit <= 0) {
+            return DEFAULT_RUN_PAGE_SIZE;
+        }
+        return Math.min(limit, MAX_RUN_PAGE_SIZE);
+    }
+
+    static int pageOffset(Integer offset) {
+        return offset == null || offset < 0 ? 0 : offset;
     }
 
     public WorkflowRun run(String runId) {
@@ -299,11 +332,10 @@ public class WorkflowService {
     }
 
     private Map<String, Object> lastEvent(String runId) {
-        List<WorkflowRunEvent> events = mapper.findRunEvents(runId);
-        if (events.isEmpty()) {
+        WorkflowRunEvent event = mapper.findLastRunEvent(runId);
+        if (event == null) {
             return null;
         }
-        WorkflowRunEvent event = events.get(events.size() - 1);
         Map<String, Object> result = new LinkedHashMap<String, Object>();
         result.put("eventId", event.getEventId());
         result.put("eventType", event.getEventType());
