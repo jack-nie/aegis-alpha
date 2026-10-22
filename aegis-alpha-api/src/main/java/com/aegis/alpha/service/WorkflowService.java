@@ -600,7 +600,7 @@ public class WorkflowService {
         mapper.insertRun(run);
         recordRunEvent(run, "RUN_CREATED", null, null, "RUNNING", "Workflow run created (streaming).", null, 0);
         String streamUrl = langChainGateway.streamWorkflowUrl();
-        String delegatedToken = issueDelegatedPortfolioReadToken(run.getRunId(), userId, tenantId, safeInputs);
+        String delegatedToken = delegatedTokenFor(run, safeInputs);
         boolean requireApproval = requireApprovalRequested(safeInputs, runLayout);
         String streamBody = langChainGateway.buildStreamBody(
                 runLayout, subject, safeInputs, delegatedToken, run.getRunId(), requireApproval);
@@ -957,13 +957,22 @@ public class WorkflowService {
      * Fail soft: returns null on any error so market tools still run.
      * userId: param → inputs.userId → "system"; tenantId: param → inputs.tenantId → "default".
      */
+    /**
+     * P2-21: the delegation carries the authenticated identity only (principal, or the run owner on
+     * replays/dispatch). Client-supplied {@code inputs.userId/tenantId} are ignored; without an
+     * identity no token is issued (the caller records DELEGATION_SKIPPED).
+     */
     String issueDelegatedPortfolioReadToken(String runId, String userId, String tenantId, Map<String, Object> inputs) {
         if (tokenService == null) {
             return null;
         }
+        if (!hasText(userId)) {
+            log.info("[WorkflowService] portfolio:read delegation not issued: no authenticated identity runId={}", runId);
+            return null;
+        }
         try {
-            String resolvedUserId = firstNonBlank(userId, text(inputs, "userId", null), "system");
-            String resolvedTenantId = firstNonBlank(tenantId, text(inputs, "tenantId", null), "default");
+            String resolvedUserId = userId.trim();
+            String resolvedTenantId = firstNonBlank(tenantId, null, "default");
             return tokenService.issueServiceDelegation(
                     runId,
                     resolvedUserId,
@@ -975,6 +984,16 @@ public class WorkflowService {
                     runId, ex.getMessage());
             return null;
         }
+    }
+
+    /** Delegation for the run owner; records DELEGATION_SKIPPED when the run has no identity. */
+    private String delegatedTokenFor(WorkflowRun run, Map<String, Object> inputs) {
+        String token = issueDelegatedPortfolioReadToken(run.getRunId(), run.getUserId(), run.getTenantId(), inputs);
+        if (token == null && tokenService != null && !hasText(run.getUserId())) {
+            recordRunEvent(run, "DELEGATION_SKIPPED", null, null, run.getStatus(),
+                    "No authenticated identity; portfolio:read delegation not issued.", null, 2);
+        }
+        return token;
     }
 
     /**
@@ -1419,7 +1438,7 @@ public class WorkflowService {
         state.put("workflowKey", run.getWorkflowKey());
         state.put("runId", run.getRunId());
         state.put("subject", run.getSubject());
-        String delegatedToken = issueDelegatedPortfolioReadToken(run.getRunId(), run.getUserId(), run.getTenantId(), inputs);
+        String delegatedToken = delegatedTokenFor(run, inputs);
         boolean requireApproval = requireApprovalRequested(inputs == null ? new LinkedHashMap<String, Object>() : inputs, layout);
         Map<String, Object> response = langChainGateway.executeWorkflow(
                 layout, run.getSubject(), state, delegatedToken, run.getRunId(), requireApproval);
@@ -1543,7 +1562,7 @@ public class WorkflowService {
         state.put("runId", run.getRunId());
         state.put("subject", run.getSubject());
         // Sync path: same portfolio:read delegation as streaming (fail soft)
-        String delegatedToken = issueDelegatedPortfolioReadToken(run.getRunId(), null, null, inputs);
+        String delegatedToken = delegatedTokenFor(run, inputs);
         List<String> degradedNodes = new ArrayList<>();
         /* P2-20: each node sees the run inputs plus only what it declares (inputKeys) or its direct upstreams. */
         Set<String> baseKeys = new HashSet<>(state.keySet());
