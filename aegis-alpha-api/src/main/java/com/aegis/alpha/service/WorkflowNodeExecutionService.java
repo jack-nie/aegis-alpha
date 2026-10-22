@@ -1,5 +1,7 @@
 package com.aegis.alpha.service;
 
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
@@ -15,6 +17,12 @@ import java.util.Map;
 
 @Service
 public class WorkflowNodeExecutionService {
+    /* P2-22 statuses for requests this service cannot serve (no silent defaults). */
+    static final String STATUS_UNSUPPORTED = "unsupported";
+    static final String STATUS_MISSING_SYMBOL = "missing_symbol";
+    static final String STATUS_MISSING_PORTFOLIO_ID = "missing_portfolio_id";
+    private static final ObjectMapper JSON = new ObjectMapper();
+
     private final String executionToken;
     private final MarketDataService marketDataService;
     private final PortfolioService portfolioService;
@@ -58,6 +66,13 @@ public class WorkflowNodeExecutionService {
 
         if (isPortfolioHandler(functionName)) {
             return handlePortfolio(functionName, request, result);
+        }
+        boolean marketHandler = ("general.agent".equals(functionName) && "hydrate_market_data".equals(action))
+                || isQuoteHandler(functionName) || isFinancialHandler(functionName) || isNewsHandler(functionName);
+        if (marketHandler && symbol(request).isEmpty()) {
+            result.put("status", STATUS_MISSING_SYMBOL);
+            result.put("error", "symbol/ticker is required");
+            return result;
         }
         if ("general.agent".equals(functionName) && "hydrate_market_data".equals(action)) {
             Map<String, Object> overview = marketDataService.overview(symbol(request));
@@ -114,7 +129,8 @@ public class WorkflowNodeExecutionService {
             result.put("rows", new ArrayList<Object>());
             return result;
         }
-        result.put("status", "ok");
+        result.put("status", STATUS_UNSUPPORTED);
+        result.put("error", "Unsupported functionName");
         return result;
     }
 
@@ -129,7 +145,7 @@ public class WorkflowNodeExecutionService {
     @SuppressWarnings("unchecked")
     private Map<String, Object> handlePortfolio(String functionName, Map<String, Object> request, Map<String, Object> result) {
         String portfolioId = resolvePortfolioId(request);
-        result.put("status", "ok");
+        result.put("status", portfolioId.isEmpty() ? STATUS_MISSING_PORTFOLIO_ID : "ok");
         result.put("provider", "aegis-alpha-portfolio");
 
         if ("portfolio.get_context".equals(functionName)) {
@@ -142,9 +158,9 @@ public class WorkflowNodeExecutionService {
                 result.put("positionCount", summary.get("positionCount"));
                 result.put("tradeCount", summary.get("tradeCount"));
             } else {
-                List<?> all = portfolioService.findAll();
-                result.put("portfolioCount", all.size());
-                result.put("portfolios", all);
+                /* Never list every portfolio for an unscoped node call. */
+                result.put("portfolioCount", 0);
+                result.put("portfolios", new ArrayList<Object>());
             }
             return result;
         }
@@ -175,9 +191,9 @@ public class WorkflowNodeExecutionService {
                 result.put("summary", contract.get("summary"));
                 result.put("dataCompleteness", contract.get("dataCompleteness"));
             } else {
-                List<?> all = portfolioService.findAll();
-                result.put("portfolioCount", all.size());
-                result.put("portfolios", all);
+                /* Never list every portfolio for an unscoped node call. */
+                result.put("portfolioCount", 0);
+                result.put("portfolios", new ArrayList<Object>());
             }
             return result;
         }
@@ -208,7 +224,7 @@ public class WorkflowNodeExecutionService {
             if (!nested.isEmpty()) { return nested; }
         }
         if (params instanceof String) {
-            String nested = extractFromJsonLike((String) params, "portfolioId", "portfolio_id");
+            String nested = firstText(parseParams((String) params), "portfolioId", "portfolio_id");
             if (!nested.isEmpty()) { return nested; }
         }
         Object extra = request.get("extra");
@@ -219,18 +235,19 @@ public class WorkflowNodeExecutionService {
         return "";
     }
 
-    private String extractFromJsonLike(String text, String... keys) {
-        for (String key : keys) {
-            String needle = "\"" + key + "\"";
-            int index = text.indexOf(needle);
-            if (index < 0) { continue; }
-            int colon = text.indexOf(":", index + needle.length());
-            int quoteStart = colon < 0 ? -1 : text.indexOf("\"", colon);
-            int quoteEnd = quoteStart < 0 ? -1 : text.indexOf("\"", quoteStart + 1);
-            if (quoteEnd > quoteStart) { return text.substring(quoteStart + 1, quoteEnd); }
+    /** Params may arrive as a JSON string (Dify); parse it properly, empty on anything malformed. */
+    static Map<String, Object> parseParams(String text) {
+        if (text == null || text.trim().isEmpty()) {
+            return Collections.emptyMap();
         }
-        return "";
+        try {
+            Map<String, Object> parsed = JSON.readValue(text, new TypeReference<Map<String, Object>>() {});
+            return parsed == null ? Collections.<String, Object>emptyMap() : parsed;
+        } catch (Exception ex) {
+            return Collections.emptyMap();
+        }
     }
+
     private boolean isQuoteHandler(String functionName) {
         return "fdb.daily_ohlc".equals(functionName)
                 || "fdb.money_flow".equals(functionName)
@@ -287,7 +304,7 @@ public class WorkflowNodeExecutionService {
             }
         }
         if (params instanceof String) {
-            String nested = symbolFromJsonLikeString((String) params);
+            String nested = firstText(parseParams((String) params), "symbol", "ticker", "code");
             if (!nested.isEmpty()) {
                 return nested;
             }
@@ -299,7 +316,7 @@ public class WorkflowNodeExecutionService {
                 return nested;
             }
         }
-        return "AAPL";
+        return "";
     }
 
     private String firstText(Map<String, Object> map, String... keys) {
@@ -309,23 +326,6 @@ public class WorkflowNodeExecutionService {
                 if (!value.isEmpty()) {
                     return value;
                 }
-            }
-        }
-        return "";
-    }
-
-    private String symbolFromJsonLikeString(String text) {
-        for (String key : new String[]{"symbol", "ticker", "code"}) {
-            String needle = "\"" + key + "\"";
-            int index = text.indexOf(needle);
-            if (index < 0) {
-                continue;
-            }
-            int colon = text.indexOf(':', index + needle.length());
-            int quoteStart = colon < 0 ? -1 : text.indexOf('"', colon);
-            int quoteEnd = quoteStart < 0 ? -1 : text.indexOf('"', quoteStart + 1);
-            if (quoteEnd > quoteStart) {
-                return text.substring(quoteStart + 1, quoteEnd);
             }
         }
         return "";
