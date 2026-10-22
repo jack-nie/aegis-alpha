@@ -33,22 +33,7 @@ import java.util.regex.Pattern;
 @Service
 public class ChatService {
     private static final Pattern TICKER_PATTERN = Pattern.compile("\\b[A-Z]{1,5}(?:[._-][A-Z])?\\b");
-    private static final Set<String> SYMBOL_STOPWORDS = new HashSet<String>(Arrays.asList(
-            "AI", "API", "CPI", "ETF", "GDP", "IPO", "LLM", "SEC", "USA", "USD", "CEO", "CFO", "ESG"
-    ));
 
-    /* Flexible patterns: analysis + stock name + stock/sector keywords */
-    private static final Pattern STOCK_ANALYSIS_PATTERN =
-            Pattern.compile("分析.{0,20}(?:股票|个股)|(?:股票|个股).{0,10}分析|分析一下.{0,20}");
-    private static final Pattern SECTOR_ANALYSIS_PATTERN =
-            Pattern.compile("分析.{0,20}(?:板块|行业)|(?:板块|行业).{0,10}分析");
-
-    /* Seeded keys from ExistingDataSeeder (+ research Phase 1 add-ons) */
-    private static final Set<String> VALID_WORKFLOW_KEYS = Collections.unmodifiableSet(new HashSet<String>(Arrays.asList(
-            "daily", "deep_dive", "stock_analysis", "stock_recommendation_research", "exit_workflow",
-            "portfolio_workflow", "position_workflow", "sector-analyst-workflow",
-            "earnings_reaction", "watchlist_digest"
-    )));
 
     /** Identity fields that must never be taken from the client-supplied {@code state}. */
     private static final Set<String> CLIENT_IDENTITY_KEYS = Collections.unmodifiableSet(new HashSet<String>(Arrays.asList(
@@ -572,82 +557,6 @@ public class ChatService {
     }
 
     /* ================================================================ *
-     * Intent routing  –  only the seeded keys are valid targets.
-     * ================================================================ */
-
-    String resolveWorkflowKey(Map<String, Object> body, String message) {
-        /* explicit override from caller takes priority */
-        String explicit = text(body, "workflowKey", "");
-        if (!explicit.isEmpty() && VALID_WORKFLOW_KEYS.contains(explicit)) {
-            return explicit;
-        }
-
-        String msg = message == null ? "" : message.toLowerCase();
-
-        /* daily briefing */
-        if (matchesAny(msg,
-                "日报", "晨报", "每日", "盘前", "daily", "morning briefing", "daily graph")) {
-            return "daily";
-        }
-        /* deep dive */
-        if (matchesAny(msg,
-                "深度分析", "深度研究", "深入研究", "个股分析", "股票分析", "分析个股", "分析股票", "deep dive", "deep analysis", "stock analysis", "analyze stock",
-                "帮我分析", "分析一下")) {
-            return "deep_dive";
-        }
-        /* deep dive - flexible regex: analysis + stock name + stock keywords */
-        if (STOCK_ANALYSIS_PATTERN.matcher(msg).find()) {
-            return "deep_dive";
-        }
-        /* exit workflow */
-        if (matchesAny(msg,
-                "止损", "止盈", "卖出", "平仓", "退出", "exit", "stop loss", "take profit", "close position")) {
-            return "exit_workflow";
-        }
-        /* portfolio workflow */
-        if (matchesAny(msg,
-                "投资组合", "资产配置", "组合分析", "portfolio", "asset allocation", "portfolio workflow")) {
-            return "portfolio_workflow";
-        }
-        /* position workflow */
-        if (matchesAny(msg,
-                "仓位", "持仓", "建仓", "加仓", "减仓", "头寸",
-                "position sizing", "position management", "open position", "add position")) {
-            return "position_workflow";
-        }
-        /* sector analyst */
-        if (matchesAny(msg,
-                "板块", "行业", "行业分析", "sector", "industry analysis", "sector analyst")) {
-            return "sector-analyst-workflow";
-        }
-        /* sector analyst - flexible regex: analysis + sector/industry name */
-        if (SECTOR_ANALYSIS_PATTERN.matcher(msg).find()) {
-            return "sector-analyst-workflow";
-        }
-        /* earnings reaction */
-        if (matchesAny(msg,
-                "earnings", "财报", "业绩", "季报", "earnings reaction", "earnings call", "业绩会", "财报解读")) {
-            return "earnings_reaction";
-        }
-        /* watchlist morning digest */
-        if (matchesAny(msg,
-                "digest", "早报", "自选", "watchlist", "morning digest", "自选股", "晨间摘要", "watchlist digest")) {
-            return "watchlist_digest";
-        }
-
-        return null;
-    }
-
-    private static boolean matchesAny(String lowerMsg, String... keywords) {
-        for (String kw : keywords) {
-            if (lowerMsg.contains(kw.toLowerCase())) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    /* ================================================================ *
      * Workflow dispatch
      * ================================================================ */
 
@@ -867,7 +776,7 @@ public class ChatService {
         Matcher matcher = TICKER_PATTERN.matcher(msg);
         while (matcher.find()) {
             String candidate = cleanTicker(matcher.group());
-            if (!candidate.isEmpty() && !SYMBOL_STOPWORDS.contains(candidate)) {
+            if (!candidate.isEmpty() && !RoutingRules.isTickerStopword(candidate)) {
                 return candidate;
             }
         }
