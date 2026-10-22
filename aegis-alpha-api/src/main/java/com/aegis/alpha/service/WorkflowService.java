@@ -1545,6 +1545,10 @@ public class WorkflowService {
         // Sync path: same portfolio:read delegation as streaming (fail soft)
         String delegatedToken = issueDelegatedPortfolioReadToken(run.getRunId(), null, null, inputs);
         List<String> degradedNodes = new ArrayList<>();
+        /* P2-20: each node sees the run inputs plus only what it declares (inputKeys) or its direct upstreams. */
+        Set<String> baseKeys = new HashSet<>(state.keySet());
+        Map<String, List<String>> upstream = upstreamIds(edges);
+        int retriesLeft = Math.max(0, runRetryBudget);
 
         int index = 0;
         for (Map<String, Object> node : orderedNodes) {
@@ -1570,16 +1574,17 @@ public class WorkflowService {
                 nodeRun.setMaxAttempts(maxAttempts);
                 nodeRun.setRetryPolicyJson(retryPolicy.isEmpty() ? null : toJson(retryPolicy));
                 nodeRun.setTimeoutMs(timeoutMs == 0 ? null : timeoutMs);
-                Map<String, Object> inputSnapshot = new LinkedHashMap<>(state);
-                nodeRun.setInputJson(toJson(inputSnapshot));
+                final Map<String, Object> inputSnapshot = nodeInput(node, state, baseKeys, upstream);
+                nodeRun.setInputJson(cappedInputJson(inputSnapshot));
                 nodeRun.setStartedAt(now());
                 nodeRun.setSortOrder(index * 100 + attempt);
                 mapper.insertNodeRun(nodeRun);
                 recordRunEvent(run, "NODE_STARTED", nodeRun, nodeRun.getNodeId(), "RUNNING", "Node started.", null, index * 100 + attempt * 10);
 
                 try {
-                    long started = System.currentTimeMillis();
-                    Map<String, Object> output = executeNode(node, state, run, delegatedToken);
+                    final Map<String, Object> callNode = node;
+                    Map<String, Object> output = callWithTimeout(
+                            () -> executeNode(callNode, inputSnapshot, run, delegatedToken), timeoutMs);
                     if (output != null && Boolean.FALSE.equals(output.get("ok"))) {
                         /* Orchestrator reported failure: retry per retryPolicy instead of storing it as success. */
                         Object error = output.get("error") != null ? output.get("error") : output.get("summary");
@@ -1588,10 +1593,6 @@ public class WorkflowService {
                     }
                     if (output != null && Boolean.TRUE.equals(output.get("degraded"))) {
                         degradedNodes.add(nodeId(node));
-                    }
-                    long elapsed = System.currentTimeMillis() - started;
-                    if (timeoutMs > 0 && elapsed > timeoutMs) {
-                        throw new IllegalStateException("Node timed out after " + elapsed + "ms; timeout=" + timeoutMs + "ms");
                     }
                     state.put(nodeRun.getNodeId(), output);
                     mergeOutputKeys(node, output, state);
@@ -1619,7 +1620,13 @@ public class WorkflowService {
                     mapper.updateNodeRun(nodeRun);
                     agentTraceService.recordNodeSpan(run, nodeRun, handler(node), inputSnapshot, output);
                     recordRunEvent(run, "NODE_FAILED", nodeRun, nodeRun.getNodeId(), "FAILED", ex.getMessage(), output, index * 100 + attempt * 10 + 1);
+                    if (attempt < maxAttempts && retriesLeft <= 0) {
+                        recordRunEvent(run, "RETRY_BUDGET_EXHAUSTED", nodeRun, nodeRun.getNodeId(), "FAILED",
+                                "Run retry budget exhausted; node not retried.", null, index * 100 + attempt * 10 + 2);
+                        break;
+                    }
                     if (attempt < maxAttempts) {
+                        retriesLeft -= 1;
                         recordRunEvent(run, "NODE_RETRYING", nodeRun, nodeRun.getNodeId(), "RETRYING", "Retrying node after failure.", output, index * 100 + attempt * 10 + 2);
                         sleepBackoff(backoffMs);
                     }
@@ -1651,6 +1658,127 @@ public class WorkflowService {
         }
         recordRunEvent(run, "RUN_COMPLETED", null, null, "COMPLETED", "Workflow run completed.", state, 1000000);
         cacheService.put("aegis:workflow:run:" + run.getRunId(), run, Duration.ofHours(2));
+    }
+
+    /** P2-20: cap on the stored workflow_node_run.input_json (characters). */
+    static final int MAX_NODE_INPUT_JSON_CHARS = 32000;
+    private static final String[] UPSTREAM_SUMMARY_KEYS = {"ok", "summary", "signals", "label", "confidence", "degraded"};
+
+    /** P2-20 (待确认): node retries allowed per run across all nodes (the only retry layer). */
+    @Value("${aegis.workflow.run-retry-budget:4}")
+    private int runRetryBudget = 4;
+
+    void setRunRetryBudget(int runRetryBudget) {
+        this.runRetryBudget = runRetryBudget;
+    }
+
+    private static final java.util.concurrent.ExecutorService NODE_CALL_EXECUTOR =
+            java.util.concurrent.Executors.newCachedThreadPool(runnable -> {
+                Thread thread = new Thread(runnable, "workflow-node-call");
+                thread.setDaemon(true);
+                return thread;
+            });
+
+    private static Map<String, List<String>> upstreamIds(List<Map<String, Object>> edges) {
+        Map<String, List<String>> upstream = new HashMap<>();
+        for (Map<String, Object> edge : edges) {
+            Object source = edge.get("source");
+            Object target = edge.get("target");
+            if (source == null || target == null) {
+                continue;
+            }
+            List<String> sources = upstream.get(String.valueOf(target));
+            if (sources == null) {
+                sources = new ArrayList<>();
+                upstream.put(String.valueOf(target), sources);
+            }
+            sources.add(String.valueOf(source));
+        }
+        return upstream;
+    }
+
+    /**
+     * Input for one node: run inputs (workflowKey/runId/subject and the request inputs), plus the
+     * state keys the node declares in {@code inputKeys}; without a declaration, a compact view
+     * (summary/signals/...) of each direct upstream output. Keeps the request size independent of chain length.
+     */
+    @SuppressWarnings("unchecked")
+    Map<String, Object> nodeInput(Map<String, Object> node, Map<String, Object> state, Set<String> baseKeys,
+                                  Map<String, List<String>> upstream) {
+        Map<String, Object> input = new LinkedHashMap<>();
+        for (String key : baseKeys) {
+            if (state.containsKey(key)) {
+                input.put(key, state.get(key));
+            }
+        }
+        Object declared = data(node).get("inputKeys");
+        if (!(declared instanceof List) || ((List<Object>) declared).isEmpty()) {
+            declared = data(node).get("input_keys");
+        }
+        if (declared instanceof List && !((List<Object>) declared).isEmpty()) {
+            for (Object key : (List<Object>) declared) {
+                if (key != null && state.containsKey(String.valueOf(key))) {
+                    input.put(String.valueOf(key), state.get(String.valueOf(key)));
+                }
+            }
+            return input;
+        }
+        List<String> sources = upstream.get(nodeId(node));
+        if (sources != null) {
+            for (String source : sources) {
+                Object value = state.get(source);
+                if (value instanceof Map) {
+                    Map<String, Object> compact = new LinkedHashMap<>();
+                    for (String key : UPSTREAM_SUMMARY_KEYS) {
+                        if (((Map<String, Object>) value).containsKey(key)) {
+                            compact.put(key, ((Map<String, Object>) value).get(key));
+                        }
+                    }
+                    input.put(source, compact);
+                } else if (value != null) {
+                    input.put(source, value);
+                }
+            }
+        }
+        return input;
+    }
+
+    /** Stored input_json is capped; an oversized snapshot keeps only its keys and size. */
+    String cappedInputJson(Map<String, Object> input) {
+        String json = toJson(input);
+        if (json == null || json.length() <= MAX_NODE_INPUT_JSON_CHARS) {
+            return json;
+        }
+        Map<String, Object> marker = new LinkedHashMap<>();
+        marker.put("truncated", true);
+        marker.put("originalChars", json.length());
+        marker.put("keys", new ArrayList<>(input.keySet()));
+        return toJson(marker);
+    }
+
+    /** Enforce the node timeout for real: the call is abandoned (interrupted) once timeoutMs elapses. */
+    private static Map<String, Object> callWithTimeout(java.util.concurrent.Callable<Map<String, Object>> call,
+                                                       int timeoutMs) throws Exception {
+        if (timeoutMs <= 0) {
+            return call.call();
+        }
+        java.util.concurrent.Future<Map<String, Object>> future = NODE_CALL_EXECUTOR.submit(call);
+        try {
+            return future.get(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS);
+        } catch (java.util.concurrent.TimeoutException ex) {
+            future.cancel(true);
+            throw new IllegalStateException("Node timed out; timeout=" + timeoutMs + "ms");
+        } catch (java.util.concurrent.ExecutionException ex) {
+            Throwable cause = ex.getCause();
+            if (cause instanceof Exception) {
+                throw (Exception) cause;
+            }
+            throw ex;
+        } catch (InterruptedException ex) {
+            future.cancel(true);
+            Thread.currentThread().interrupt();
+            throw new WorkflowStoppedException("CANCELLED");
+        }
     }
 
     private void enforceRunControl(WorkflowRun run) {
