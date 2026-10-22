@@ -19,6 +19,8 @@ import java.util.regex.Pattern;
 
 @Service
 public class IntentRouterService {
+    /** P2-7: the classifier picked its {@code out_of_scope} function (domain OUT_OF_SCOPE). */
+    public static final String SOURCE_LLM_OUT_OF_SCOPE = "llm_out_of_scope";
     private static final Logger log = LoggerFactory.getLogger(IntentRouterService.class);
     private static final long CACHE_TTL_MS = 5 * 60 * 1000;
     private static final Pattern TICKER_PATTERN = Pattern.compile("\\b[A-Z]{1,5}(?:[._-][A-Z])?\\b");
@@ -100,6 +102,9 @@ public class IntentRouterService {
         if (llmUsable && (!keywordUsable || llm.getConfidence() > keyword.getConfidence())) {
             return llm;
         }
+        if (!keywordUsable && llm != null && SOURCE_LLM_OUT_OF_SCOPE.equals(llm.getSource())) {
+            return llm;
+        }
         return keyword == null ? IntentResult.empty() : keyword;
     }
 
@@ -158,6 +163,14 @@ public class IntentRouterService {
             confidence = ((Number) confidenceObj).doubleValue();
         }
         if (workflowKey.isEmpty()) {
+            Object data = result.get("data");
+            String domain = string(result.get("domain"));
+            if (domain.isEmpty() && data instanceof Map) {
+                domain = string(((Map<?, ?>) data).get("domain"));
+            }
+            if ("OUT_OF_SCOPE".equalsIgnoreCase(domain)) {
+                return new IntentResult(null, null, confidence, SOURCE_LLM_OUT_OF_SCOPE);
+            }
             return null;
         }
         for (WorkflowDefinition def : definitions) {

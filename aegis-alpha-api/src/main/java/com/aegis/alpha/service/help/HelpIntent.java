@@ -16,7 +16,9 @@ public final class HelpIntent {
         RESEARCH,
         PRODUCT_HELP,
         RUN_DIAGNOSIS,
-        CHITCHAT
+        CHITCHAT,
+        /** P2-7: unrelated to research / the product (poems, jokes, weather ...): polite decline. */
+        OUT_OF_SCOPE
     }
 
     /** L0=playbook, L1=hybrid lexical retrieval (TF-IDF + keyword + RRF), L2=help graph / diagnosis */
@@ -32,7 +34,9 @@ public final class HelpIntent {
         KNOWLEDGE_RAG,
         HELP_GRAPH,
         COPILOT,
-        CLARIFY
+        CLARIFY,
+        /** P2-7: answered with a fixed decline template; no Copilot LLM call. */
+        DECLINE
     }
 
     public static final class PageContext {

@@ -137,6 +137,11 @@ public class HelpRoutingService {
             return productHelp(text, entities, cacheable);
         }
 
+        // 2b) Clearly unrelated requests (creative writing, jokes, weather ...) → polite decline (P2-7)
+        if (isOutOfScope(text)) {
+            return outOfScope(entities, "Out-of-scope rule");
+        }
+
         // 3) Greetings / thanks → copilot chit-chat without consulting the LLM router
         if (isChitchat(text)) {
             return chitchat(entities, "Greeting rule");
@@ -152,6 +157,10 @@ public class HelpRoutingService {
         IntentResult llm = intentRouterService.classify(text);
         if (isConfidentResearch(llm)) {
             return research(llm, entities, "Published workflow match (classifier)");
+        }
+        if (llm != null && IntentRouterService.SOURCE_LLM_OUT_OF_SCOPE.equals(llm.getSource())
+                && !containsAny(text, RESEARCH_HINTS)) {
+            return outOfScope(entities, "Classifier: out of scope");
         }
 
         // Soft research hints without workflow → copilot research path
@@ -198,6 +207,34 @@ public class HelpRoutingService {
             }
         }
         return false;
+    }
+
+    /** Creative-writing / lifestyle requests unrelated to research or the product. */
+    static final String[] OUT_OF_SCOPE_HINTS = {
+            "写首诗", "写一首诗", "写诗", "作诗", "写首歌", "写歌词", "讲个笑话", "说个笑话", "讲笑话",
+            "天气怎么样", "天气预报", "今天天气", "菜谱", "怎么做菜", "写小说", "写作文", "星座", "算命",
+            "write a poem", "write me a poem", "tell me a joke", "tell a joke", "weather today",
+            "weather forecast", "recipe for", "write a story", "write a song", "horoscope"
+    };
+
+    static boolean isOutOfScope(String text) {
+        if (text == null) {
+            return false;
+        }
+        return containsAny(text, OUT_OF_SCOPE_HINTS) && !containsAny(text, RESEARCH_HINTS);
+    }
+
+    private HelpIntent.Result outOfScope(HelpIntent.Entities entities, String reason) {
+        HelpIntent.Result result = HelpIntent.Result.empty();
+        result.setConfidence(0.9);
+        result.setSource("out_of_scope");
+        result.setDomain(HelpIntent.Domain.OUT_OF_SCOPE);
+        result.setComplexity(HelpIntent.Complexity.L0);
+        result.setRouteAction(HelpIntent.RouteAction.DECLINE);
+        result.setEntities(entities);
+        result.setCacheable(false);
+        result.setReason(reason);
+        return result;
     }
 
     private HelpIntent.Result chitchat(HelpIntent.Entities entities, String reason) {
