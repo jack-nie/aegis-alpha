@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field
 
 from ..config import Settings
 from .context_assembly import normalize_token_usage
+from .prompt_safety import build_user_content, with_untrusted_notice
 
 logger = logging.getLogger(__name__)
 
@@ -195,9 +196,8 @@ class LLMClient:
         if tools:
             client = client.bind_tools(tools)
 
-        user_content = prompt
-        if context:
-            user_content = f"{prompt}\n\nWorkflow context:\n{context}"
+        user_content = build_user_content(prompt, context)
+        system = with_untrusted_notice(system)
 
         messages = [
             SystemMessage(content=system),
@@ -283,9 +283,8 @@ class LLMClient:
         if bindable and not force_final:
             client = client.bind_tools(bindable)
 
-        user_content = prompt
-        if context:
-            user_content = f"{prompt}\n\nWorkflow context:\n{context}"
+        user_content = build_user_content(prompt, context)
+        system = with_untrusted_notice(system)
 
         prior = list(prior_messages or [])
         seed_human: HumanMessage | None = None
@@ -381,9 +380,8 @@ class LLMClient:
         effective_timeout = timeout_ms or self._config.timeout_ms
         client = self._build_client(resolved_model, temperature, effective_timeout)
 
-        user_content = prompt
-        if context:
-            user_content = f"{prompt}\n\nWorkflow context:\n{context}"
+        user_content = build_user_content(prompt, context)
+        system = with_untrusted_notice(system)
 
         messages = [
             SystemMessage(content=system),

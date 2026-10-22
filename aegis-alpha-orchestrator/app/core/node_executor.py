@@ -21,6 +21,7 @@ from .context_assembly import (
     DEFAULT_TOKEN_BUDGET,
     assemble_model_context,
 )
+from .prompt_safety import USER_INPUT_TAG, fence
 from .critique import critique_recommendation_draft
 from .llm_client import AgentToolResult, LLMClient, LLMResponse
 from .market_data import MarketDataService
@@ -46,7 +47,9 @@ def render_prompt(template: str | None, *, subject: str, agent_name: str) -> str
     user-authored prompts with braces failed the same way.
     """
     text = template or ""
-    return text.replace("{subject}", str(subject or "")).replace("{agent_name}", str(agent_name or ""))
+    # P2-9: the subject is end-user input, so it is substituted as a labelled inline block.
+    subject_block = fence(USER_INPUT_TAG, str(subject or ""), inline=True)
+    return text.replace("{agent_name}", str(agent_name or "")).replace("{subject}", subject_block)
 
 
 def aggregate_system_prompt(agent_name: str) -> str:
