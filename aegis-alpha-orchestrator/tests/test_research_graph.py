@@ -128,19 +128,36 @@ def test_watchlist_digest_layout():
     assert "finance.stock_recommendation_aggregate" not in handlers
 
 
-def test_sequential_edges_form_single_path():
-    """Each non-end node has exactly one outgoing edge; single entry from start."""
-    layout = build_single_name_research_layout()
-    ids = set(_node_ids(layout))
-    outgoing = {}
-    incoming = {}
+@pytest.mark.parametrize(
+    "builder,specialists,sink",
+    [
+        (lambda: build_single_name_research_layout(), ["fundamentals", "news", "valuation", "risk"], "aggregate"),
+        (
+            lambda: build_single_name_research_layout(include_portfolio=True),
+            ["fundamentals", "news", "valuation", "risk", "portfolio_context"],
+            "aggregate",
+        ),
+        (
+            lambda: build_earnings_reaction_layout(),
+            ["market_analysis", "financial_interpretation", "industry_news"],
+            "aggregate",
+        ),
+        (lambda: build_watchlist_digest_layout(), ["market_analysis", "industry_news"], "risk_assessment"),
+    ],
+)
+def test_specialists_fan_out_in_parallel_and_fan_in(builder, specialists, sink):
+    """P2-14: start → every specialist in parallel → single fan-in sink → end."""
+    layout = builder()
+    outgoing: dict = {}
+    incoming: dict = {}
     for edge in layout["edges"]:
         outgoing.setdefault(edge["source"], []).append(edge["target"])
         incoming.setdefault(edge["target"], []).append(edge["source"])
-    assert "start" in ids and "end" in ids
-    assert "start" not in incoming
-    assert "end" not in outgoing
-    for node_id in ids - {"end"}:
-        assert len(outgoing.get(node_id, [])) == 1, f"{node_id} should have one out-edge"
-    for node_id in ids - {"start"}:
-        assert len(incoming.get(node_id, [])) == 1, f"{node_id} should have one in-edge"
+    assert sorted(outgoing["start"]) == sorted(specialists)
+    for specialist in specialists:
+        assert outgoing[specialist] == [sink]
+        assert incoming[specialist] == ["start"]
+    assert sorted(incoming[sink]) == sorted(specialists)
+    assert outgoing[sink] == ["end"]
+    assert "end" not in outgoing and "start" not in incoming
+    assert layout["metadata"]["parallel"] is True

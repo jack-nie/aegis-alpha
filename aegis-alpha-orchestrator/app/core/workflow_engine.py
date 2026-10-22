@@ -32,6 +32,7 @@ from ..models.responses import NodeResult, WorkflowResult, SSEEvent
 from .checkpointer_lifecycle import ensure_async_checkpointer
 from .context_assembly import apply_trace_usage, memory_hit_count
 from .memory_selector import load_run_memory, read_store_value
+from .market_data import run_scoped_market_cache
 from .memory_store import MemoryStoreManager
 from .node_executor import NodeExecutor
 from .tool_registry import TOOL_SPECS, resolve_agent_roles, tools_for_roles
@@ -346,12 +347,13 @@ class WorkflowEngine:
         }
 
     async def _ainvoke_guarded(self, graph: Any, graph_input: Any, config: dict[str, Any]) -> Any:
-        """``ainvoke`` bounded by the configured whole-run timeout."""
+        """``ainvoke`` bounded by the configured whole-run timeout, with a run-scoped quote cache."""
         try:
-            return await asyncio.wait_for(
-                graph.ainvoke(graph_input, config=config, **self._graph_run_kwargs()),
-                timeout=self._guardrails.timeout_seconds,
-            )
+            with run_scoped_market_cache():
+                return await asyncio.wait_for(
+                    graph.ainvoke(graph_input, config=config, **self._graph_run_kwargs()),
+                    timeout=self._guardrails.timeout_seconds,
+                )
         except asyncio.TimeoutError:
             raise WorkflowTimeout(self._guardrails.timeout_seconds) from None
 
@@ -597,8 +599,12 @@ class WorkflowEngine:
                 outgoing[edge.source].append(edge.target)
                 incoming[edge.target].append(edge.source)
 
+        # P2-14: a node with several distinct predecessors is a fan-in join. Deferring it makes
+        # LangGraph run it once, after every pending branch (including multi-step agent tool loops)
+        # has finished, instead of once per superstep in which some predecessor completed.
+        fan_in_ids = {nid for nid, sources in incoming.items() if len(set(sources)) > 1}
         for node in nodes:
-            graph.add_node(node.id, self._make_node_fn(node))
+            graph.add_node(node.id, self._make_node_fn(node), defer=node.id in fan_in_ids)
 
         if use_per_agent_tools:
             # Per-agent ToolNode with role-filtered tools; unique id tools__{agent_id}.
@@ -641,7 +647,7 @@ class WorkflowEngine:
                     return {"final_state": {"approval_status": "approved"}}
                 return {"final_state": {"approval_status": "rejected"}}
 
-            graph.add_node("approval_gate", approval_gate)
+            graph.add_node("approval_gate", approval_gate, defer=aggregate_node.id in fan_in_ids)
 
         for node in nodes:
             if not incoming[node.id]:
@@ -652,6 +658,9 @@ class WorkflowEngine:
                 tools_target = agent_tools_node_ids[agent_id]
 
                 next_nodes = [e.target for e in edges if e.source == agent_id and e.target in node_ids]
+                if require_approval and aggregate_node:
+                    # Agents must not bypass the approval gate in front of the aggregate (P2-14).
+                    next_nodes = ["approval_gate" if t == aggregate_node.id else t for t in next_nodes]
                 if not next_nodes:
                     next_nodes = [END]
 
@@ -1149,6 +1158,8 @@ class WorkflowEngine:
         streamed_outputs: dict[str, Any] = {}
         loop = asyncio.get_running_loop()
         deadline = loop.time() + self._guardrails.timeout_seconds
+        market_scope = run_scoped_market_cache()
+        market_scope.__enter__()
         stream = graph.astream(
             graph_input,
             config=config,
@@ -1266,6 +1277,7 @@ class WorkflowEngine:
                     await aclose()
                 except Exception:  # noqa: BLE001 - generator already torn down by the timeout
                     pass
+            market_scope.__exit__(None, None, None)
 
     async def stream_workflow(
         self,
