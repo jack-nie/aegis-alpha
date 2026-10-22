@@ -172,6 +172,55 @@ class LangChainGatewayTest {
         assertThat(result.get("ok"), is(false));
     }
 
+    // P2-10: model credentials are never forwarded in orchestrator request bodies.
+    @Test
+    void requestBodiesNeverCarryApiKeyOrBaseUrl() throws Exception {
+        final java.util.List<String> bodies = java.util.Collections.synchronizedList(new java.util.ArrayList<String>());
+        server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        for (String path : new String[] {"/execute-node", "/classify-intent", "/help/execute", "/execute-workflow"}) {
+            server.createContext(path, exchange -> {
+                java.io.ByteArrayOutputStream buffer = new java.io.ByteArrayOutputStream();
+                byte[] chunk = new byte[1024];
+                int read;
+                java.io.InputStream in = exchange.getRequestBody();
+                while ((read = in.read(chunk)) != -1) {
+                    buffer.write(chunk, 0, read);
+                }
+                bodies.add(new String(buffer.toByteArray(), StandardCharsets.UTF_8));
+                byte[] response = "{\"ok\":true,\"summary\":\"s\"}".getBytes(StandardCharsets.UTF_8);
+                exchange.getResponseHeaders().set("Content-Type", "application/json");
+                exchange.sendResponseHeaders(200, response.length);
+                try (OutputStream output = exchange.getResponseBody()) {
+                    output.write(response);
+                }
+            });
+        }
+        server.start();
+        String url = "http://127.0.0.1:" + server.getAddress().getPort();
+        LangChainGateway gateway = new LangChainGateway(new ObjectMapper(), true, url, "openai",
+                "deepseek-v4-flash", "sk-secret-test-key", "http://secret-base.test/v1");
+
+        gateway.runAgent(new AgentTemplate(), new LinkedHashMap<String, Object>(),
+                new LinkedHashMap<String, Object>(), "subject");
+        gateway.classifyIntent("hello", java.util.Collections.<Map<String, String>>emptyList());
+        gateway.executeHelp("how", java.util.Collections.<String>emptyList(), null,
+                java.util.Collections.<Map<String, Object>>emptyList());
+        Map<String, Object> layout = new LinkedHashMap<String, Object>();
+        layout.put("nodes", java.util.Collections.emptyList());
+        layout.put("edges", java.util.Collections.emptyList());
+        String streamBody = gateway.buildStreamBody(layout, "subject", new LinkedHashMap<String, Object>(),
+                null, "run-1", false);
+        bodies.add(streamBody);
+
+        assertThat(bodies.size() >= 4, is(true));
+        for (String body : bodies) {
+            assertThat(body, body.contains("apiKey"), is(false));
+            assertThat(body, body.contains("baseUrl"), is(false));
+            assertThat(body, body.contains("sk-secret-test-key"), is(false));
+            assertThat(body, body.contains("secret-base.test"), is(false));
+        }
+    }
+
     private void summaryOnlyResponse(HttpExchange exchange) throws IOException {
         byte[] response = "{\"ok\":true,\"summary\":\"Real LLM summary\",\"provider\":\"langchain-openai\"}"
                 .getBytes(StandardCharsets.UTF_8);

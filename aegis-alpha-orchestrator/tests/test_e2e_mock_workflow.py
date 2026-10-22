@@ -173,3 +173,41 @@ def test_e2e_execute_workflow_with_require_approval_returns_interrupted(client, 
     assert data["ok"] is True, data.get("error")
     assert data["final_state"].get("interrupted") is True
     WorkflowEngine._graph_cache.clear()
+
+
+# ---------------- P2-10: request-level credentials are accepted but never used ----------------
+
+
+def test_request_models_drop_api_key_and_base_url_with_warning(caplog):
+    import logging
+
+    from app.models.requests import IntentRequest, NodeRequest, WorkflowRequest
+
+    caplog.set_level(logging.WARNING, logger="app.models.requests")
+    for model in (WorkflowRequest, NodeRequest, IntentRequest):
+        body = model.model_validate({"apiKey": "sk-evil-123", "baseUrl": "http://evil.test/v1"})
+        assert body.api_key is None and body.base_url is None
+    assert "Ignoring request-level credentials" in caplog.text
+    assert "sk-evil-123" not in caplog.text and "evil.test" not in caplog.text
+    assert NodeRequest.model_validate({}).api_key is None
+
+
+def test_execute_node_never_forwards_request_api_key(client):
+    from app.routers import workflow as workflow_router
+
+    fake = AsyncMock(return_value=NodeResult(ok=True, status="completed", handler="start", node_id="n1"))
+    with patch.object(workflow_router.node_executor, "execute", fake):
+        resp = client.post(
+            "/execute-node",
+            json={
+                "node": {"id": "n1", "data": {"handler": "start", "nodeType": "start"}},
+                "subject": "t",
+                "apiKey": "sk-evil-123",
+                "baseUrl": "http://evil.test/v1",
+            },
+            headers=_auth_headers(),
+        )
+    assert resp.status_code == 200
+    kwargs = fake.await_args.kwargs
+    assert kwargs.get("api_key") is None and kwargs.get("base_url") is None
+    assert "sk-evil-123" not in repr(fake.await_args)
