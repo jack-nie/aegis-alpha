@@ -145,27 +145,39 @@ class WorkflowNodeExecutionServiceTest {
         assertThat(result.get("portfolioId")).isEqualTo("p-1");
     }
 
+    /* P2-22: an unscoped call never lists every portfolio. */
     @Test
     void executePortfolioGetContextWithoutPortfolioId() {
-        when(portfolioService.findAll()).thenReturn(Collections.emptyList());
-
         Map<String, Object> request = new LinkedHashMap<>();
         request.put("functionName", "portfolio.get_context");
 
         Map<String, Object> result = service.execute(request);
 
-        assertThat(result.get("status")).isEqualTo("ok");
+        assertThat(result.get("status")).isEqualTo("missing_portfolio_id");
         assertThat(result.get("portfolioCount")).isEqualTo(0);
+        assertThat((java.util.List<?>) result.get("portfolios")).isEmpty();
+        org.mockito.Mockito.verify(portfolioService, org.mockito.Mockito.never()).findAll();
     }
 
     @Test
-    void executeUnknownFunctionReturnsOk() {
+    void portfolioSummaryWithoutPortfolioIdDoesNotListAll() {
+        Map<String, Object> request = new LinkedHashMap<>();
+        request.put("functionName", "portfolio.summary");
+
+        Map<String, Object> result = service.execute(request);
+
+        assertThat(result.get("status")).isEqualTo("missing_portfolio_id");
+        org.mockito.Mockito.verify(portfolioService, org.mockito.Mockito.never()).findAll();
+    }
+
+    @Test
+    void executeUnknownFunctionIsUnsupported() {
         Map<String, Object> request = new LinkedHashMap<>();
         request.put("functionName", "unknown.handler");
 
         Map<String, Object> result = service.execute(request);
 
-        assertThat(result.get("status")).isEqualTo("ok");
+        assertThat(result.get("status")).isEqualTo("unsupported");
         assertThat(result.get("functionName")).isEqualTo("unknown.handler");
     }
 
@@ -200,19 +212,40 @@ class WorkflowNodeExecutionServiceTest {
         assertThat(result.get("status")).isEqualTo("ok");
     }
 
+    /* P2-22: no silent AAPL default. */
     @Test
-    void symbolDefaultsToAAPL() {
-        Map<String, Object> quoteResult = new LinkedHashMap<>();
-        quoteResult.put("provider", "yahoo");
-        quoteResult.put("sources", Collections.emptyList());
-        when(marketDataService.quote("AAPL")).thenReturn(quoteResult);
-
+    void missingSymbolIsReportedNotDefaulted() {
         Map<String, Object> request = new LinkedHashMap<>();
         request.put("functionName", "fdb.daily_ohlc");
 
         Map<String, Object> result = service.execute(request);
 
-        verify(marketDataService).quote("AAPL");
+        assertThat(result.get("status")).isEqualTo("missing_symbol");
+        org.mockito.Mockito.verifyNoInteractions(marketDataService);
+    }
+
+    @Test
+    void paramsJsonStringIsParsedWithJackson() {
+        Map<String, Object> quoteResult = new LinkedHashMap<>();
+        quoteResult.put("provider", "yahoo");
+        when(marketDataService.quote("MSFT")).thenReturn(quoteResult);
+        Map<String, Object> request = new LinkedHashMap<>();
+        request.put("functionName", "fdb.daily_ohlc");
+        /* The old substring scan took the first "symbol" anywhere (here a nested filter), not the top-level key. */
+        request.put("params", "{\"filter\":{\"symbol\":\"WRONG\"},\"symbol\":\"MSFT\"}");
+
+        Map<String, Object> result = service.execute(request);
+
+        verify(marketDataService).quote("MSFT");
+        assertThat(result.get("status")).isEqualTo("ok");
+        assertThat(WorkflowNodeExecutionService.parseParams("not json")).isEmpty();
+    }
+
+    @Test
+    void emptyConfiguredTokenNeverAuthorizes() {
+        assertThat(service.authorized("")).isFalse();
+        assertThat(service.authorized(null)).isFalse();
+        assertThat(service.authorized("local-workflow-node-token")).isFalse();
     }
 
     @Test

@@ -15,7 +15,9 @@ def test_build_tools():
         {"workflowKey": "stock-analysis", "name": "Stock Analysis", "routingDescription": "Analyze a stock"},
     ]
     tools, function_name_map = classifier._build_tools(workflows)
-    assert len(tools) == 1
+    # one tool per workflow + the trailing out_of_scope tool (P2-7)
+    assert len(tools) == 2
+    assert tools[-1]["function"]["name"] == "out_of_scope"
     assert tools[0]["type"] == "function"
     fn = tools[0]["function"]
     assert fn["name"] == "run_stock_analysis"
@@ -35,7 +37,7 @@ def test_build_tools_multiple():
         {"workflowKey": "market-overview", "name": "Market Overview"},
     ]
     tools, function_name_map = classifier._build_tools(workflows)
-    assert len(tools) == 2
+    assert len(tools) == 3
     assert function_name_map["run_stock_analysis"] == "stock-analysis"
     assert function_name_map["run_market_overview"] == "market-overview"
 
@@ -53,7 +55,7 @@ def test_build_tools_underscore_keys():
         {"workflowKey": "deep_dive", "name": "Deep Dive"},
     ]
     tools, function_name_map = classifier._build_tools(workflows)
-    assert len(tools) == 2
+    assert len(tools) == 3  # + out_of_scope (P2-7)
     assert tools[0]["function"]["name"] == "run_stock_analysis"
     assert tools[1]["function"]["name"] == "run_deep_dive"
     assert function_name_map["run_stock_analysis"] == "stock_analysis"
@@ -73,7 +75,7 @@ def test_build_tools_collision_prefers_first():
         {"workflowKey": "stock_analysis", "name": "Underscore"},
     ]
     tools, function_name_map = classifier._build_tools(workflows)
-    assert len(tools) == 2
+    assert len(tools) == 3  # both workflow tools + out_of_scope (P2-7)
     assert function_name_map["run_stock_analysis"] == "stock-analysis"
 
 
@@ -285,3 +287,22 @@ def test_tools_require_confidence_parameter():
     params = tools[0]["function"]["parameters"]
     assert params["properties"]["confidence"]["type"] == "number"
     assert "confidence" in params["required"]
+
+
+@pytest.mark.asyncio
+async def test_model_can_classify_out_of_scope():
+    """P2-7: the out_of_scope function yields domain OUT_OF_SCOPE and no workflow."""
+    from app.config import Settings
+    from app.core.intent_classifier import IntentClassifier
+    from app.core.llm_client import LLMClient
+
+    client = LLMClient(Settings(AEGIS_ALPHA_LANGCHAIN_API_KEY="test"))
+    client.classify_intent = AsyncMock(return_value={"function": "out_of_scope", "confidence": 0.8})
+    classifier = IntentClassifier(client)
+    result = await classifier.classify("帮我写首诗", [{"workflowKey": "deep_dive", "name": "Deep Dive"}])
+    assert result.workflow_key is None
+    assert result.domain == "OUT_OF_SCOPE"
+    assert result.source == "llm_out_of_scope"
+    assert result.confidence == 0.8
+    dumped = result.model_dump(by_alias=True)
+    assert dumped["domain"] == "OUT_OF_SCOPE" and dumped["workflowKey"] is None

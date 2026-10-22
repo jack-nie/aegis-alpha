@@ -735,12 +735,12 @@ class ApiContractTest {
         String token = login.replaceAll(".*\"access_token\":\"([^\"]+)\".*", "$1");
         String auth = "Bearer " + token;
 
-        // Verify stock_analysis layout returns sequential multi-specialist chain
+        // Verify stock_analysis layout returns parallel specialists fanning in to the aggregate (P2-14)
         mockMvc.perform(get("/_backend/workflows/stock_analysis/layout").header("Authorization", auth))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.workflowKey").value("stock_analysis"))
                 .andExpect(jsonPath("$.nodes", hasSize(7)))
-                .andExpect(jsonPath("$.edges", hasSize(6)));
+                .andExpect(jsonPath("$.edges", hasSize(9)));
 
         // Run the workflow
         String runJson = mockMvc.perform(post("/_backend/workflows/stock_analysis/run").header("Authorization", auth)

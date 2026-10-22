@@ -26,7 +26,10 @@ import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyBoolean;
+import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.nullable;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -56,10 +59,12 @@ class WorkflowRunOwnershipEndpointTest {
                 mock(TokenService.class), Runnable::run);
 
         when(mapper.findRun("run-a")).thenAnswer(inv -> run("run-a", "u-a", "t-1", "RUNNING"));
-        when(mapper.findRuns()).thenReturn(Arrays.asList(
-                run("run-a", "u-a", "t-1", "COMPLETED"),
-                run("run-b", "u-b", "t-1", "COMPLETED"),
-                run("legacy", null, null, "COMPLETED")));
+        /* The mapper ignores the SQL owner filter here, so the Java-side guard is exercised too. */
+        when(mapper.findRunsPage(nullable(String.class), nullable(String.class), anyBoolean(), anyInt(), anyInt()))
+                .thenAnswer(inv -> new java.util.ArrayList<WorkflowRun>(Arrays.asList(
+                        run("run-a", "u-a", "t-1", "COMPLETED"),
+                        run("run-b", "u-b", "t-1", "COMPLETED"),
+                        run("legacy", null, null, "COMPLETED"))));
         WorkflowNodeRun nodeRun = new WorkflowNodeRun();
         nodeRun.setRunId("run-a");
         when(mapper.findNodeRuns("run-a")).thenReturn(Collections.singletonList(nodeRun));
@@ -90,6 +95,33 @@ class WorkflowRunOwnershipEndpointTest {
         List<WorkflowRun> runs = controller.runs("Bearer a").getBody();
         assertThat(runs).extracting(WorkflowRun::getRunId).containsExactly("run-a");
         assertThat(controller.runs(null).getStatusCodeValue()).isEqualTo(401);
+    }
+
+    /* ---------------- P2-23 ---------------- */
+
+    @Test
+    void listIsPagedWithDefault50AndOwnerScopedInSql() {
+        controller.runs("Bearer a");
+        verify(mapper).findRunsPage("u-a", "t-1", false, 50, 0);
+
+        controller.runs("Bearer a", 500, 20);
+        verify(mapper).findRunsPage("u-a", "t-1", false, 200, 20);
+
+        controller.runs("Bearer a", -1, -5);
+        verify(mapper, org.mockito.Mockito.times(2)).findRunsPage("u-a", "t-1", false, 50, 0);
+    }
+
+    @Test
+    void listLastEventUsesOneSingleRowQueryPerRun() {
+        WorkflowRunEvent last = new WorkflowRunEvent();
+        last.setEventType("RUN_COMPLETED");
+        when(mapper.findLastRunEvent("run-a")).thenReturn(last);
+
+        List<WorkflowRun> runs = controller.runs("Bearer a").getBody();
+
+        assertThat(runs.get(0).getLastEvent()).containsEntry("eventType", "RUN_COMPLETED");
+        verify(mapper, org.mockito.Mockito.times(1)).findLastRunEvent("run-a");
+        verify(mapper, never()).findRunEvents("run-a");
     }
 
     @Test

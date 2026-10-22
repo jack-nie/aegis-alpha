@@ -52,9 +52,6 @@ public class HelpRoutingService {
             Pattern.CASE_INSENSITIVE
     );
     private static final Pattern TICKER_PATTERN = Pattern.compile("\\b([A-Z]{1,5}(?:\\.[A-Z]{2})?)\\b");
-    private static final String[] TICKER_STOPWORDS = {
-            "AI", "API", "CPI", "ETF", "GDP", "IPO", "LLM", "SEC", "USA", "USD", "CEO", "CFO", "ESG"
-    };
 
     private final IntentRouterService intentRouterService;
     private final PlaybookService playbookService;
@@ -65,6 +62,30 @@ public class HelpRoutingService {
     }
 
     public HelpIntent.Result classifyExtended(String message, HelpIntent.PageContext pageContext) {
+        return classifyExtended(message, pageContext, null);
+    }
+
+    /** Routes and emits one structured {@code aegis.routing} log line (no message text). */
+    public HelpIntent.Result classifyExtended(String message, HelpIntent.PageContext pageContext, String traceId) {
+        long started = System.nanoTime();
+        RoutingTelemetry.Call call = RoutingTelemetry.begin();
+        HelpIntent.Result result = null;
+        try {
+            result = classifyInternal(message, pageContext);
+            return result;
+        } finally {
+            RoutingTelemetry.end();
+            long latencyMs = (System.nanoTime() - started) / 1_000_000L;
+            RoutingTelemetry.logRoute(traceId,
+                    result == null || result.getDomain() == null ? "error" : result.getDomain().name(),
+                    result == null || result.getRouteAction() == null ? "error" : result.getRouteAction().name(),
+                    result == null ? "error" : result.getSource(),
+                    result == null ? 0d : result.getConfidence(),
+                    latencyMs, call.isLlmUsed(), call.isCacheHit(), message);
+        }
+    }
+
+    private HelpIntent.Result classifyInternal(String message, HelpIntent.PageContext pageContext) {
         HelpIntent.PageContext page = pageContext == null ? new HelpIntent.PageContext() : pageContext;
         String text = message == null ? "" : message.trim();
         HelpIntent.Entities entities = extractEntities(text, page);
@@ -75,6 +96,24 @@ public class HelpRoutingService {
             empty.setEntities(entities);
             empty.setReason("Empty message");
             return empty;
+        }
+
+        // 0) Safety boundary (P2-6): approve-on-behalf / trade / cross-tenant requests never reach
+        //    the LLM classifier and never dispatch a workflow, whatever the model would say.
+        HelpSafetyRules.Category safety = HelpSafetyRules.classify(text);
+        if (safety != HelpSafetyRules.Category.NONE) {
+            HelpIntent.Result guarded = HelpIntent.Result.empty();
+            guarded.setTicker(entities.getTicker());
+            guarded.setConfidence(1.0);
+            guarded.setSource("safety_rule");
+            guarded.setDomain(HelpIntent.Domain.PRODUCT_HELP);
+            guarded.setComplexity(HelpIntent.Complexity.L0);
+            guarded.setRouteAction(HelpIntent.RouteAction.PLAYBOOK);
+            guarded.setPlaybookId(safety == HelpSafetyRules.Category.APPROVE_ON_BEHALF ? "approval-inbox" : null);
+            guarded.setEntities(entities);
+            guarded.setCacheable(false);
+            guarded.setReason("Safety rule: " + safety.name());
+            return guarded;
         }
 
         boolean runIdInText = RUN_ID_PATTERN.matcher(text).find();
@@ -98,6 +137,11 @@ public class HelpRoutingService {
             return productHelp(text, entities, cacheable);
         }
 
+        // 2b) Clearly unrelated requests (creative writing, jokes, weather ...) → polite decline (P2-7)
+        if (isOutOfScope(text)) {
+            return outOfScope(entities, "Out-of-scope rule");
+        }
+
         // 3) Greetings / thanks → copilot chit-chat without consulting the LLM router
         if (isChitchat(text)) {
             return chitchat(entities, "Greeting rule");
@@ -113,6 +157,10 @@ public class HelpRoutingService {
         IntentResult llm = intentRouterService.classify(text);
         if (isConfidentResearch(llm)) {
             return research(llm, entities, "Published workflow match (classifier)");
+        }
+        if (llm != null && IntentRouterService.SOURCE_LLM_OUT_OF_SCOPE.equals(llm.getSource())
+                && !containsAny(text, RESEARCH_HINTS)) {
+            return outOfScope(entities, "Classifier: out of scope");
         }
 
         // Soft research hints without workflow → copilot research path
@@ -159,6 +207,34 @@ public class HelpRoutingService {
             }
         }
         return false;
+    }
+
+    /** Creative-writing / lifestyle requests unrelated to research or the product. */
+    static final String[] OUT_OF_SCOPE_HINTS = {
+            "写首诗", "写一首诗", "写诗", "作诗", "写首歌", "写歌词", "讲个笑话", "说个笑话", "讲笑话",
+            "天气怎么样", "天气预报", "今天天气", "菜谱", "怎么做菜", "写小说", "写作文", "星座", "算命",
+            "write a poem", "write me a poem", "tell me a joke", "tell a joke", "weather today",
+            "weather forecast", "recipe for", "write a story", "write a song", "horoscope"
+    };
+
+    static boolean isOutOfScope(String text) {
+        if (text == null) {
+            return false;
+        }
+        return containsAny(text, OUT_OF_SCOPE_HINTS) && !containsAny(text, RESEARCH_HINTS);
+    }
+
+    private HelpIntent.Result outOfScope(HelpIntent.Entities entities, String reason) {
+        HelpIntent.Result result = HelpIntent.Result.empty();
+        result.setConfidence(0.9);
+        result.setSource("out_of_scope");
+        result.setDomain(HelpIntent.Domain.OUT_OF_SCOPE);
+        result.setComplexity(HelpIntent.Complexity.L0);
+        result.setRouteAction(HelpIntent.RouteAction.DECLINE);
+        result.setEntities(entities);
+        result.setCacheable(false);
+        result.setReason(reason);
+        return result;
     }
 
     private HelpIntent.Result chitchat(HelpIntent.Entities entities, String reason) {
@@ -343,15 +419,6 @@ public class HelpRoutingService {
     }
 
     private static boolean isTickerStopword(String symbol) {
-        if (symbol == null) {
-            return true;
-        }
-        String upper = symbol.toUpperCase(Locale.ROOT);
-        for (String sw : TICKER_STOPWORDS) {
-            if (upper.equals(sw)) {
-                return true;
-            }
-        }
-        return false;
+        return com.aegis.alpha.service.RoutingRules.isTickerStopword(symbol);
     }
 }

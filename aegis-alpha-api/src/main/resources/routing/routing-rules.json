@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "description": "Single source of deterministic routing rules (P2-3). Java RoutingRules loads this file; the orchestrator keyword fallback keeps an identical copy that tests/test_routing_rules_sync.py compares against this file.",
+  "tickerStopwords": ["AI", "API", "CPI", "ETF", "GDP", "IPO", "LLM", "SEC", "USA", "USD", "CEO", "CFO", "ESG"],
+  "regexRules": [
+    {"workflowKey": "earnings_reaction", "pattern": "财报|业绩|季报|earnings reaction|earnings report", "extractTicker": true},
+    {"workflowKey": "watchlist_digest", "pattern": "早报|自选|watchlist|morning digest|digest", "extractTicker": true},
+    {"workflowKey": "stock_analysis", "pattern": "分析.{0,20}(?:股票|个股)|(?:股票|个股).{0,10}分析|分析一下.{0,20}", "extractTicker": true},
+    {"workflowKey": "sector-analyst-workflow", "pattern": "分析.{0,20}(?:板块|行业)|(?:板块|行业).{0,10}分析", "extractTicker": false}
+  ]
+}

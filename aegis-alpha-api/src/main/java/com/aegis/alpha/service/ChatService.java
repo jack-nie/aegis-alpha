@@ -32,23 +32,13 @@ import java.util.regex.Pattern;
 
 @Service
 public class ChatService {
+    /** P2-11: Copilot system prompt lives in a resource; missing data must be stated explicitly. */
+    static final String COPILOT_PROMPT_RESOURCE = "prompts/copilot-system.md";
+    static final String COPILOT_SYSTEM_PROMPT = loadCopilotPrompt();
+
+    private static final org.slf4j.Logger log = org.slf4j.LoggerFactory.getLogger(ChatService.class);
     private static final Pattern TICKER_PATTERN = Pattern.compile("\\b[A-Z]{1,5}(?:[._-][A-Z])?\\b");
-    private static final Set<String> SYMBOL_STOPWORDS = new HashSet<String>(Arrays.asList(
-            "AI", "API", "CPI", "ETF", "GDP", "IPO", "LLM", "SEC", "USA", "USD", "CEO", "CFO", "ESG"
-    ));
 
-    /* Flexible patterns: analysis + stock name + stock/sector keywords */
-    private static final Pattern STOCK_ANALYSIS_PATTERN =
-            Pattern.compile("分析.{0,20}(?:股票|个股)|(?:股票|个股).{0,10}分析|分析一下.{0,20}");
-    private static final Pattern SECTOR_ANALYSIS_PATTERN =
-            Pattern.compile("分析.{0,20}(?:板块|行业)|(?:板块|行业).{0,10}分析");
-
-    /* Seeded keys from ExistingDataSeeder (+ research Phase 1 add-ons) */
-    private static final Set<String> VALID_WORKFLOW_KEYS = Collections.unmodifiableSet(new HashSet<String>(Arrays.asList(
-            "daily", "deep_dive", "stock_analysis", "stock_recommendation_research", "exit_workflow",
-            "portfolio_workflow", "position_workflow", "sector-analyst-workflow",
-            "earnings_reaction", "watchlist_digest"
-    )));
 
     /** Identity fields that must never be taken from the client-supplied {@code state}. */
     private static final Set<String> CLIENT_IDENTITY_KEYS = Collections.unmodifiableSet(new HashSet<String>(Arrays.asList(
@@ -140,9 +130,20 @@ public class ChatService {
         HelpTrace trace = helpTraceService == null
                 ? null
                 : helpTraceService.start(UUID.randomUUID().toString(), threadId);
+        String previousTraceId = org.slf4j.MDC.get("traceId");
+        if (trace != null) {
+            org.slf4j.MDC.put("traceId", trace.getTraceId());
+        }
         try {
             return replyInternal(body, principal, message, threadId, trace);
         } finally {
+            if (trace != null) {
+                if (previousTraceId == null) {
+                    org.slf4j.MDC.remove("traceId");
+                } else {
+                    org.slf4j.MDC.put("traceId", previousTraceId);
+                }
+            }
             if (helpTraceService != null) {
                 helpTraceService.finish(trace);
             }
@@ -171,6 +172,9 @@ public class ChatService {
         /* Explicit workflowKey override takes priority */
         String explicit = text(body, "workflowKey", "");
         if (!explicit.isEmpty()) {
+            com.aegis.alpha.service.help.RoutingTelemetry.logRoute(trace == null ? null : trace.getTraceId(),
+                    HelpIntent.Domain.RESEARCH.name(), HelpIntent.RouteAction.DISPATCH_WORKFLOW.name(),
+                    "explicit_workflow_key", 1.0d, 0L, false, false, message);
             Map<String, Object> response = dispatchWorkflow(explicit, message, threadId, body, principal, trace);
             decorateResearch(response, explicit);
             recordSession(threadId, principal, session, message, null, response, false);
@@ -180,6 +184,15 @@ public class ChatService {
         HelpIntent.Result intent = helpRoutingService.classifyExtended(message, pageContext);
         applyPreferredDomain(body, intent);
         applySessionRunId(intent, session);
+
+        /* Out of scope: fixed decline, never the Copilot LLM (P2-7) */
+        if (intent.getDomain() == HelpIntent.Domain.OUT_OF_SCOPE) {
+            Map<String, Object> declined = helpService.outOfScope(threadId, intent);
+            markTrace(trace, intent, text(declined, "provider", "help-out-of-scope"), false, false);
+            persistAssistant(threadId, text(declined, "content", ""));
+            recordSession(threadId, principal, session, message, intent, declined, false);
+            return declined;
+        }
 
         /* Public help answer cache (entity-gated; never private run/portfolio) */
         if (helpAnswerCacheService != null) {
@@ -279,7 +292,8 @@ public class ChatService {
         }
         try {
             return helpSessionStateService.load(threadId, principal);
-        } catch (Exception ignored) {
+        } catch (Exception ex) {
+            log.warn("[ChatService] help session load failed: {}", ex.getClass().getSimpleName());
             return null;
         }
     }
@@ -348,8 +362,9 @@ public class ChatService {
                 helpSessionStateService.mergeCheckpoint(state, "");
             }
             helpSessionStateService.save(state, principal);
-        } catch (Exception ignored) {
+        } catch (Exception ex) {
             /* Session state must never break a chat response. */
+            log.warn("[ChatService] help session save failed: {}", ex.getClass().getSimpleName());
         }
     }
 
@@ -572,82 +587,6 @@ public class ChatService {
     }
 
     /* ================================================================ *
-     * Intent routing  –  only the seeded keys are valid targets.
-     * ================================================================ */
-
-    String resolveWorkflowKey(Map<String, Object> body, String message) {
-        /* explicit override from caller takes priority */
-        String explicit = text(body, "workflowKey", "");
-        if (!explicit.isEmpty() && VALID_WORKFLOW_KEYS.contains(explicit)) {
-            return explicit;
-        }
-
-        String msg = message == null ? "" : message.toLowerCase();
-
-        /* daily briefing */
-        if (matchesAny(msg,
-                "日报", "晨报", "每日", "盘前", "daily", "morning briefing", "daily graph")) {
-            return "daily";
-        }
-        /* deep dive */
-        if (matchesAny(msg,
-                "深度分析", "深度研究", "深入研究", "个股分析", "股票分析", "分析个股", "分析股票", "deep dive", "deep analysis", "stock analysis", "analyze stock",
-                "帮我分析", "分析一下")) {
-            return "deep_dive";
-        }
-        /* deep dive - flexible regex: analysis + stock name + stock keywords */
-        if (STOCK_ANALYSIS_PATTERN.matcher(msg).find()) {
-            return "deep_dive";
-        }
-        /* exit workflow */
-        if (matchesAny(msg,
-                "止损", "止盈", "卖出", "平仓", "退出", "exit", "stop loss", "take profit", "close position")) {
-            return "exit_workflow";
-        }
-        /* portfolio workflow */
-        if (matchesAny(msg,
-                "投资组合", "资产配置", "组合分析", "portfolio", "asset allocation", "portfolio workflow")) {
-            return "portfolio_workflow";
-        }
-        /* position workflow */
-        if (matchesAny(msg,
-                "仓位", "持仓", "建仓", "加仓", "减仓", "头寸",
-                "position sizing", "position management", "open position", "add position")) {
-            return "position_workflow";
-        }
-        /* sector analyst */
-        if (matchesAny(msg,
-                "板块", "行业", "行业分析", "sector", "industry analysis", "sector analyst")) {
-            return "sector-analyst-workflow";
-        }
-        /* sector analyst - flexible regex: analysis + sector/industry name */
-        if (SECTOR_ANALYSIS_PATTERN.matcher(msg).find()) {
-            return "sector-analyst-workflow";
-        }
-        /* earnings reaction */
-        if (matchesAny(msg,
-                "earnings", "财报", "业绩", "季报", "earnings reaction", "earnings call", "业绩会", "财报解读")) {
-            return "earnings_reaction";
-        }
-        /* watchlist morning digest */
-        if (matchesAny(msg,
-                "digest", "早报", "自选", "watchlist", "morning digest", "自选股", "晨间摘要", "watchlist digest")) {
-            return "watchlist_digest";
-        }
-
-        return null;
-    }
-
-    private static boolean matchesAny(String lowerMsg, String... keywords) {
-        for (String kw : keywords) {
-            if (lowerMsg.contains(kw.toLowerCase())) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    /* ================================================================ *
      * Workflow dispatch
      * ================================================================ */
 
@@ -729,7 +668,7 @@ public class ChatService {
         copilot.setDescription("Conversational investment research assistant.");
         copilot.setCategory("copilot");
         copilot.setTags("chat,copilot,research");
-        copilot.setPrompt("\u4f60\u662f Aegis Alpha Copilot\u3002\u8bf7\u7528\u4e2d\u6587\u56de\u7b54\u7528\u6237\u7684\u6295\u8d44\u7814\u7a76\u95ee\u9898\u3002\u5fc5\u987b\u5f15\u7528\u5f53\u524d\u4e0a\u4e0b\u6587\u4e2d\u7684\u5b9e\u65f6\u884c\u60c5\u6570\u636e\uff08\u4ef7\u683c\u3001\u6da8\u8dcc\u5e45\u3001PE\u3001PB\u3001\u5e02\u503c\u7b49\uff09\u548c\u65b0\u95fb\u6807\u9898\u6765\u5206\u6790\u3002\u5982\u679c\u5e02\u573a\u6570\u636e\u4e0a\u4e0b\u6587\u5df2\u7ecf\u63d0\u4f9b\uff0c\u5fc5\u987b\u57fa\u4e8e\u8fd9\u4e9b\u6570\u636e\u7ed9\u51fa\u5177\u4f53\u5206\u6790\uff0c\u4e0d\u8981\u8bf4\u6570\u636e\u4e0d\u8db3\u3002");
+        copilot.setPrompt(COPILOT_SYSTEM_PROMPT);
         copilot.setModelName(text(body, "modelName", ""));
         copilot.setToolsJson("[\"market-data\",\"portfolio\",\"news\",\"workflow\"]");
 
@@ -764,6 +703,30 @@ public class ChatService {
         response.put("escalateHuman", false);
         response.put("cacheHit", false);
         return response;
+    }
+
+    static String loadCopilotPrompt() {
+        java.io.InputStream in = ChatService.class.getClassLoader().getResourceAsStream(COPILOT_PROMPT_RESOURCE);
+        if (in == null) {
+            throw new IllegalStateException("Missing classpath resource " + COPILOT_PROMPT_RESOURCE);
+        }
+        try {
+            java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+            byte[] buffer = new byte[2048];
+            int read;
+            while ((read = in.read(buffer)) != -1) {
+                out.write(buffer, 0, read);
+            }
+            return new String(out.toByteArray(), java.nio.charset.StandardCharsets.UTF_8).trim();
+        } catch (java.io.IOException ex) {
+            throw new IllegalStateException("Cannot read " + COPILOT_PROMPT_RESOURCE, ex);
+        } finally {
+            try {
+                in.close();
+            } catch (java.io.IOException ignored) {
+                // nothing to do
+            }
+        }
     }
 
     /* ================================================================ *
@@ -867,7 +830,7 @@ public class ChatService {
         Matcher matcher = TICKER_PATTERN.matcher(msg);
         while (matcher.find()) {
             String candidate = cleanTicker(matcher.group());
-            if (!candidate.isEmpty() && !SYMBOL_STOPWORDS.contains(candidate)) {
+            if (!candidate.isEmpty() && !RoutingRules.isTickerStopword(candidate)) {
                 return candidate;
             }
         }
