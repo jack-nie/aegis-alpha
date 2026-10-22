@@ -1,5 +1,6 @@
 """Remote execution helper for deployment."""
 
+import os
 import sys
 import io
 import paramiko
@@ -9,14 +10,14 @@ sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="repla
 
 SSH_HOST = "106.53.115.183"
 SSH_USER = "root"
-SSH_PASS = "***REMOVED***"
+SSH_KEY = os.path.expanduser(os.environ.get("AEGIS_SSH_KEY", "~/.ssh/id_ed25519"))
 
 
 def run(cmd, print_output=True):
     """Execute a command on the remote server."""
     ssh = paramiko.SSHClient()
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    ssh.connect(SSH_HOST, username=SSH_USER, password=SSH_PASS, timeout=15)
+    ssh.connect(SSH_HOST, username=SSH_USER, key_filename=SSH_KEY, timeout=15)
 
     stdin, stdout, stderr = ssh.exec_command(cmd, timeout=300)
     out = stdout.read().decode("utf-8", errors="replace")
