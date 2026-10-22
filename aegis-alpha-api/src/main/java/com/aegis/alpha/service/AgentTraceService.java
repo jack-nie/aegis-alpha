@@ -42,9 +42,13 @@ public class AgentTraceService {
         span.setCompletedAt(nodeRun.getCompletedAt() == null ? now() : nodeRun.getCompletedAt());
         span.setLatencyMs(latencyMillis(nodeRun.getStartedAt(), span.getCompletedAt()));
         Map<String, Object> usage = usageFrom(output);
-        span.setPromptTokens(number(usage, "prompt_tokens"));
-        span.setCompletionTokens(number(usage, "completion_tokens"));
-        span.setTotalTokens(number(usage, "total_tokens"));
+        span.setPromptTokens(firstNumber(usage, "prompt_tokens", "inputTokens", "input_tokens", "promptTokens"));
+        span.setCompletionTokens(firstNumber(usage, "completion_tokens", "outputTokens", "output_tokens", "completionTokens"));
+        Integer total = firstNumber(usage, "total_tokens", "totalTokens");
+        if (total == null && span.getPromptTokens() != null && span.getCompletionTokens() != null) {
+            total = span.getPromptTokens() + span.getCompletionTokens();
+        }
+        span.setTotalTokens(total);
         span.setSortOrder(nodeRun.getSortOrder());
         mapper.insert(span);
     }
@@ -54,16 +58,22 @@ public class AgentTraceService {
         if (output == null) {
             return new LinkedHashMap<>();
         }
+        // Orchestrator contract (P2-5): data.tokenUsage{inputTokens,outputTokens,totalTokens};
+        // legacy shapes data.usage / usage / top-level OpenAI keys still accepted.
         Object data = output.get("data");
         if (data instanceof Map) {
-            Object usage = ((Map<String, Object>) data).get("usage");
+            for (String key : new String[] {"tokenUsage", "usage"}) {
+                Object usage = ((Map<String, Object>) data).get(key);
+                if (usage instanceof Map) {
+                    return (Map<String, Object>) usage;
+                }
+            }
+        }
+        for (String key : new String[] {"tokenUsage", "usage"}) {
+            Object usage = output.get(key);
             if (usage instanceof Map) {
                 return (Map<String, Object>) usage;
             }
-        }
-        Object usage = output.get("usage");
-        if (usage instanceof Map) {
-            return (Map<String, Object>) usage;
         }
         return output;
     }
@@ -75,6 +85,16 @@ public class AgentTraceService {
         } catch (Exception ignored) {
             return 0L;
         }
+    }
+
+    private Integer firstNumber(Map<String, Object> map, String... keys) {
+        for (String key : keys) {
+            Integer value = number(map, key);
+            if (value != null) {
+                return value;
+            }
+        }
+        return null;
     }
 
     private Integer number(Map<String, Object> map, String key) {

@@ -171,4 +171,40 @@ class AgentTraceServiceTest {
             return true;
         }));
     }
+
+    @Test
+    void tokenUsageContractFromOrchestratorFillsAllThreeColumns() {
+        WorkflowRun run = new WorkflowRun();
+        run.setRunId("run-t");
+        run.setTraceId("trace-t");
+        WorkflowNodeRun nodeRun = new WorkflowNodeRun();
+        nodeRun.setNodeRunId("nr-t");
+        nodeRun.setNodeType("agent");
+        nodeRun.setSortOrder(1);
+        Map<String, Object> usage = mapOf(entry("inputTokens", (Object) 120), entry("outputTokens", (Object) 30),
+                entry("totalTokens", (Object) 150));
+        Map<String, Object> data = mapOf(entry("tokenUsage", (Object) usage));
+        Map<String, Object> output = mapOf(entry("ok", (Object) true), entry("data", (Object) data));
+
+        service.recordNodeSpan(run, nodeRun, "general.agent", Collections.<String, Object>emptyMap(), output);
+
+        verify(mapper).insert(argThat(span -> span.getPromptTokens() == 120
+                && span.getCompletionTokens() == 30 && span.getTotalTokens() == 150));
+    }
+
+    @Test
+    void totalIsDerivedWhenOnlyInputAndOutputArePresent() {
+        WorkflowRun run = new WorkflowRun();
+        run.setRunId("run-u");
+        WorkflowNodeRun nodeRun = new WorkflowNodeRun();
+        nodeRun.setNodeRunId("nr-u");
+        nodeRun.setSortOrder(1);
+        Map<String, Object> usage = mapOf(entry("inputTokens", (Object) 7), entry("outputTokens", (Object) 5));
+        Map<String, Object> output = mapOf(entry("tokenUsage", (Object) usage));
+
+        service.recordNodeSpan(run, nodeRun, "general.agent", Collections.<String, Object>emptyMap(), output);
+
+        verify(mapper).insert(argThat(span -> span.getPromptTokens() == 7
+                && span.getCompletionTokens() == 5 && span.getTotalTokens() == 12));
+    }
 }
