@@ -65,8 +65,17 @@ public interface WorkflowMapper {
     @Insert("insert into workflow_version(version_id, workflow_key, version, layout_json, validation_json, published_by, published_at) values(#{versionId}, #{workflowKey}, #{version}, #{layoutJson}, #{validationJson}, #{publishedBy}, #{publishedAt})")
     void insertVersion(WorkflowVersion version);
 
-    @Select("select run_id, user_id, tenant_id, workflow_key, trace_id, status, subject, started_at, completed_at, result_json, error_message, node_count, idempotency_key, workflow_version_id, inputs_json, control_status, pause_requested, cancel_requested, queued_at from workflow_run order by started_at desc")
-    List<WorkflowRun> findRuns();
+    /**
+     * P2-23: paged run list. Large columns (result_json, inputs_json) are not selected; the list keeps
+     * the same JSON fields with null values. {@code all=false} scopes to one owner (user + tenant).
+     */
+    @Select("<script>select run_id, user_id, tenant_id, workflow_key, trace_id, status, subject, started_at, completed_at, "
+            + "error_message, node_count, idempotency_key, workflow_version_id, control_status, pause_requested, "
+            + "cancel_requested, queued_at from workflow_run"
+            + "<if test='!all'> where user_id = #{userId} and tenant_id = #{tenantId}</if>"
+            + " order by started_at desc limit #{limit} offset #{offset}</script>")
+    List<WorkflowRun> findRunsPage(@Param("userId") String userId, @Param("tenantId") String tenantId,
+                                   @Param("all") boolean all, @Param("limit") int limit, @Param("offset") int offset);
 
     @Select("select run_id, user_id, tenant_id, workflow_key, trace_id, status, subject, started_at, completed_at, result_json, error_message, node_count, idempotency_key, workflow_version_id, inputs_json, control_status, pause_requested, cancel_requested, queued_at from workflow_run where run_id = #{runId}")
     WorkflowRun findRun(String runId);
@@ -121,4 +130,8 @@ public interface WorkflowMapper {
 
     @Select("select event_id, run_id, event_type, node_run_id, node_id, status, message, payload_json, created_at, sort_order from workflow_run_event where run_id = #{runId} order by sort_order asc, created_at asc")
     List<WorkflowRunEvent> findRunEvents(String runId);
+
+    /** P2-23: newest event of a run in one single-row query (same order as findRunEvents, reversed). */
+    @Select("select event_id, run_id, event_type, node_run_id, node_id, status, message, payload_json, created_at, sort_order from workflow_run_event where run_id = #{runId} order by sort_order desc, created_at desc limit 1")
+    WorkflowRunEvent findLastRunEvent(String runId);
 }
