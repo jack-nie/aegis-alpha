@@ -52,9 +52,6 @@ public class HelpRoutingService {
             Pattern.CASE_INSENSITIVE
     );
     private static final Pattern TICKER_PATTERN = Pattern.compile("\\b([A-Z]{1,5}(?:\\.[A-Z]{2})?)\\b");
-    private static final String[] TICKER_STOPWORDS = {
-            "AI", "API", "CPI", "ETF", "GDP", "IPO", "LLM", "SEC", "USA", "USD", "CEO", "CFO", "ESG"
-    };
 
     private final IntentRouterService intentRouterService;
     private final PlaybookService playbookService;
@@ -343,15 +340,6 @@ public class HelpRoutingService {
     }
 
     private static boolean isTickerStopword(String symbol) {
-        if (symbol == null) {
-            return true;
-        }
-        String upper = symbol.toUpperCase(Locale.ROOT);
-        for (String sw : TICKER_STOPWORDS) {
-            if (upper.equals(sw)) {
-                return true;
-            }
-        }
-        return false;
+        return com.aegis.alpha.service.RoutingRules.isTickerStopword(symbol);
     }
 }

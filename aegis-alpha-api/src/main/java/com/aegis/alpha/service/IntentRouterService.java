@@ -21,15 +21,6 @@ import java.util.regex.Pattern;
 public class IntentRouterService {
     private static final Logger log = LoggerFactory.getLogger(IntentRouterService.class);
     private static final long CACHE_TTL_MS = 5 * 60 * 1000;
-    /** High-precision: must run before stock_analysis so 财报/业绩 phrases don't fall through. */
-    private static final Pattern EARNINGS_REACTION_PATTERN =
-            Pattern.compile("财报|业绩|季报|earnings reaction|earnings report");
-    private static final Pattern WATCHLIST_DIGEST_PATTERN =
-            Pattern.compile("早报|自选|watchlist|morning digest|digest");
-    private static final Pattern STOCK_ANALYSIS_PATTERN =
-            Pattern.compile("分析.{0,20}(?:股票|个股)|(?:股票|个股).{0,10}分析|分析一下.{0,20}");
-    private static final Pattern SECTOR_ANALYSIS_PATTERN =
-            Pattern.compile("分析.{0,20}(?:板块|行业)|(?:板块|行业).{0,10}分析");
     private static final Pattern TICKER_PATTERN = Pattern.compile("\\b[A-Z]{1,5}(?:[._-][A-Z])?\\b");
 
     private final WorkflowMapper workflowMapper;
@@ -238,29 +229,13 @@ public class IntentRouterService {
 
     private IntentResult classifyByKeywords(String message, List<WorkflowDefinition> definitions) {
         String lower = message.toLowerCase();
-        // regex patterns first (higher precision); order matters — research keys before stock_analysis
-        if (EARNINGS_REACTION_PATTERN.matcher(lower).find()) {
-            String key = findKey(definitions, "earnings_reaction");
-            if (key != null) {
-                return new IntentResult(key, extractTicker(message), 0.7, "keyword_regex");
-            }
-        }
-        if (WATCHLIST_DIGEST_PATTERN.matcher(lower).find()) {
-            String key = findKey(definitions, "watchlist_digest");
-            if (key != null) {
-                return new IntentResult(key, extractTicker(message), 0.7, "keyword_regex");
-            }
-        }
-        if (STOCK_ANALYSIS_PATTERN.matcher(lower).find()) {
-            String key = findKey(definitions, "stock_analysis");
-            if (key != null) {
-                return new IntentResult(key, extractTicker(message), 0.7, "keyword_regex");
-            }
-        }
-        if (SECTOR_ANALYSIS_PATTERN.matcher(lower).find()) {
-            String key = findKey(definitions, "sector-analyst-workflow");
-            if (key != null) {
-                return new IntentResult(key, null, 0.7, "keyword_regex");
+        // regex rules first (higher precision); order matters — research keys before stock_analysis
+        for (RoutingRules.RegexRule rule : RoutingRules.regexRules()) {
+            if (rule.getPattern().matcher(lower).find()) {
+                String key = findKey(definitions, rule.getWorkflowKey());
+                if (key != null) {
+                    return new IntentResult(key, rule.isExtractTicker() ? extractTicker(message) : null, 0.7, "keyword_regex");
+                }
             }
         }
         // keyword matching from DB trigger_keywords
@@ -310,14 +285,7 @@ public class IntentRouterService {
     }
 
     private boolean isStopword(String symbol) {
-        String upper = symbol.toUpperCase();
-        String[] stopwords = {"AI", "API", "CPI", "ETF", "GDP", "IPO", "LLM", "SEC", "USA", "USD", "CEO", "CFO", "ESG"};
-        for (String sw : stopwords) {
-            if (upper.equals(sw)) {
-                return true;
-            }
-        }
-        return false;
+        return RoutingRules.isTickerStopword(symbol);
     }
 
     private List<WorkflowDefinition> getDefinitions() {
