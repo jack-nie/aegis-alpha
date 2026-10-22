@@ -67,6 +67,13 @@ class Settings(BaseSettings):
     data_dir: str = Field(default="data", alias="AEGIS_ALPHA_DATA_DIR")
     store_default_ttl_seconds: int = Field(default=3600, alias="AEGIS_ALPHA_STORE_TTL_SECONDS")
 
+    # Graph execution guardrails (P2-12)
+    workflow_recursion_limit: int = Field(default=100, alias="AEGIS_ALPHA_WORKFLOW_RECURSION_LIMIT")
+    workflow_timeout_seconds: float = Field(default=900.0, alias="AEGIS_ALPHA_WORKFLOW_TIMEOUT_SECONDS")
+    workflow_thread_meta_max: int = Field(default=1000, alias="AEGIS_ALPHA_WORKFLOW_THREAD_META_MAX")
+    # 待确认: default keeps checkpoints of finished runs (debuggability); set true to delete them.
+    workflow_cleanup_checkpoints: bool = Field(default=False, alias="AEGIS_ALPHA_WORKFLOW_CLEANUP_CHECKPOINTS")
+
     # OpenAI fallback
     openai_api_key: str = Field(default="", alias="OPENAI_API_KEY")
     openai_base_url: str = Field(default="", alias="OPENAI_BASE_URL")

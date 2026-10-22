@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
 import uuid
 from collections import defaultdict, OrderedDict
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Annotated, Any, AsyncIterator, Optional
 from typing_extensions import TypedDict
@@ -194,6 +196,38 @@ def is_explicit_approval(value: Any) -> bool:
     """Only ``{"approved": True}`` approves; anything else (missing, None, truthy strings) rejects."""
     return is_valid_resume_value(value) and value.get("approved") is True
 
+@dataclass(frozen=True)
+class GraphGuardrails:
+    """P2-12: bounds for one graph run (all configurable via Settings)."""
+
+    recursion_limit: int = 100
+    timeout_seconds: float = 900.0
+    thread_meta_max: int = 1000
+    cleanup_checkpoints: bool = False
+
+    @classmethod
+    def from_settings(cls, settings: Any) -> "GraphGuardrails":
+        return cls(
+            recursion_limit=int(getattr(settings, "workflow_recursion_limit", 100)),
+            timeout_seconds=float(getattr(settings, "workflow_timeout_seconds", 900.0)),
+            thread_meta_max=int(getattr(settings, "workflow_thread_meta_max", 1000)),
+            cleanup_checkpoints=bool(getattr(settings, "workflow_cleanup_checkpoints", False)),
+        )
+
+
+class WorkflowTimeout(Exception):
+    def __init__(self, seconds: float):
+        super().__init__(f"Workflow timed out after {seconds:g}s")
+        self.seconds = seconds
+
+
+def _interrupt_event() -> SSEEvent:
+    return SSEEvent(
+        event="human_interrupt",
+        data={"message": "Workflow paused for approval", "ok": True, "interrupted": True},
+    )
+
+
 class WorkflowEngine:
     """LangGraph-based workflow orchestration engine."""
 
@@ -206,16 +240,19 @@ class WorkflowEngine:
         store: BaseStore | None = None,
         checkpointer: Any | None = None,
         tool_registry: dict[str, Any] | None = None,
+        guardrails: "GraphGuardrails | None" = None,
     ):
         self._node_executor = node_executor
+        self._guardrails = guardrails or GraphGuardrails()
         self._checkpointer = ensure_async_checkpointer(checkpointer)
         self._tools = tools or []
         self._tool_registry = tool_registry
         self._store = store
         # Shared ToolNode for backward-compatible single-tools-list mode.
         self._tool_node = ToolNode(self._tools) if self._tools else None
-        # Persist layout/flags per thread so resume rebuilds the same graph.
-        self._thread_meta: dict[str, dict[str, Any]] = {}
+        # Persist layout/flags per thread so resume rebuilds the same graph. Bounded LRU (P2-12);
+        # evicted threads fall back to the durable layout in the store.
+        self._thread_meta: OrderedDict[str, dict[str, Any]] = OrderedDict()
 
     def _has_tools_capability(self) -> bool:
         return bool(self._tools) or bool(self._tool_registry)
@@ -292,12 +329,48 @@ class WorkflowEngine:
         nodes: list[Node],
         edges: list[Edge],
     ) -> None:
-        """Store layout and approval flag for later resume on the same thread."""
+        """Store layout and approval flag for later resume on the same thread (bounded LRU)."""
         self._thread_meta[thread_id] = {
             "require_approval": require_approval,
             "nodes": nodes,
             "edges": edges,
         }
+        self._thread_meta.move_to_end(thread_id)
+        while len(self._thread_meta) > max(1, self._guardrails.thread_meta_max):
+            self._thread_meta.popitem(last=False)
+
+    def _run_config(self, thread_id: str) -> dict[str, Any]:
+        return {
+            "configurable": {"thread_id": thread_id},
+            "recursion_limit": self._guardrails.recursion_limit,
+        }
+
+    async def _ainvoke_guarded(self, graph: Any, graph_input: Any, config: dict[str, Any]) -> Any:
+        """``ainvoke`` bounded by the configured whole-run timeout."""
+        try:
+            return await asyncio.wait_for(
+                graph.ainvoke(graph_input, config=config, **self._graph_run_kwargs()),
+                timeout=self._guardrails.timeout_seconds,
+            )
+        except asyncio.TimeoutError:
+            raise WorkflowTimeout(self._guardrails.timeout_seconds) from None
+
+    async def _cleanup_thread(self, thread_id: str) -> None:
+        """Drop checkpoint + layout of a thread that reached a terminal state (opt-in)."""
+        if not self._guardrails.cleanup_checkpoints:
+            return
+        self._thread_meta.pop(thread_id, None)
+        delete = getattr(self._checkpointer, "adelete_thread", None)
+        if delete is not None:
+            try:
+                await delete(thread_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[THINKING] Checkpoint cleanup failed thread_id=%s error=%s", thread_id, type(exc).__name__)
+        if self._store is not None:
+            try:
+                await self._store.adelete(("thread", thread_id), "layout")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[THINKING] Layout cleanup failed thread_id=%s error=%s", thread_id, type(exc).__name__)
 
     async def _persist_thread_layout(
         self,
@@ -994,6 +1067,27 @@ class WorkflowEngine:
             out["agent_messages"] = {node.id: append_msgs}
         return out
 
+    def _initial_state(self, state: dict[str, Any], subject: str, require_approval: bool) -> WorkflowState:
+        return {
+            "final_state": state,
+            "trace": [],
+            "node_outputs": {},
+            "subject": subject,
+            "require_approval": require_approval,
+            "messages": [],
+            "agent_messages": {},
+        }
+
+    async def _start_thread(
+        self, nodes: list[Node], edges: list[Edge], require_approval: bool, thread_id: str | None
+    ) -> tuple[Any, str, dict[str, Any]]:
+        graph = self.build_graph(nodes, edges, require_approval=require_approval)
+        tid = thread_id or str(uuid.uuid4())
+        await self._persist_thread_layout(
+            tid, require_approval=require_approval, nodes=nodes, edges=edges
+        )
+        return graph, tid, self._run_config(tid)
+
     async def execute_workflow(
         self,
         nodes: list[Node],
@@ -1005,29 +1099,17 @@ class WorkflowEngine:
     ) -> WorkflowResult:
         """Execute workflow non-streaming."""
         logger.info(f"[THINKING] Workflow execution starting: subject={subject} nodes={[n.id for n in nodes]} require_approval={require_approval}")
-        graph = self.build_graph(nodes, edges, require_approval=require_approval)
-        tid = thread_id or str(uuid.uuid4())
-        await self._persist_thread_layout(
-            tid, require_approval=require_approval, nodes=nodes, edges=edges
-        )
-        config = {"configurable": {"thread_id": tid}}
-        initial_state: WorkflowState = {
-            "final_state": state,
-            "trace": [],
-            "node_outputs": {},
-            "subject": subject,
-            "require_approval": require_approval,
-            "messages": [],
-            "agent_messages": {},
-        }
+        graph, tid, config = await self._start_thread(nodes, edges, require_approval, thread_id)
+        initial_state = self._initial_state(state, subject, require_approval)
 
         try:
-            final_state = await graph.ainvoke(
-                initial_state, config=config, **self._graph_run_kwargs()
-            )
+            final_state = await self._ainvoke_guarded(graph, initial_state, config)
             node_ids = [n.id for n in nodes]
             logger.info(f"[THINKING] Workflow execution completed: subject={subject} nodes={node_ids} ok=True")
-            return self._result_from_graph_output(final_state)
+            result = self._result_from_graph_output(final_state)
+            if not result.final_state.get("interrupted"):
+                await self._cleanup_thread(tid)
+            return result
         except GraphInterrupt:
             logger.info(
                 "[THINKING] Workflow paused for approval: subject=%s thread_id=%s",
@@ -1035,184 +1117,61 @@ class WorkflowEngine:
                 tid,
             )
             return await self._result_from_interrupt(graph, config, state)
+        except WorkflowTimeout as e:
+            logger.error("[THINKING] Workflow execution timed out: thread_id=%s", tid)
+            return WorkflowResult(ok=False, error=str(e), final_state=state)
         except Exception as e:
             logger.error(f"[THINKING] Workflow execution failed: subject={subject} error={e}")
             return WorkflowResult(ok=False, error=str(e), final_state=state)
 
-    async def stream_workflow(
+    async def _stream_events(
         self,
-        nodes: list[Node],
-        edges: list[Edge],
+        graph: Any,
+        graph_input: Any,
+        config: dict[str, Any],
         state: dict[str, Any],
-        subject: str,
-        require_approval: bool = False,
-        thread_id: str | None = None,
+        *,
+        tid: str,
+        token_node_id: str | None,
+        report_degraded: bool,
+        label: str,
     ) -> AsyncIterator[SSEEvent]:
-        """Execute workflow with SSE streaming."""
-        logger.info(f"[THINKING] Workflow streaming starting: subject={subject} nodes={[n.id for n in nodes]} require_approval={require_approval}")
-        graph = self.build_graph(nodes, edges, require_approval=require_approval)
-        tid = thread_id or str(uuid.uuid4())
-        await self._persist_thread_layout(
-            tid, require_approval=require_approval, nodes=nodes, edges=edges
-        )
-        config = {"configurable": {"thread_id": tid}}
-        initial_state: WorkflowState = {
-            "final_state": state,
-            "trace": [],
-            "node_outputs": {},
-            "subject": subject,
-            "require_approval": require_approval,
-            "messages": [],
-            "agent_messages": {},
-        }
+        """Shared ``astream`` → SSE translation for both streaming endpoints (P2-12).
 
+        ``token_node_id`` re-emits that node's content as ``token`` chunks; ``report_degraded``
+        collects degraded reasons and emits a ``degraded`` event before completion. The whole run
+        is bounded by the configured timeout; on expiry an ``error`` event with code
+        ``WORKFLOW_TIMEOUT`` is emitted.
+        """
         degraded_reasons: list[str] = []
         saw_interrupt = False
         streamed_state: dict[str, Any] = dict(state or {})
         streamed_outputs: dict[str, Any] = {}
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self._guardrails.timeout_seconds
+        stream = graph.astream(
+            graph_input,
+            config=config,
+            stream_mode="updates",
+            **self._graph_run_kwargs(),
+        ).__aiter__()
         try:
-            async for chunk in graph.astream(
-                initial_state,
-                config=config,
-                stream_mode="updates",
-                **self._graph_run_kwargs(),
-            ):
-                if not isinstance(chunk, dict):
-                    continue
-                for node_name, update in chunk.items():
-                    if node_name == "__interrupt__":
-                        saw_interrupt = True
-                        yield SSEEvent(
-                            event="human_interrupt",
-                            data={"message": "Workflow paused for approval", "ok": True, "interrupted": True},
-                        )
-                        continue
-                    if not isinstance(update, dict):
-                        continue
-                    if isinstance(update.get("final_state"), dict):
-                        streamed_state = deep_merge(streamed_state, update["final_state"])
-                    if isinstance(update.get("node_outputs"), dict):
-                        streamed_outputs.update(update["node_outputs"])
-                    trace_entry = (update.get("trace") or [{}])[0]
-                    if _is_tools_node_name(str(node_name)):
-                        yield SSEEvent(
-                            event="tool_call",
-                            data={
-                                "nodeId": node_name,
-                                "nodeName": "Tool Execution",
-                                "handler": "tool",
-                                "status": "completed",
-                                "ok": True,
-                                "results": update.get("node_outputs", {}),
-                            },
-                        )
-                    else:
-                        node_id = trace_entry.get("nodeId", node_name)
-                        node_status = trace_entry.get("status", "")
-                        node_ok = trace_entry.get("ok", False)
-                        node_duration = trace_entry.get("durationMs", 0)
-                        node_degraded = bool(trace_entry.get("degraded", False))
-                        if node_degraded:
-                            degraded_reasons.append(f"node:{node_id}")
-                        # Inspect aggregate policy in node_outputs
-                        outputs = update.get("node_outputs") or {}
-                        for _nid, payload in outputs.items():
-                            if isinstance(payload, dict) and payload.get("degraded"):
-                                degraded_reasons.append(f"output:{_nid}")
-                            if isinstance(payload, dict) and isinstance(payload.get("data"), dict):
-                                missing = payload["data"].get("missingData") or []
-                                for m in missing:
-                                    degraded_reasons.append(str(m))
-                        logger.info(f"[THINKING] SSE node_update: id={node_id} status={node_status} ok={node_ok} duration={node_duration}ms")
-                        yield SSEEvent(
-                            event="node_update",
-                            data={
-                                "nodeId": node_id,
-                                "nodeName": trace_entry.get("nodeName", node_name),
-                                "handler": trace_entry.get("handler", ""),
-                                "status": node_status,
-                                "ok": node_ok,
-                                "degraded": node_degraded,
-                                "startedAt": trace_entry.get("startedAt", ""),
-                                "completedAt": trace_entry.get("completedAt", ""),
-                                "durationMs": node_duration,
-                            },
-                        )
-                if saw_interrupt:
+            while True:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    raise WorkflowTimeout(self._guardrails.timeout_seconds)
+                try:
+                    chunk = await asyncio.wait_for(stream.__anext__(), timeout=remaining)
+                except StopAsyncIteration:
                     break
-
-            if saw_interrupt:
-                return
-            if degraded_reasons:
-                # Dedupe reasons
-                unique_reasons = list(dict.fromkeys(degraded_reasons))
-                yield SSEEvent(event="degraded", data={"ok": True, "reasons": unique_reasons})
-            yield SSEEvent(
-                event="workflow_complete",
-                data={
-                    "ok": True,
-                    "degraded": bool(degraded_reasons),
-                    "final_state": build_stream_final_state(streamed_state, streamed_outputs),
-                },
-            )
-        except GraphInterrupt:
-            yield SSEEvent(
-                event="human_interrupt",
-                data={"message": "Workflow paused for approval", "ok": True, "interrupted": True},
-            )
-        except Exception as e:
-            logger.error(f"[THINKING] Workflow streaming failed: subject={subject} error={e}")
-            yield SSEEvent(event="error", data={"ok": False, "error": str(e), "code": "WORKFLOW_ERROR"})
-
-    async def stream_workflow_tokens(
-        self,
-        nodes: list[Node],
-        edges: list[Edge],
-        state: dict[str, Any],
-        subject: str,
-        require_approval: bool = False,
-        thread_id: str | None = None,
-    ) -> AsyncIterator[SSEEvent]:
-        graph = self.build_graph(nodes, edges, require_approval=require_approval)
-        tid = thread_id or str(uuid.uuid4())
-        await self._persist_thread_layout(
-            tid, require_approval=require_approval, nodes=nodes, edges=edges
-        )
-        config = {"configurable": {"thread_id": tid}}
-        initial_state: WorkflowState = {
-            "final_state": state,
-            "trace": [],
-            "node_outputs": {},
-            "subject": subject,
-            "require_approval": require_approval,
-            "messages": [],
-            "agent_messages": {},
-        }
-
-        aggregate_node = next(
-            (n for n in nodes if n.data.handler == "finance.stock_recommendation_aggregate"),
-            None,
-        )
-
-        saw_interrupt = False
-        streamed_state: dict[str, Any] = dict(state or {})
-        streamed_outputs: dict[str, Any] = {}
-        try:
-            async for chunk in graph.astream(
-                initial_state,
-                config=config,
-                stream_mode="updates",
-                **self._graph_run_kwargs(),
-            ):
+                except asyncio.TimeoutError:
+                    raise WorkflowTimeout(self._guardrails.timeout_seconds) from None
                 if not isinstance(chunk, dict):
                     continue
                 for node_name, update in chunk.items():
                     if node_name == "__interrupt__":
                         saw_interrupt = True
-                        yield SSEEvent(
-                            event="human_interrupt",
-                            data={"message": "Workflow paused for approval", "ok": True, "interrupted": True},
-                        )
+                        yield _interrupt_event()
                         continue
                     if not isinstance(update, dict):
                         continue
@@ -1222,18 +1181,15 @@ class WorkflowEngine:
                         streamed_outputs.update(update["node_outputs"])
                     trace_entry = (update.get("trace") or [{}])[0]
 
-                    if aggregate_node and node_name == aggregate_node.id:
-                        node_result = (update.get("node_outputs") or {}).get(aggregate_node.id)
+                    if token_node_id and node_name == token_node_id:
+                        node_result = (update.get("node_outputs") or {}).get(token_node_id)
                         if node_result and node_result.get("content"):
                             content = node_result["content"]
                             chunk_size = 50
                             for i in range(0, len(content), chunk_size):
                                 yield SSEEvent(
                                     event="token",
-                                    data={
-                                        "nodeId": aggregate_node.id,
-                                        "content": content[i:i + chunk_size],
-                                    },
+                                    data={"nodeId": token_node_id, "content": content[i:i + chunk_size]},
                                 )
                             continue
 
@@ -1249,43 +1205,117 @@ class WorkflowEngine:
                                 "results": update.get("node_outputs", {}),
                             },
                         )
-                    else:
-                        node_id = trace_entry.get("nodeId", node_name)
-                        node_status = trace_entry.get("status", "")
-                        node_ok = trace_entry.get("ok", False)
-                        node_duration = trace_entry.get("durationMs", 0)
-                        logger.info(f"[THINKING] SSE token-stream node_update: id={node_id} status={node_status} ok={node_ok} duration={node_duration}ms")
-                        yield SSEEvent(
-                            event="node_update",
-                            data={
-                                "nodeId": node_id,
-                                "nodeName": trace_entry.get("nodeName", node_name),
-                                "handler": trace_entry.get("handler", ""),
-                                "status": node_status,
-                                "ok": node_ok,
-                                "degraded": trace_entry.get("degraded", False),
-                                "startedAt": trace_entry.get("startedAt", ""),
-                                "completedAt": trace_entry.get("completedAt", ""),
-                                "durationMs": node_duration,
-                            },
-                        )
+                        continue
+                    node_id = trace_entry.get("nodeId", node_name)
+                    node_status = trace_entry.get("status", "")
+                    node_ok = trace_entry.get("ok", False)
+                    node_duration = trace_entry.get("durationMs", 0)
+                    node_degraded = bool(trace_entry.get("degraded", False))
+                    if report_degraded:
+                        if node_degraded:
+                            degraded_reasons.append(f"node:{node_id}")
+                        for _nid, payload in (update.get("node_outputs") or {}).items():
+                            if isinstance(payload, dict) and payload.get("degraded"):
+                                degraded_reasons.append(f"output:{_nid}")
+                            if isinstance(payload, dict) and isinstance(payload.get("data"), dict):
+                                for m in payload["data"].get("missingData") or []:
+                                    degraded_reasons.append(str(m))
+                    logger.info(f"[THINKING] SSE {label} node_update: id={node_id} status={node_status} ok={node_ok} duration={node_duration}ms")
+                    yield SSEEvent(
+                        event="node_update",
+                        data={
+                            "nodeId": node_id,
+                            "nodeName": trace_entry.get("nodeName", node_name),
+                            "handler": trace_entry.get("handler", ""),
+                            "status": node_status,
+                            "ok": node_ok,
+                            "degraded": node_degraded,
+                            "startedAt": trace_entry.get("startedAt", ""),
+                            "completedAt": trace_entry.get("completedAt", ""),
+                            "durationMs": node_duration,
+                        },
+                    )
                 if saw_interrupt:
                     break
 
             if saw_interrupt:
                 return
-            yield SSEEvent(
-                event="workflow_complete",
-                data={"ok": True, "final_state": build_stream_final_state(streamed_state, streamed_outputs)},
-            )
+            complete: dict[str, Any] = {"ok": True}
+            if report_degraded:
+                if degraded_reasons:
+                    yield SSEEvent(
+                        event="degraded",
+                        data={"ok": True, "reasons": list(dict.fromkeys(degraded_reasons))},
+                    )
+                complete["degraded"] = bool(degraded_reasons)
+            complete["final_state"] = build_stream_final_state(streamed_state, streamed_outputs)
+            await self._cleanup_thread(tid)
+            yield SSEEvent(event="workflow_complete", data=complete)
         except GraphInterrupt:
-            yield SSEEvent(
-                event="human_interrupt",
-                data={"message": "Workflow paused for approval", "ok": True, "interrupted": True},
-            )
+            yield _interrupt_event()
+        except WorkflowTimeout as e:
+            logger.error("[THINKING] Workflow %s timed out: thread_id=%s", label, tid)
+            yield SSEEvent(event="error", data={"ok": False, "error": str(e), "code": "WORKFLOW_TIMEOUT"})
         except Exception as e:
-            logger.error(f"[THINKING] Workflow token streaming failed: subject={subject} error={e}")
-            yield SSEEvent(event="error", data={"ok": False, "error": str(e)})
+            logger.error(f"[THINKING] Workflow {label} failed: thread_id={tid} error={e}")
+            yield SSEEvent(event="error", data={"ok": False, "error": str(e), "code": "WORKFLOW_ERROR"})
+        finally:
+            aclose = getattr(stream, "aclose", None)
+            if aclose is not None:
+                try:
+                    await aclose()
+                except Exception:  # noqa: BLE001 - generator already torn down by the timeout
+                    pass
+
+    async def stream_workflow(
+        self,
+        nodes: list[Node],
+        edges: list[Edge],
+        state: dict[str, Any],
+        subject: str,
+        require_approval: bool = False,
+        thread_id: str | None = None,
+    ) -> AsyncIterator[SSEEvent]:
+        """Execute workflow with SSE streaming."""
+        logger.info(f"[THINKING] Workflow streaming starting: subject={subject} nodes={[n.id for n in nodes]} require_approval={require_approval}")
+        graph, tid, config = await self._start_thread(nodes, edges, require_approval, thread_id)
+        async for event in self._stream_events(
+            graph,
+            self._initial_state(state, subject, require_approval),
+            config,
+            state,
+            tid=tid,
+            token_node_id=None,
+            report_degraded=True,
+            label="streaming",
+        ):
+            yield event
+
+    async def stream_workflow_tokens(
+        self,
+        nodes: list[Node],
+        edges: list[Edge],
+        state: dict[str, Any],
+        subject: str,
+        require_approval: bool = False,
+        thread_id: str | None = None,
+    ) -> AsyncIterator[SSEEvent]:
+        graph, tid, config = await self._start_thread(nodes, edges, require_approval, thread_id)
+        aggregate_node = next(
+            (n for n in nodes if n.data.handler == "finance.stock_recommendation_aggregate"),
+            None,
+        )
+        async for event in self._stream_events(
+            graph,
+            self._initial_state(state, subject, require_approval),
+            config,
+            state,
+            tid=tid,
+            token_node_id=aggregate_node.id if aggregate_node else None,
+            report_degraded=False,
+            label="token-stream",
+        ):
+            yield event
 
     async def resume_workflow(
         self,
@@ -1343,19 +1373,21 @@ class WorkflowEngine:
                 require_approval = True
 
         graph = self.build_graph(nodes, edges, require_approval=require_approval)
-        config = {"configurable": {"thread_id": thread_id}}
+        config = self._run_config(thread_id)
 
         try:
             from langgraph.types import Command as LgCommand
-            final_state = await graph.ainvoke(
-                LgCommand(resume=resume_value),
-                config=config,
-                **self._graph_run_kwargs(),
-            )
-            return self._result_from_graph_output(final_state)
+            final_state = await self._ainvoke_guarded(graph, LgCommand(resume=resume_value), config)
+            result = self._result_from_graph_output(final_state)
+            if not result.final_state.get("interrupted"):
+                await self._cleanup_thread(thread_id)
+            return result
         except GraphInterrupt:
             logger.info("[THINKING] Workflow resume paused again: thread_id=%s", thread_id)
             return await self._result_from_interrupt(graph, config, {})
+        except WorkflowTimeout as e:
+            logger.error("[THINKING] Workflow resume timed out: thread_id=%s", thread_id)
+            return WorkflowResult(ok=False, error=str(e), final_state={})
         except Exception as e:
             logger.error(f"[THINKING] Workflow resume failed: thread_id={thread_id} error={e}")
             return WorkflowResult(ok=False, error=str(e), final_state={})
