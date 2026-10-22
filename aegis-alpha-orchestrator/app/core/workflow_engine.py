@@ -13,6 +13,7 @@ from typing_extensions import TypedDict
 
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import StateGraph, START, END
+from langchain_core.runnables import RunnableConfig
 from langgraph.prebuilt import ToolNode
 from langgraph.store.base import BaseStore
 
@@ -91,13 +92,34 @@ def concat_lists(current: list, update: list) -> list:
     return current + update
 
 
+def merge_agent_messages(current: dict, update: dict) -> dict:
+    """Per-agent message channels: concatenate each agent's list independently (P2-8)."""
+    result = dict(current or {})
+    for agent_id, msgs in (update or {}).items():
+        result[agent_id] = list(result.get(agent_id) or []) + list(msgs or [])
+    return result
+
+
+def _last_agent_message(state: dict, agent_id: str) -> Any:
+    msgs = (state.get("agent_messages") or {}).get(agent_id) or []
+    return msgs[-1] if msgs else None
+
+
+def _has_pending_tool_calls(message: Any) -> bool:
+    return bool(message is not None and getattr(message, "tool_calls", None))
+
+
 class WorkflowState(TypedDict):
     final_state: Annotated[dict[str, Any], deep_merge]
     trace: Annotated[list[dict], concat_lists]
     node_outputs: Annotated[dict[str, Any], deep_merge]
     subject: str
     require_approval: bool
+    # Legacy shared channel; no longer written by agents (kept for checkpoint compatibility).
     messages: Annotated[list[Any], concat_lists]
+    # P2-8: tool-loop conversation per general.agent node id, so parallel agents never see
+    # (or route on) each other's tool calls.
+    agent_messages: Annotated[dict[str, list[Any]], merge_agent_messages]
 
 
 
@@ -515,16 +537,17 @@ class WorkflowEngine:
                 if not filtered:
                     continue
                 tools_node_id = f"tools__{node.id}"
-                graph.add_node(tools_node_id, ToolNode(filtered))
+                graph.add_node(tools_node_id, self._agent_tools_fn(ToolNode(filtered), [node.id]))
                 agent_tools_node_ids[node.id] = tools_node_id
                 agent_nodes.append(node.id)
         elif self._tool_node:
-            # Backward compatible: single shared tools node for all agents.
-            graph.add_node("tools", self._tool_node)
+            # Backward compatible: single shared tools node for all agents; it executes each
+            # agent's pending tool calls on that agent's own message channel.
             for node in nodes:
                 if node.data.handler == "general.agent":
                     agent_tools_node_ids[node.id] = "tools"
                     agent_nodes.append(node.id)
+            graph.add_node("tools", self._agent_tools_fn(self._tool_node, list(agent_nodes)))
 
         aggregate_node = next(
             (n for n in nodes if n.data.handler == "finance.stock_recommendation_aggregate"),
@@ -555,20 +578,23 @@ class WorkflowEngine:
             for agent_id in agent_nodes:
                 tools_target = agent_tools_node_ids[agent_id]
 
+                next_nodes = [e.target for e in edges if e.source == agent_id and e.target in node_ids]
+                if not next_nodes:
+                    next_nodes = [END]
+
                 def route_to_tools(
                     state: WorkflowState,
                     _agent_id: str = agent_id,
                     _tools_target: str = tools_target,
-                ) -> str:
-                    messages = state.get("messages", [])
-                    last_msg = messages[-1] if messages else None
-                    if last_msg and hasattr(last_msg, "tool_calls") and last_msg.tool_calls:
+                    _next: tuple = tuple(next_nodes),
+                ) -> Any:
+                    if _has_pending_tool_calls(_last_agent_message(state, _agent_id)):
                         return _tools_target
-                    return _agent_id + "__next"
+                    # Fan out to every successor (P2-8), not only the first one.
+                    if len(_next) == 1:
+                        return _agent_id + "__next"
+                    return list(_next)
 
-                next_nodes = [e.target for e in edges if e.source == agent_id and e.target in node_ids]
-                if not next_nodes:
-                    next_nodes = [END]
                 # Always register __next so route_to_tools return value is valid
                 # whether there is one or many successors (next_nodes defaults to [END]).
                 routing_map: dict[str, Any] = {tools_target: tools_target}
@@ -582,12 +608,13 @@ class WorkflowEngine:
                 for agent_id, tools_node_id in agent_tools_node_ids.items():
                     graph.add_edge(tools_node_id, agent_id)
             else:
-                # Shared tools node: route back via final_state.last_agent_id.
-                def route_after_tools(state: WorkflowState, _agents: list[str] = list(agent_nodes)) -> str:
+                # Shared tools node: route back to every agent whose channel now ends with tool results.
+                def route_after_tools(state: WorkflowState, _agents: list[str] = list(agent_nodes)) -> Any:
+                    ready = [aid for aid in _agents if _is_tool_message(_last_agent_message(state, aid))]
+                    if ready:
+                        return ready if len(ready) > 1 else ready[0]
                     last = (state.get("final_state") or {}).get("last_agent_id")
-                    if last in _agents:
-                        return last
-                    return _agents[0]
+                    return last if last in _agents else _agents[0]
 
                 tools_routing = {aid: aid for aid in agent_nodes}
                 graph.add_conditional_edges("tools", route_after_tools, tools_routing)
@@ -650,6 +677,23 @@ class WorkflowEngine:
         self._put_cached_graph(cache_key, compiled)
         return compiled
 
+    @staticmethod
+    def _agent_tools_fn(tool_node: Any, agent_ids: list[str]):
+        """Run ToolNode on each listed agent's own pending tool calls (P2-8 isolation)."""
+
+        async def tools_fn(state: WorkflowState, config: RunnableConfig) -> dict:
+            updates: dict[str, list[Any]] = {}
+            for agent_id in agent_ids:
+                msgs = list((state.get("agent_messages") or {}).get(agent_id) or [])
+                if not msgs or not _has_pending_tool_calls(msgs[-1]):
+                    continue
+                out = await tool_node.ainvoke({"messages": msgs}, config)
+                produced = out.get("messages", []) if isinstance(out, dict) else list(out or [])
+                updates[agent_id] = list(produced)
+            return {"agent_messages": updates} if updates else {}
+
+        return tools_fn
+
     def _make_node_fn(self, node: Node):
         """Create async function for a graph node."""
         handler = node.data.handler or node.data.function_name or "logic"
@@ -662,7 +706,7 @@ class WorkflowEngine:
             subject = state.get("subject", "Aegis Alpha workflow")
             node_label = node.data.label or node.data.title or node.id
             agent_tools = self._tools_for_node(node) if is_agent_with_tools else []
-            messages = list(state.get("messages") or [])
+            messages = list((state.get("agent_messages") or {}).get(node.id) or [])
             prior_for_tools = _messages_for_tool_continuation(messages)
             mid_tool_loop = bool(prior_for_tools)
 
@@ -866,7 +910,7 @@ class WorkflowEngine:
             )
             # messages reducer concatenates; seed Human only on first loop entry.
             return {
-                "messages": agent_result.messages_to_append,
+                "agent_messages": {node.id: agent_result.messages_to_append},
                 "final_state": {
                     "last_agent_id": node.id,
                     "tool_rounds": {node.id: next_round},
@@ -947,7 +991,7 @@ class WorkflowEngine:
         # Keep final AI text in message history when present (no tool_calls).
         append_msgs = agent_result.messages_to_append
         if append_msgs:
-            out["messages"] = append_msgs
+            out["agent_messages"] = {node.id: append_msgs}
         return out
 
     async def execute_workflow(
@@ -974,6 +1018,7 @@ class WorkflowEngine:
             "subject": subject,
             "require_approval": require_approval,
             "messages": [],
+            "agent_messages": {},
         }
 
         try:
@@ -1018,6 +1063,7 @@ class WorkflowEngine:
             "subject": subject,
             "require_approval": require_approval,
             "messages": [],
+            "agent_messages": {},
         }
 
         degraded_reasons: list[str] = []
@@ -1140,6 +1186,7 @@ class WorkflowEngine:
             "subject": subject,
             "require_approval": require_approval,
             "messages": [],
+            "agent_messages": {},
         }
 
         aggregate_node = next(
