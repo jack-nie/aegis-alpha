@@ -1,5 +1,6 @@
 package com.aegis.alpha.controller;
 
+import com.aegis.alpha.security.AuthenticatedPrincipal;
 import com.aegis.alpha.service.AuthService;
 import com.aegis.alpha.service.help.tool.HelpToolCatalog;
 import com.aegis.alpha.service.help.tool.HelpToolDefinition;
@@ -17,7 +18,8 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * Read-only Help tool listing: catalog, recent audit tail and gateway counters.
+ * Read-only Help tool listing: catalog, recent audit tail (admin: everyone; others: own entries)
+ * and gateway counters.
  */
 @RestController
 @RequestMapping("/_backend/help")
@@ -37,7 +39,8 @@ public class HelpToolsController {
     @GetMapping("/tools")
     public ResponseEntity<Map<String, Object>> tools(
             @RequestHeader(value = "Authorization", required = false) String authorization) {
-        if (!authenticated(authorization)) {
+        AuthenticatedPrincipal principal = principal(authorization);
+        if (principal == null) {
             return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build();
         }
         List<Map<String, Object>> tools = new ArrayList<Map<String, Object>>();
@@ -46,15 +49,19 @@ public class HelpToolsController {
         }
         Map<String, Object> body = new LinkedHashMap<String, Object>();
         body.put("tools", tools);
-        body.put("audit", gateway.audit(AUDIT_LIMIT));
+        /* The audit tail names other users and their errors: admins see all of it, everyone else
+         * only their own entries (field kept for compatibility; 待确认). */
+        body.put("audit", principal.hasRole("admin")
+                ? gateway.audit(AUDIT_LIMIT)
+                : gateway.audit(AUDIT_LIMIT, principal.getUserId() == null ? "" : principal.getUserId()));
         body.put("metrics", gateway.metricsSnapshot());
         return ResponseEntity.ok(body);
     }
 
-    private boolean authenticated(String authorization) {
+    private AuthenticatedPrincipal principal(String authorization) {
         if (authorization == null || authorization.trim().isEmpty()) {
-            return false;
+            return null;
         }
-        return authService.me(authorization) != null;
+        return authService.principal(authorization);
     }
 }
