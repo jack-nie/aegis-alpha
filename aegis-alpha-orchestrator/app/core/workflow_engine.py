@@ -294,6 +294,7 @@ class WorkflowEngine:
     ):
         self._node_executor = node_executor
         self._guardrails = guardrails or GraphGuardrails()
+        self._cache_token = uuid.uuid4().hex
         self._checkpointer = ensure_async_checkpointer(checkpointer)
         self._tools = tools or []
         self._tool_registry = tool_registry
@@ -303,6 +304,14 @@ class WorkflowEngine:
         # Persist layout/flags per thread so resume rebuilds the same graph. Bounded LRU (P2-12);
         # evicted threads fall back to the durable layout in the store.
         self._thread_meta: OrderedDict[str, dict[str, Any]] = OrderedDict()
+
+    def attach_checkpointer(self, checkpointer: Any) -> None:
+        """Swap the checkpointer (lifespan opens the durable one on the serving loop, P2-16).
+
+        Compiled graphs embed their checkpointer, so this engine's cache token is renewed.
+        """
+        self._checkpointer = ensure_async_checkpointer(checkpointer)
+        self._cache_token = uuid.uuid4().hex
 
     def _has_tools_capability(self) -> bool:
         return bool(self._tools) or bool(self._tool_registry)
@@ -646,7 +655,10 @@ class WorkflowEngine:
         topo_hash = self._topology_hash(nodes, edges)
         cache_key = (
             f"{topo_hash}:{require_approval}:"
-            f"{bool(self._tools)}:{bool(self._tool_registry)}"
+            f"{bool(self._tools)}:{bool(self._tool_registry)}:"
+            # Compiled graphs embed this engine's executor, checkpointer and store: never share
+            # them across engine instances or across a checkpointer swap.
+            f"{self._cache_token}"
         )
         cached = self._get_cached_graph(cache_key)
         if cached is not None:
