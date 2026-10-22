@@ -47,6 +47,15 @@ aegis:
     # User-authored layout limits (待确认): prompt/systemPrompt max length; modelName whitelist (empty = any).
     max-prompt-chars: ${AEGIS_ALPHA_WORKFLOW_MAX_PROMPT_CHARS:8000}
     allowed-model-names: ${AEGIS_ALPHA_WORKFLOW_ALLOWED_MODEL_NAMES:}
+    # Bounded workflow executor (streaming runs, async starts).
+    executor:
+      core-size: ${AEGIS_ALPHA_WORKFLOW_EXECUTOR_CORE:4}
+      max-size: ${AEGIS_ALPHA_WORKFLOW_EXECUTOR_MAX:16}
+      queue-capacity: ${AEGIS_ALPHA_WORKFLOW_EXECUTOR_QUEUE:200}
+    stream:
+      # 待确认: when the browser disconnects, false = keep consuming the orchestrator stream so the run
+      # finishes and is recorded (CLIENT_DISCONNECTED event); true = stop reading and cancel the run.
+      cancel-on-disconnect: ${AEGIS_ALPHA_WORKFLOW_STREAM_CANCEL_ON_DISCONNECT:false}
   langchain:
     enabled: ${AEGIS_ALPHA_LANGCHAIN_ENABLED:true}
     engine-url: ${AEGIS_ALPHA_LANGCHAIN_ENGINE_URL:http://127.0.0.1:8787}
