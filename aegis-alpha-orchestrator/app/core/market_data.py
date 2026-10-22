@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
+import copy
 import logging
-from typing import Any
+from contextlib import contextmanager
+from contextvars import ContextVar
+from typing import Any, Iterator
 
 import httpx
 
@@ -14,6 +18,26 @@ logger = logging.getLogger(__name__)
 
 # Handlers that don't need market data hydration
 SKIP_HYDRATION_HANDLERS = {"finance.stock_recommendation_aggregate"}
+
+
+# P2-14: one quote fetch per symbol per workflow run. The engine opens a run scope; parallel
+# branches inherit the same dict (asyncio tasks copy the context, not the dict) and share one
+# in-flight fetch per symbol. Outside a run scope every call fetches as before.
+_run_quote_cache: ContextVar[dict[str, "asyncio.Future[Any]"] | None] = ContextVar(
+    "aegis_run_quote_cache", default=None
+)
+
+
+@contextmanager
+def run_scoped_market_cache() -> Iterator[None]:
+    token = _run_quote_cache.set({})
+    try:
+        yield
+    finally:
+        try:
+            _run_quote_cache.reset(token)
+        except ValueError:  # finalised from another context (e.g. async generator close)
+            _run_quote_cache.set(None)
 
 
 class MarketDataService:
@@ -69,6 +93,23 @@ class MarketDataService:
             }
 
         ticker = resolved["symbol"]
+        cache = _run_quote_cache.get()
+        if cache is None:
+            return await self._fetch_quote(ticker, resolved, node)
+        pending = cache.get(ticker)
+        if pending is None:
+            pending = asyncio.ensure_future(self._fetch_quote(ticker, resolved, node))
+            cache[ticker] = pending
+        else:
+            logger.info("Market data reused within run for %s", ticker)
+        data = await asyncio.shield(pending)
+        if isinstance(data, dict) and data.get("ok") is False:
+            # Do not pin a failure for the rest of the run; a later node may retry.
+            if cache.get(ticker) is pending:
+                cache.pop(ticker, None)
+        return copy.deepcopy(data)
+
+    async def _fetch_quote(self, ticker: str, resolved: dict[str, Any], node: dict[str, Any]) -> dict[str, Any] | None:
         backend_url = self._config.effective_backend_url
 
         try:

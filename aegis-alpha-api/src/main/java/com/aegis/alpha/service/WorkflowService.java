@@ -44,7 +44,8 @@ public class WorkflowService {
     private static final Logger log = LoggerFactory.getLogger(WorkflowService.class);
 
     /** Bump when research default graphs change so stale DB layouts are skipped on read. */
-    static final int CURRENT_RESEARCH_LAYOUT_VERSION = 2;
+    /** 3 = parallel specialist fan-out → fan-in (P2-14); older un-customised defaults are refreshed. */
+    static final int CURRENT_RESEARCH_LAYOUT_VERSION = 3;
     /** Short-lived portfolio:read delegation for orchestrator tool calls (15 minutes). */
     static final long DELEGATED_PORTFOLIO_READ_TTL_MS = 15L * 60L * 1000L;
     static final String SCOPE_PORTFOLIO_READ = "portfolio:read";
@@ -1940,22 +1941,22 @@ public class WorkflowService {
     private List<Map<String, Object>> stockAnalysisNodes() {
         List<Map<String, Object>> nodes = new ArrayList<>();
         nodes.add(flowNode("start", "Start", "start", 80, 260, "scheduler.manual", null));
-        nodes.add(flowNode("fundamentals", "Fundamentals", "agent", 320, 260, "finance.fundamental_analysis", null));
-        nodes.add(flowNode("news", "Industry News", "agent", 560, 260, "finance.industry_news", null));
-        nodes.add(flowNode("valuation", "Valuation", "agent", 800, 260, "finance.valuation_analysis", null));
-        nodes.add(flowNode("risk", "Risk Assessment", "agent", 1040, 260, "finance.risk_assessment", null));
-        nodes.add(flowNode("aggregate", "Recommendation Aggregate", "agent", 1280, 260, "finance.stock_recommendation_aggregate", null));
-        nodes.add(flowNode("end", "End", "end", 1520, 260, "workflow.end", null));
+        nodes.add(flowNode("fundamentals", "Fundamentals", "agent", 340, 80, "finance.fundamental_analysis", null));
+        nodes.add(flowNode("news", "Industry News", "agent", 340, 200, "finance.industry_news", null));
+        nodes.add(flowNode("valuation", "Valuation", "agent", 340, 320, "finance.valuation_analysis", null));
+        nodes.add(flowNode("risk", "Risk Assessment", "agent", 340, 440, "finance.risk_assessment", null));
+        nodes.add(flowNode("aggregate", "Recommendation Aggregate", "agent", 620, 260, "finance.stock_recommendation_aggregate", null));
+        nodes.add(flowNode("end", "End", "end", 880, 260, "workflow.end", null));
         return nodes;
     }
 
     private List<Map<String, Object>> stockAnalysisEdges() {
         List<Map<String, Object>> edges = new ArrayList<>();
-        edges.add(edge("start", "fundamentals"));
-        edges.add(edge("fundamentals", "news"));
-        edges.add(edge("news", "valuation"));
-        edges.add(edge("valuation", "risk"));
-        edges.add(edge("risk", "aggregate"));
+        /* Parallel specialists fan in to the aggregate (orchestrator defers the join). */
+        for (String specialist : Arrays.asList("fundamentals", "news", "valuation", "risk")) {
+            edges.add(edge("start", specialist));
+            edges.add(edge(specialist, "aggregate"));
+        }
         edges.add(edge("aggregate", "end"));
         return edges;
     }
@@ -2184,19 +2185,19 @@ public class WorkflowService {
     private List<Map<String, Object>> earningsReactionNodes() {
         List<Map<String, Object>> nodes = new ArrayList<>();
         nodes.add(flowNode("start", "Start", "start", 80, 260, "scheduler.manual", null));
-        nodes.add(flowNode("market_analysis", "Market Reaction", "agent", 320, 260, "finance.market_analysis", null));
-        nodes.add(flowNode("financial_interpretation", "Earnings Interpretation", "agent", 560, 260, "finance.financial_interpretation", null));
-        nodes.add(flowNode("industry_news", "Industry & Guidance News", "agent", 800, 260, "finance.industry_news", null));
-        nodes.add(flowNode("aggregate", "Earnings Recommendation", "agent", 1040, 260, "finance.stock_recommendation_aggregate", null));
-        nodes.add(flowNode("end", "End", "end", 1280, 260, "workflow.end", null));
+        nodes.add(flowNode("market_analysis", "Market Reaction", "agent", 340, 140, "finance.market_analysis", null));
+        nodes.add(flowNode("financial_interpretation", "Earnings Interpretation", "agent", 340, 260, "finance.financial_interpretation", null));
+        nodes.add(flowNode("industry_news", "Industry & Guidance News", "agent", 340, 380, "finance.industry_news", null));
+        nodes.add(flowNode("aggregate", "Earnings Recommendation", "agent", 620, 260, "finance.stock_recommendation_aggregate", null));
+        nodes.add(flowNode("end", "End", "end", 880, 260, "workflow.end", null));
         return nodes;
     }
     private List<Map<String, Object>> earningsReactionEdges() {
         List<Map<String, Object>> edges = new ArrayList<>();
-        edges.add(edge("start", "market_analysis"));
-        edges.add(edge("market_analysis", "financial_interpretation"));
-        edges.add(edge("financial_interpretation", "industry_news"));
-        edges.add(edge("industry_news", "aggregate"));
+        for (String specialist : Arrays.asList("market_analysis", "financial_interpretation", "industry_news")) {
+            edges.add(edge("start", specialist));
+            edges.add(edge(specialist, "aggregate"));
+        }
         edges.add(edge("aggregate", "end"));
         return edges;
     }
@@ -2205,17 +2206,18 @@ public class WorkflowService {
     private List<Map<String, Object>> watchlistDigestNodes() {
         List<Map<String, Object>> nodes = new ArrayList<>();
         nodes.add(flowNode("start", "Start", "start", 80, 260, "scheduler.manual", null));
-        nodes.add(flowNode("market_analysis", "Watchlist Market Snapshot", "agent", 320, 260, "finance.market_analysis", null));
-        nodes.add(flowNode("industry_news", "Watchlist News", "agent", 560, 260, "finance.industry_news", null));
-        nodes.add(flowNode("risk_assessment", "Digest Risk Summary", "agent", 800, 260, "finance.risk_assessment", null));
-        nodes.add(flowNode("end", "End", "end", 1040, 260, "workflow.end", null));
+        nodes.add(flowNode("market_analysis", "Watchlist Market Snapshot", "agent", 340, 180, "finance.market_analysis", null));
+        nodes.add(flowNode("industry_news", "Watchlist News", "agent", 340, 340, "finance.industry_news", null));
+        nodes.add(flowNode("risk_assessment", "Digest Risk Summary", "agent", 620, 260, "finance.risk_assessment", null));
+        nodes.add(flowNode("end", "End", "end", 880, 260, "workflow.end", null));
         return nodes;
     }
     private List<Map<String, Object>> watchlistDigestEdges() {
         List<Map<String, Object>> edges = new ArrayList<>();
-        edges.add(edge("start", "market_analysis"));
-        edges.add(edge("market_analysis", "industry_news"));
-        edges.add(edge("industry_news", "risk_assessment"));
+        for (String specialist : Arrays.asList("market_analysis", "industry_news")) {
+            edges.add(edge("start", specialist));
+            edges.add(edge(specialist, "risk_assessment"));
+        }
         edges.add(edge("risk_assessment", "end"));
         return edges;
     }

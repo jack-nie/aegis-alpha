@@ -62,7 +62,7 @@ class WorkflowServiceDefaultLayoutTest {
                 "finance.risk_assessment",
                 "finance.stock_recommendation_aggregate",
                 "workflow.end");
-        assertThat(edgeCount(layout)).isEqualTo(6);
+        assertThat(edgeCount(layout)).isEqualTo(9);  // P2-14: 4 fan-out + 4 fan-in + aggregate→end
         assertResearchMetadata(layout, "fan_in_aggregate");
     }
 
@@ -79,7 +79,7 @@ class WorkflowServiceDefaultLayoutTest {
                 "finance.financial_interpretation",
                 "finance.industry_news",
                 "finance.stock_recommendation_aggregate");
-        assertThat(edgeCount(layout)).isEqualTo(5);
+        assertThat(edgeCount(layout)).isEqualTo(7);  // 3 fan-out + 3 fan-in + aggregate→end
         assertResearchMetadata(layout, "earnings_reaction");
     }
 
@@ -96,12 +96,12 @@ class WorkflowServiceDefaultLayoutTest {
                 "finance.industry_news",
                 "finance.risk_assessment");
         assertThat(handlers(layout)).doesNotContain("finance.stock_recommendation_aggregate");
-        assertThat(edgeCount(layout)).isEqualTo(4);
+        assertThat(edgeCount(layout)).isEqualTo(5);  // 2 fan-out + 2 fan-in + risk→end
         assertResearchMetadata(layout, "watchlist_digest");
     }
 
     @Test
-    void researchDefaultsExposeLayoutVersionTwo() {
+    void researchDefaultsExposeCurrentLayoutVersion() {
         for (String key : Arrays.asList("stock_analysis", "earnings_reaction", "watchlist_digest")) {
             stubDefinition(key, key);
             Map<String, Object> layout = service.layout(key);
@@ -129,12 +129,12 @@ class WorkflowServiceDefaultLayoutTest {
 
         assertThat(nodeIds(layout)).containsExactly(
                 "start", "fundamentals", "news", "valuation", "risk", "aggregate", "end");
-        assertThat(layoutVersion(layout)).isEqualTo(2);
+        assertThat(layoutVersion(layout)).isEqualTo(3);
         assertThat(layout.get("updatedAt")).isEqualTo("2026-01-01 00:00:00");
     }
 
     @Test
-    void researchLayoutWithVersionTwoIsPreserved() throws Exception {
+    void researchLayoutWithCurrentVersionIsPreserved() throws Exception {
         stubDefinition("stock_analysis", "Stock Analysis");
         Map<String, Object> stored = new LinkedHashMap<String, Object>();
         stored.put("workflowKey", "stock_analysis");
@@ -151,7 +151,7 @@ class WorkflowServiceDefaultLayoutTest {
         edges.add(edge);
         stored.put("edges", edges);
         Map<String, Object> metadata = new LinkedHashMap<String, Object>();
-        metadata.put("layoutVersion", 2);
+        metadata.put("layoutVersion", 3);
         metadata.put("pattern", "fan_in_aggregate");
         stored.put("metadata", metadata);
 
@@ -164,7 +164,44 @@ class WorkflowServiceDefaultLayoutTest {
         Map<String, Object> layout = service.layout("stock_analysis");
 
         assertThat(nodeIds(layout)).containsExactly("start", "end");
-        assertThat(layoutVersion(layout)).isEqualTo(2);
+        assertThat(layoutVersion(layout)).isEqualTo(3);
+    }
+
+    // P2-14: a stored, non-custom version-2 (sequential) default is refreshed to the parallel layout.
+    @Test
+    @SuppressWarnings("unchecked")
+    void versionTwoSequentialDefaultIsRefreshedToParallel() throws Exception {
+        stubDefinition("stock_analysis", "Stock Analysis");
+        Map<String, Object> stored = new LinkedHashMap<String, Object>();
+        stored.put("workflowKey", "stock_analysis");
+        List<Map<String, Object>> nodes = new ArrayList<Map<String, Object>>();
+        nodes.add(simpleNode("start", "scheduler.manual", "Start", "start"));
+        nodes.add(simpleNode("end", "workflow.end", "End", "end"));
+        stored.put("nodes", nodes);
+        stored.put("edges", Collections.emptyList());
+        Map<String, Object> metadata = new LinkedHashMap<String, Object>();
+        metadata.put("layoutVersion", 2);
+        stored.put("metadata", metadata);
+        WorkflowLayout record = new WorkflowLayout();
+        record.setWorkflowKey("stock_analysis");
+        record.setLayoutJson(objectMapper.writeValueAsString(stored));
+        when(mapper.findLayout("stock_analysis")).thenReturn(record);
+
+        Map<String, Object> layout = service.layout("stock_analysis");
+
+        assertThat(layoutVersion(layout)).isEqualTo(3);
+        List<String> fromStart = new ArrayList<String>();
+        List<String> intoAggregate = new ArrayList<String>();
+        for (Map<String, Object> edge : (List<Map<String, Object>>) layout.get("edges")) {
+            if ("start".equals(edge.get("source"))) {
+                fromStart.add(String.valueOf(edge.get("target")));
+            }
+            if ("aggregate".equals(edge.get("target"))) {
+                intoAggregate.add(String.valueOf(edge.get("source")));
+            }
+        }
+        assertThat(fromStart).containsExactlyInAnyOrder("fundamentals", "news", "valuation", "risk");
+        assertThat(intoAggregate).containsExactlyInAnyOrder("fundamentals", "news", "valuation", "risk");
     }
 
     @Test
