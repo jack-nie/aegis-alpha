@@ -83,6 +83,24 @@ public interface WorkflowMapper {
     @Update("update workflow_run set status = #{status}, started_at = #{startedAt}, completed_at = #{completedAt}, result_json = #{resultJson}, error_message = #{errorMessage}, node_count = #{nodeCount}, control_status = #{controlStatus}, pause_requested = coalesce(#{pauseRequested}, 0), cancel_requested = coalesce(#{cancelRequested}, 0) where run_id = #{runId}")
     void updateRun(WorkflowRun run);
 
+    /**
+     * Conditional run update (P2-17): writes only while the stored status is one of
+     * {@code expectedStatuses} and, when {@code requireNoCancel}, no cancellation was requested.
+     * Returns the rows changed (0 = the run moved on concurrently, e.g. cancelled).
+     */
+    @Update({"<script>",
+            "update workflow_run set status = #{run.status}, completed_at = #{run.completedAt},",
+            " result_json = #{run.resultJson}, error_message = #{run.errorMessage}, node_count = #{run.nodeCount},",
+            " control_status = #{run.controlStatus}, pause_requested = coalesce(#{run.pauseRequested}, 0),",
+            " cancel_requested = coalesce(#{run.cancelRequested}, 0)",
+            " where run_id = #{run.runId} and status in",
+            " <foreach collection='expectedStatuses' item='s' open='(' separator=',' close=')'>#{s}</foreach>",
+            " <if test='requireNoCancel'> and coalesce(cancel_requested, 0) = 0</if>",
+            "</script>"})
+    int updateRunStatusIf(@Param("run") WorkflowRun run,
+                          @Param("expectedStatuses") List<String> expectedStatuses,
+                          @Param("requireNoCancel") boolean requireNoCancel);
+
     /** Compare-and-set on control_status; returns the number of rows changed (0 = lost the race). */
     @Update("update workflow_run set control_status = #{toStatus} where run_id = #{runId} and control_status = #{fromStatus}")
     int transitionControlStatus(@Param("runId") String runId,
