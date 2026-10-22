@@ -150,9 +150,9 @@ class KnowledgeServiceHybridTest {
     }
 
     @Test
-    void cjkBigramVectorRetrievesDocsWithoutKeywordHit() {
-        // The legacy keyword tokenizer sees "如何发布工作流" as one glued Han run and scores 0;
-        // the CJK bigram vector space still finds the document.
+    void cjkBigramsHitBothKeywordAndVectorRetrieval() {
+        // P2-1: the keyword tokenizer now emits CJK bigrams too (it used to glue "如何发布工作流"
+        // into one Han run and score 0), so both retrievers rank the document first.
         KnowledgeService service = serviceWith(
                 publicDoc("cn-doc", "工作流发布操作说明",
                         "画布编辑中的草稿需要先发布才能被生产对话触发。")
@@ -162,13 +162,13 @@ class KnowledgeServiceHybridTest {
 
         assertThat(ids(result)).containsExactly("cn-doc");
         KnowledgeService.KnowledgeHit hit = result.getHits().get(0);
-        assertThat(hit.getKeywordScore()).isEqualTo(0d);
-        assertThat(hit.getKeywordRank()).isZero();
+        assertThat(hit.getKeywordScore()).isGreaterThan(0d);
+        assertThat(hit.getKeywordRank()).isEqualTo(1);
         assertThat(hit.getVectorRank()).isEqualTo(1);
         assertThat(hit.getVectorScore()).isGreaterThan(0d);
-        assertThat(hit.getFusedScore()).isCloseTo(0.6d / 61d, within(1e-12));
+        assertThat(hit.getFusedScore()).isCloseTo(0.6d / 61d + 0.4d / 61d, within(1e-12));
 
-        assertThat(result.getKeywordCandidates()).isZero();
+        assertThat(result.getKeywordCandidates()).isEqualTo(1);
         assertThat(result.getVectorCandidates()).isEqualTo(1);
         assertThat(result.getFusedCandidates()).isEqualTo(1);
         assertThat(result.isReranked()).isTrue();
