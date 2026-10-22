@@ -98,6 +98,24 @@ public class HelpRoutingService {
             return empty;
         }
 
+        // 0) Safety boundary (P2-6): approve-on-behalf / trade / cross-tenant requests never reach
+        //    the LLM classifier and never dispatch a workflow, whatever the model would say.
+        HelpSafetyRules.Category safety = HelpSafetyRules.classify(text);
+        if (safety != HelpSafetyRules.Category.NONE) {
+            HelpIntent.Result guarded = HelpIntent.Result.empty();
+            guarded.setTicker(entities.getTicker());
+            guarded.setConfidence(1.0);
+            guarded.setSource("safety_rule");
+            guarded.setDomain(HelpIntent.Domain.PRODUCT_HELP);
+            guarded.setComplexity(HelpIntent.Complexity.L0);
+            guarded.setRouteAction(HelpIntent.RouteAction.PLAYBOOK);
+            guarded.setPlaybookId(safety == HelpSafetyRules.Category.APPROVE_ON_BEHALF ? "approval-inbox" : null);
+            guarded.setEntities(entities);
+            guarded.setCacheable(false);
+            guarded.setReason("Safety rule: " + safety.name());
+            return guarded;
+        }
+
         boolean runIdInText = RUN_ID_PATTERN.matcher(text).find();
         boolean diagnosisWords = containsAny(text, DIAGNOSIS_HINTS);
         boolean helpWords = containsAny(text, HELP_HINTS);
