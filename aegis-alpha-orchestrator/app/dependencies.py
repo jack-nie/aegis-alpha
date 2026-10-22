@@ -8,7 +8,7 @@ from .core.market_data import MarketDataService
 from .core.memory_store import MemoryStoreManager
 from .core.node_executor import NodeExecutor
 from .core.tool_registry import create_tool_registry
-from .core.workflow_engine import WorkflowEngine
+from .core.workflow_engine import WorkflowEngine, GraphGuardrails
 from .core.intent_classifier import IntentClassifier
 
 os.makedirs(settings.data_dir, exist_ok=True)
@@ -34,5 +34,6 @@ workflow_engine = WorkflowEngine(
     tool_registry=tool_registry,
     store=memory_store_manager.store,
     checkpointer=_checkpointer,
+    guardrails=GraphGuardrails.from_settings(settings),
 )
 intent_classifier = IntentClassifier(llm_client)
