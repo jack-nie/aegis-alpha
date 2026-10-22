@@ -222,6 +222,55 @@ class WorkflowTimeout(Exception):
         self.seconds = seconds
 
 
+APPROVED_CONCLUSION_KEY = "approved_conclusion"
+_CONCLUSION_LABELS = {"BUY", "HOLD", "SELL", "WATCH"}
+
+
+def approved_conclusion_payload(
+    result: WorkflowResult, nodes: list[Node], thread_id: str
+) -> tuple[str, dict[str, Any]] | None:
+    """P2-15: the ``approved_conclusion`` memory entry for an approved run, or None.
+
+    Written only when the human approved, the aggregate finished ok, and the aggregate's
+    recommendation policy ran and passed (policy block present, not degraded, a definite label,
+    at least one evidence-bound claim). Rejections and policy-failing drafts write nothing.
+    """
+    final = result.final_state or {}
+    if final.get("approval_status") != "approved" or final.get("interrupted"):
+        return None
+    symbol = str(final.get("ticker") or final.get("symbol") or "").strip()
+    aggregate = next((n for n in nodes if n.data.handler == "finance.stock_recommendation_aggregate"), None)
+    if not symbol or aggregate is None:
+        return None
+    output = (result.node_outputs or {}).get(aggregate.id)
+    if not isinstance(output, dict) or output.get("ok") is False:
+        return None
+    data = output.get("data") if isinstance(output.get("data"), dict) else {}
+    label = str(data.get("recommendation") or "").upper()
+    claims = [
+        {"text": str(c.get("text") or "")[:200], "evidenceId": str(c.get("evidenceId"))}
+        for c in (data.get("claims") or [])
+        if isinstance(c, dict) and c.get("evidenceId")
+    ]
+    if (
+        not isinstance(data.get("policy"), dict)
+        or data.get("degraded")
+        or output.get("degraded")
+        or label not in _CONCLUSION_LABELS
+        or not claims
+    ):
+        return None
+    summary = str(output.get("summary") or "").strip()
+    return symbol, {
+        "summary": summary[:600] or f"[{label}]",
+        "recommendation": label,
+        "confidence": data.get("confidence"),
+        "claims": claims[:10],
+        "threadId": thread_id,
+        "approvedAt": datetime.now(timezone.utc).isoformat(),
+    }
+
+
 def _interrupt_event() -> SSEEvent:
     return SSEEvent(
         event="human_interrupt",
@@ -356,6 +405,25 @@ class WorkflowEngine:
                 )
         except asyncio.TimeoutError:
             raise WorkflowTimeout(self._guardrails.timeout_seconds) from None
+
+    async def _store_approved_conclusion(
+        self, result: WorkflowResult, nodes: list[Node], thread_id: str
+    ) -> None:
+        if self._store is None:
+            return
+        entry = approved_conclusion_payload(result, nodes, thread_id)
+        if entry is None:
+            logger.info("[THINKING] Approved run wrote no conclusion (policy gate) thread_id=%s", thread_id)
+            return
+        symbol, payload = entry
+        try:
+            # ttl 0 = no expiry for approved conclusions (same as MemoryStoreManager).
+            await self._store.aput(("ticker", symbol), APPROVED_CONCLUSION_KEY, payload, ttl_seconds=0)
+        except TypeError:
+            await self._store.aput(("ticker", symbol), APPROVED_CONCLUSION_KEY, payload)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[THINKING] approved_conclusion write failed thread_id=%s error=%s",
+                           thread_id, type(exc).__name__)
 
     async def _cleanup_thread(self, thread_id: str) -> None:
         """Drop checkpoint + layout of a thread that reached a terminal state (opt-in)."""
@@ -1392,6 +1460,8 @@ class WorkflowEngine:
             final_state = await self._ainvoke_guarded(graph, LgCommand(resume=resume_value), config)
             result = self._result_from_graph_output(final_state)
             if not result.final_state.get("interrupted"):
+                if is_explicit_approval(resume_value):
+                    await self._store_approved_conclusion(result, nodes, thread_id)
                 await self._cleanup_thread(thread_id)
             return result
         except GraphInterrupt:
