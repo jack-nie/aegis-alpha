@@ -28,6 +28,9 @@ REGEX_RULES: tuple[tuple[str, str, bool], ...] = (
     ("sector-analyst-workflow", r"分析.{0,20}(?:板块|行业)|(?:板块|行业).{0,10}分析", False),
 )
 _COMPILED_REGEX_RULES = tuple((key, re.compile(pattern), ticker) for key, pattern, ticker in REGEX_RULES)
+# P2-7: function the model calls for requests unrelated to research / the product.
+OUT_OF_SCOPE_FUNCTION = "out_of_scope"
+OUT_OF_SCOPE_DOMAIN = "OUT_OF_SCOPE"
 _TICKER_RE = re.compile(r"\b([A-Z]{1,5}(?:\.[A-Z]{2})?)\b")
 
 
@@ -88,6 +91,16 @@ class IntentClassifier:
                 ticker = result.get("ticker", "") or None
                 if ticker is not None and not str(ticker).strip():
                     ticker = None
+
+                if function_name == OUT_OF_SCOPE_FUNCTION and OUT_OF_SCOPE_FUNCTION not in function_name_map:
+                    return IntentResult(
+                        workflow_key=None,
+                        ticker=None,
+                        confidence=self._model_confidence(result.get("confidence")),
+                        source="llm_out_of_scope",
+                        domain=OUT_OF_SCOPE_DOMAIN,
+                        data={"domain": OUT_OF_SCOPE_DOMAIN},
+                    )
 
                 # Look up original key; never reverse-munge underscores/hyphens
                 workflow_key = function_name_map.get(function_name)
@@ -174,6 +187,25 @@ class IntentClassifier:
                     },
                 }
             )
+        tools.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": OUT_OF_SCOPE_FUNCTION,
+                    "description": (
+                        "Call when the request is unrelated to investment research, workflows or this "
+                        "product (e.g. poems, jokes, weather, recipes). Do not call for market questions."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                        },
+                        "required": ["confidence"],
+                    },
+                },
+            }
+        )
         return tools, function_name_map
 
     def _keyword_fallback(

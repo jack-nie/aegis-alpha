@@ -181,6 +181,15 @@ public class ChatService {
         applyPreferredDomain(body, intent);
         applySessionRunId(intent, session);
 
+        /* Out of scope: fixed decline, never the Copilot LLM (P2-7) */
+        if (intent.getDomain() == HelpIntent.Domain.OUT_OF_SCOPE) {
+            Map<String, Object> declined = helpService.outOfScope(threadId, intent);
+            markTrace(trace, intent, text(declined, "provider", "help-out-of-scope"), false, false);
+            persistAssistant(threadId, text(declined, "content", ""));
+            recordSession(threadId, principal, session, message, intent, declined, false);
+            return declined;
+        }
+
         /* Public help answer cache (entity-gated; never private run/portfolio) */
         if (helpAnswerCacheService != null) {
             Map<String, Object> cached = helpAnswerCacheService.getIfAllowed(message, intent, principal);

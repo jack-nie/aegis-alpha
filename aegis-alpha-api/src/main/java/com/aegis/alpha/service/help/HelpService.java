@@ -450,6 +450,19 @@ public class HelpService {
     /**
      * Safety refusals for approve/trade style prompts (no side-effect tools).
      */
+    /** P2-7: fixed polite decline for out-of-scope requests (no LLM call). */
+    public Map<String, Object> outOfScope(String threadId, HelpIntent.Result intent) {
+        String body = "这个问题超出了我的服务范围。我可以帮你：\n"
+                + "- 研究个股、板块或财报（例如「分析一下 NVDA」）\n"
+                + "- 解答产品使用问题（例如「如何发布工作流」）\n"
+                + "- 诊断工作流运行（附上 runId）";
+        Map<String, Object> response = buildResponse(threadId, body, intent, "help-out-of-scope",
+                HelpIntent.RouteAction.DECLINE, sourceRef("playbook", "out-of-scope", "服务范围", null), false, null);
+        response.put("ok", true);
+        response.put("escalateHuman", false);
+        return response;
+    }
+
     public Map<String, Object> safetyRefuse(String threadId, String message, HelpIntent.Result intent) {
         String body;
         switch (HelpSafetyRules.classify(message)) {
