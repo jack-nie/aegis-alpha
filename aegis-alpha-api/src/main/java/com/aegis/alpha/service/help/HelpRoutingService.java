@@ -62,6 +62,30 @@ public class HelpRoutingService {
     }
 
     public HelpIntent.Result classifyExtended(String message, HelpIntent.PageContext pageContext) {
+        return classifyExtended(message, pageContext, null);
+    }
+
+    /** Routes and emits one structured {@code aegis.routing} log line (no message text). */
+    public HelpIntent.Result classifyExtended(String message, HelpIntent.PageContext pageContext, String traceId) {
+        long started = System.nanoTime();
+        RoutingTelemetry.Call call = RoutingTelemetry.begin();
+        HelpIntent.Result result = null;
+        try {
+            result = classifyInternal(message, pageContext);
+            return result;
+        } finally {
+            RoutingTelemetry.end();
+            long latencyMs = (System.nanoTime() - started) / 1_000_000L;
+            RoutingTelemetry.logRoute(traceId,
+                    result == null || result.getDomain() == null ? "error" : result.getDomain().name(),
+                    result == null || result.getRouteAction() == null ? "error" : result.getRouteAction().name(),
+                    result == null ? "error" : result.getSource(),
+                    result == null ? 0d : result.getConfidence(),
+                    latencyMs, call.isLlmUsed(), call.isCacheHit(), message);
+        }
+    }
+
+    private HelpIntent.Result classifyInternal(String message, HelpIntent.PageContext pageContext) {
         HelpIntent.PageContext page = pageContext == null ? new HelpIntent.PageContext() : pageContext;
         String text = message == null ? "" : message.trim();
         HelpIntent.Entities entities = extractEntities(text, page);
