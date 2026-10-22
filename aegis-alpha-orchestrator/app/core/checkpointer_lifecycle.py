@@ -1,4 +1,11 @@
-"""Process-lifetime SqliteSaver holder.
+"""Process-lifetime checkpointer holders.
+
+P2-16: production uses ``AsyncSqliteSaver`` (aiosqlite), opened inside the FastAPI lifespan
+because it binds to the running event loop: :func:`open_async_checkpointer` /
+:func:`close_async_checkpointer`. The sync ``SqliteSaver`` holder plus
+:class:`SyncCheckpointAsyncAdapter` below are kept for callers without a running loop (legacy).
+
+Legacy notes (sync holder):
 
 SqliteSaver.from_conn_string is a context manager. Enter it once and keep the
 yielded saver until shutdown. Do not wrap the import in a with-block that
@@ -118,3 +125,43 @@ def close_checkpointer() -> None:
     _saver = None
     if context_manager is not None:
         context_manager.__exit__(None, None, None)
+
+
+_async_context_manager: Any = None
+_async_saver: Any = None
+
+
+async def open_async_checkpointer(db_path: str) -> Any:
+    """Enter ``AsyncSqliteSaver.from_conn_string`` once per process and run its table setup.
+
+    Must be awaited on the serving event loop (FastAPI lifespan). Repeated calls return the
+    already-open saver. Raises ImportError when langgraph-checkpoint-sqlite / aiosqlite is missing.
+    """
+    global _async_context_manager, _async_saver
+    if _async_saver is not None:
+        return _async_saver
+
+    from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+
+    parent = os.path.dirname(db_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    context_manager = AsyncSqliteSaver.from_conn_string(db_path)
+    saver = await context_manager.__aenter__()
+    try:
+        await saver.setup()
+    except Exception:
+        await context_manager.__aexit__(None, None, None)
+        raise
+    _async_context_manager, _async_saver = context_manager, saver
+    return saver
+
+
+async def close_async_checkpointer() -> None:
+    """Close the AsyncSqliteSaver connection opened by :func:`open_async_checkpointer`."""
+    global _async_context_manager, _async_saver
+    context_manager = _async_context_manager
+    _async_context_manager = None
+    _async_saver = None
+    if context_manager is not None:
+        await context_manager.__aexit__(None, None, None)
