@@ -187,6 +187,35 @@ class WorkflowServiceStreamingControlTest {
         assertThat(hasEvent("RUN_COMPLETED")).isFalse();
     }
 
+    /* ---------------- P2-18 ---------------- */
+
+    @Test
+    void humanInterruptCompletesEmitterAndRunStaysWaiting() throws Exception {
+        serve("event: node_update\ndata: {\"nodeId\":\"market\",\"status\":\"completed\",\"ok\":true}\n\n"
+                + "event: human_interrupt\ndata: {\"ok\":true,\"interrupted\":true}\n\n", null, null);
+        RecordingEmitter emitter = new RecordingEmitter();
+
+        service.startWithStreaming("daily", "s", inputs(), emitter);
+
+        assertThat(emitter.names).containsExactly("node_update", "human_interrupt");
+        assertThat(emitter.completed).isTrue();
+        assertThat(emitter.completeCalls.get()).isEqualTo(1);
+        assertThat(storedRun.get().getStatus()).isEqualTo("PAUSED");
+        assertThat(storedRun.get().getControlStatus()).isEqualTo("HUMAN_INTERRUPT");
+        assertThat(hasEvent("RUN_COMPLETED")).isFalse();
+    }
+
+    @Test
+    void streamEndingWithoutTerminalEventStillEndsClientStream() throws Exception {
+        serve("event: node_update\ndata: {\"nodeId\":\"market\",\"status\":\"completed\",\"ok\":true}\n\n", null, null);
+        RecordingEmitter emitter = new RecordingEmitter();
+
+        service.startWithStreaming("daily", "s", inputs(), emitter);
+
+        assertThat(emitter.completed).isTrue();
+        assertThat(storedRun.get().getStatus()).isEqualTo("COMPLETED");
+    }
+
     static WorkflowRun copy(WorkflowRun source) {
         WorkflowRun copy = new WorkflowRun();
         copy.setRunId(source.getRunId());
@@ -211,6 +240,7 @@ class WorkflowServiceStreamingControlTest {
         final List<String> names = new CopyOnWriteArrayList<>();
         volatile boolean completed;
         volatile boolean failSends;
+        final java.util.concurrent.atomic.AtomicInteger completeCalls = new java.util.concurrent.atomic.AtomicInteger();
 
         RecordingEmitter() {
             super(30_000L);
@@ -232,6 +262,7 @@ class WorkflowServiceStreamingControlTest {
         @Override
         public synchronized void complete() {
             completed = true;
+            completeCalls.incrementAndGet();
         }
 
         @Override

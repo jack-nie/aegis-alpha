@@ -613,8 +613,20 @@ public class WorkflowService {
             streamLayoutNodes.put(nodeId(layoutNode), layoutNode);
         }
         final SseStreamReader.Handle readerHandle = new SseStreamReader.Handle();
+        final java.util.concurrent.atomic.AtomicBoolean emitterClosed = new java.util.concurrent.atomic.AtomicBoolean(false);
         SseStreamReader.readSse(streamUrl, streamBody, langChainGateway.serviceAuthorizationHeader(),
                 new SseStreamReader.SseEventHandler() {
+            /* P2-18: every terminal or paused outcome ends the client stream exactly once. */
+            private void closeEmitter() {
+                if (emitterClosed.compareAndSet(false, true)) {
+                    try {
+                        emitter.complete();
+                    } catch (Exception ignored) {
+                        // already completed by the container
+                    }
+                }
+            }
+
             /* P2-17: re-read before acting; a cancel requested meanwhile ends the stream as CANCELLED. */
             private boolean stopIfCancelled() {
                 WorkflowRun latest = mapper.findRun(runId);
@@ -671,6 +683,8 @@ public class WorkflowService {
                                 "Workflow paused for human interrupt (streaming).", payload, 950000);
                         emitter.send(org.springframework.web.servlet.mvc.method.annotation.SseEmitter.event()
                                 .name("human_interrupt").data(data == null ? "{}" : data));
+                        /* The run waits for approval (resumed via decideApproval), not on this stream. */
+                        closeEmitter();
                     } else if ("workflow_complete".equals(eventName)) {
                         if ("HUMAN_INTERRUPT".equals(run.getControlStatus())) {
                             return;
@@ -709,7 +723,7 @@ public class WorkflowService {
                                 : data;
                         emitter.send(org.springframework.web.servlet.mvc.method.annotation.SseEmitter.event()
                                 .name("workflow_complete").data(completeData));
-                        emitter.complete();
+                        closeEmitter();
                     } else if ("error".equals(eventName)) {
                         JsonNode en = objectMapper.readTree(data);
                         run.setStatus("FAILED");
@@ -721,7 +735,7 @@ public class WorkflowService {
                         }
                         recordRunEvent(run, "RUN_FAILED", null, null, "FAILED", run.getErrorMessage(), null, 1000000);
                         emitter.send(org.springframework.web.servlet.mvc.method.annotation.SseEmitter.event().name("error").data(data));
-                        emitter.complete();
+                        closeEmitter();
                     }
                 } catch (Exception ex) {
                     try {
@@ -753,6 +767,7 @@ public class WorkflowService {
                     finishStreamingAsCancelled(run, emitter, readerHandle);
                     return;
                 }
+                /* P2-18: PAUSED / HUMAN_INTERRUPT and any other final state also end the client stream. */
                 if (latest != null && "RUNNING".equals(latest.getStatus())) {
                     latest.setStatus("COMPLETED"); latest.setCompletedAt(now());
                     latest.setControlStatus("COMPLETED");
@@ -762,6 +777,7 @@ public class WorkflowService {
                         materializeStreamingCompletedRun(runId, safeInputs);
                     }
                 }
+                closeEmitter();
             }
         }, readerHandle);
         return mapper.findRun(runId);
