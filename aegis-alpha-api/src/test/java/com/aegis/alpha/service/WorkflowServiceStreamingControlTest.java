@@ -216,6 +216,93 @@ class WorkflowServiceStreamingControlTest {
         assertThat(storedRun.get().getStatus()).isEqualTo("COMPLETED");
     }
 
+    /* ---------------- P2-19 ---------------- */
+
+    private long eventCount(String type) {
+        long count = 0;
+        for (WorkflowRunEvent event : events) {
+            if (type.equals(event.getEventType())) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    @Test
+    void failingClientSendsDoNotFailTheRun() throws Exception {
+        serve("event: node_update\ndata: {\"nodeId\":\"market\",\"status\":\"completed\",\"ok\":true}\n\n"
+                + "event: node_update\ndata: {\"nodeId\":\"news\",\"status\":\"completed\",\"ok\":true}\n\n"
+                + "event: workflow_complete\ndata: {\"ok\":true,\"final_state\":{}}\n\n", null, null);
+        RecordingEmitter emitter = new RecordingEmitter();
+        emitter.failSends = true;
+
+        service.startWithStreaming("daily", "s", inputs(), emitter);
+
+        assertThat(storedRun.get().getStatus()).isEqualTo("COMPLETED");
+        assertThat(eventCount("CLIENT_DISCONNECTED")).isEqualTo(1);
+        assertThat(hasEvent("RUN_FAILED")).isFalse();
+        assertThat(hasEvent("RUN_COMPLETED")).isTrue();
+    }
+
+    @Test
+    void clientTimeoutByDefaultLetsTheRunFinish() throws Exception {
+        CountDownLatch gate = new CountDownLatch(1);
+        serve("event: node_update\ndata: {\"nodeId\":\"market\",\"status\":\"completed\",\"ok\":true}\n\n", gate,
+                "event: workflow_complete\ndata: {\"ok\":true,\"final_state\":{}}\n\n");
+        RecordingEmitter emitter = new RecordingEmitter();
+        Thread streaming = new Thread(() -> service.startWithStreaming("daily", "s", inputs(), emitter));
+        streaming.start();
+        awaitName(emitter, "node_update");
+
+        emitter.timeoutCallback.run();
+        gate.countDown();
+        streaming.join(5000);
+
+        assertThat(storedRun.get().getStatus()).isEqualTo("COMPLETED");
+        assertThat(eventCount("CLIENT_DISCONNECTED")).isEqualTo(1);
+        assertThat(emitter.names).doesNotContain("workflow_complete");
+    }
+
+    @Test
+    void clientTimeoutWithCancelOnDisconnectCancelsTheRun() throws Exception {
+        service.setCancelStreamOnDisconnect(true);
+        CountDownLatch gate = new CountDownLatch(1);
+        serve("event: node_update\ndata: {\"nodeId\":\"market\",\"status\":\"completed\",\"ok\":true}\n\n", gate,
+                "event: workflow_complete\ndata: {\"ok\":true,\"final_state\":{}}\n\n");
+        RecordingEmitter emitter = new RecordingEmitter();
+        Thread streaming = new Thread(() -> service.startWithStreaming("daily", "s", inputs(), emitter));
+        streaming.start();
+        awaitName(emitter, "node_update");
+
+        emitter.timeoutCallback.run();
+        gate.countDown();
+        streaming.join(5000);
+
+        assertThat(storedRun.get().getStatus()).isEqualTo("CANCELLED");
+        assertThat(hasEvent("CLIENT_DISCONNECTED")).isTrue();
+        assertThat(hasEvent("RUN_CANCELLED")).isTrue();
+        assertThat(hasEvent("RUN_COMPLETED")).isFalse();
+    }
+
+    @Test
+    void normalCompletionIsNotRecordedAsDisconnect() throws Exception {
+        serve("event: workflow_complete\ndata: {\"ok\":true,\"final_state\":{}}\n\n", null, null);
+        RecordingEmitter emitter = new RecordingEmitter();
+
+        service.startWithStreaming("daily", "s", inputs(), emitter);
+        emitter.completionCallback.run(); // container fires onCompletion after our complete()
+
+        assertThat(hasEvent("CLIENT_DISCONNECTED")).isFalse();
+    }
+
+    private static void awaitName(RecordingEmitter emitter, String name) throws InterruptedException {
+        long deadline = System.currentTimeMillis() + 5000;
+        while (!emitter.names.contains(name) && System.currentTimeMillis() < deadline) {
+            Thread.sleep(10);
+        }
+        assertThat(emitter.names).contains(name);
+    }
+
     static WorkflowRun copy(WorkflowRun source) {
         WorkflowRun copy = new WorkflowRun();
         copy.setRunId(source.getRunId());
@@ -242,8 +329,21 @@ class WorkflowServiceStreamingControlTest {
         volatile boolean failSends;
         final java.util.concurrent.atomic.AtomicInteger completeCalls = new java.util.concurrent.atomic.AtomicInteger();
 
+        volatile Runnable timeoutCallback = () -> { };
+        volatile Runnable completionCallback = () -> { };
+
         RecordingEmitter() {
             super(30_000L);
+        }
+
+        @Override
+        public synchronized void onTimeout(Runnable callback) {
+            timeoutCallback = callback;
+        }
+
+        @Override
+        public synchronized void onCompletion(Runnable callback) {
+            completionCallback = callback;
         }
 
         @Override

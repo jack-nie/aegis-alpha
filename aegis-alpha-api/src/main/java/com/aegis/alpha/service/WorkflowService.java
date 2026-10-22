@@ -614,6 +614,20 @@ public class WorkflowService {
         }
         final SseStreamReader.Handle readerHandle = new SseStreamReader.Handle();
         final java.util.concurrent.atomic.AtomicBoolean emitterClosed = new java.util.concurrent.atomic.AtomicBoolean(false);
+        final java.util.concurrent.atomic.AtomicBoolean clientGone = new java.util.concurrent.atomic.AtomicBoolean(false);
+        /* P2-19: the client stream ending on its own (timeout, network error, browser closed). */
+        final Runnable onClientGone = () -> {
+            if (emitterClosed.get() || !clientGone.compareAndSet(false, true)) {
+                return;
+            }
+            recordClientDisconnected(runId);
+            if (cancelStreamOnDisconnect && emitterClosed.compareAndSet(false, true)) {
+                finishStreamingAsCancelled(run, emitter, readerHandle);
+            }
+        };
+        emitter.onTimeout(onClientGone);
+        emitter.onError(ex -> onClientGone.run());
+        emitter.onCompletion(onClientGone);
         SseStreamReader.readSse(streamUrl, streamBody, langChainGateway.serviceAuthorizationHeader(),
                 new SseStreamReader.SseEventHandler() {
             /* P2-18: every terminal or paused outcome ends the client stream exactly once. */
@@ -627,12 +641,25 @@ public class WorkflowService {
                 }
             }
 
+            /* P2-19: a failed send means the client went away; the run itself keeps going. */
+            private void send(org.springframework.web.servlet.mvc.method.annotation.SseEmitter.SseEventBuilder event) {
+                if (clientGone.get() || emitterClosed.get()) {
+                    return;
+                }
+                try {
+                    emitter.send(event);
+                } catch (java.io.IOException | IllegalStateException ex) {
+                    onClientGone.run();
+                }
+            }
+
             /* P2-17: re-read before acting; a cancel requested meanwhile ends the stream as CANCELLED. */
             private boolean stopIfCancelled() {
                 WorkflowRun latest = mapper.findRun(runId);
                 if (!isCancelRequested(latest)) {
                     return false;
                 }
+                emitterClosed.set(true);
                 finishStreamingAsCancelled(run, emitter, readerHandle);
                 return true;
             }
@@ -644,6 +671,7 @@ public class WorkflowService {
                 }
                 WorkflowRun latest = mapper.findRun(runId);
                 if (isCancelRequested(latest)) {
+                    emitterClosed.set(true);
                     finishStreamingAsCancelled(run, emitter, readerHandle);
                 }
                 return false;
@@ -663,12 +691,12 @@ public class WorkflowService {
                                 nodeRun.getStatus(), (nodeOk ? "Node completed: " : "Node failed: ") + nodeRun.getNodeName(),
                                 nodePayload, nodeRun.getSortOrder() + 1);
                         recordStreamedNodeSpan(run, nodeRun, nodePayload);
-                        emitter.send(org.springframework.web.servlet.mvc.method.annotation.SseEmitter.event().name("node_update").data(data));
+                        send(org.springframework.web.servlet.mvc.method.annotation.SseEmitter.event().name("node_update").data(data));
                     } else if ("degraded".equals(eventName)) {
                         Map<String, Object> payload = parseJsonMap(data);
                         recordRunEvent(run, "RUN_DEGRADED", null, null, "RUNNING",
                                 "Workflow run degraded (streaming).", payload, 900000);
-                        emitter.send(org.springframework.web.servlet.mvc.method.annotation.SseEmitter.event()
+                        send(org.springframework.web.servlet.mvc.method.annotation.SseEmitter.event()
                                 .name("degraded").data(data == null ? "{}" : data));
                     } else if ("human_interrupt".equals(eventName)) {
                         Map<String, Object> payload = parseJsonMap(data);
@@ -681,7 +709,7 @@ public class WorkflowService {
                         }
                         recordRunEvent(run, "RUN_PAUSED", null, null, "PAUSED",
                                 "Workflow paused for human interrupt (streaming).", payload, 950000);
-                        emitter.send(org.springframework.web.servlet.mvc.method.annotation.SseEmitter.event()
+                        send(org.springframework.web.servlet.mvc.method.annotation.SseEmitter.event()
                                 .name("human_interrupt").data(data == null ? "{}" : data));
                         /* The run waits for approval (resumed via decideApproval), not on this stream. */
                         closeEmitter();
@@ -721,7 +749,7 @@ public class WorkflowService {
                         String completeData = data == null || data.trim().isEmpty()
                                 ? (degraded ? "{\"ok\":true,\"degraded\":true}" : "{\"ok\":true}")
                                 : data;
-                        emitter.send(org.springframework.web.servlet.mvc.method.annotation.SseEmitter.event()
+                        send(org.springframework.web.servlet.mvc.method.annotation.SseEmitter.event()
                                 .name("workflow_complete").data(completeData));
                         closeEmitter();
                     } else if ("error".equals(eventName)) {
@@ -734,7 +762,7 @@ public class WorkflowService {
                             return;
                         }
                         recordRunEvent(run, "RUN_FAILED", null, null, "FAILED", run.getErrorMessage(), null, 1000000);
-                        emitter.send(org.springframework.web.servlet.mvc.method.annotation.SseEmitter.event().name("error").data(data));
+                        send(org.springframework.web.servlet.mvc.method.annotation.SseEmitter.event().name("error").data(data));
                         closeEmitter();
                     }
                 } catch (Exception ex) {
@@ -746,7 +774,9 @@ public class WorkflowService {
                     } catch (Exception ignored) {
                         // best effort
                     }
+                    if (emitterClosed.compareAndSet(false, true)) {
                     try { emitter.completeWithError(ex); } catch (Exception ignored) {}
+                }
                 }
             }
             @Override public void onError(Exception ex) {
@@ -756,14 +786,17 @@ public class WorkflowService {
                     run.setControlStatus("FAILED");
                     if (writeIfRunning()) {
                         recordRunEvent(run, "RUN_FAILED", null, null, "FAILED", run.getErrorMessage(), null, 1000000);
-                        emitter.send(org.springframework.web.servlet.mvc.method.annotation.SseEmitter.event().name("error").data("{\"ok\":false}"));
+                        send(org.springframework.web.servlet.mvc.method.annotation.SseEmitter.event().name("error").data("{\"ok\":false}"));
                     }
                 } catch (Exception ignored) {}
-                try { emitter.completeWithError(ex); } catch (Exception ignored) {}
+                if (emitterClosed.compareAndSet(false, true)) {
+                    try { emitter.completeWithError(ex); } catch (Exception ignored) {}
+                }
             }
             @Override public void onComplete() {
                 WorkflowRun latest = mapper.findRun(runId);
                 if (isCancelRequested(latest)) {
+                    emitterClosed.set(true);
                     finishStreamingAsCancelled(run, emitter, readerHandle);
                     return;
                 }
@@ -784,6 +817,22 @@ public class WorkflowService {
     }
 
     static final List<String> RUNNING_ONLY = Collections.singletonList("RUNNING");
+
+    private void recordClientDisconnected(String runId) {
+        try {
+            WorkflowRun latest = mapper.findRun(runId);
+            if (latest != null) {
+                recordRunEvent(latest, "CLIENT_DISCONNECTED", null, null, latest.getStatus(),
+                        cancelStreamOnDisconnect
+                                ? "Streaming client disconnected; run will be cancelled."
+                                : "Streaming client disconnected; run continues in the background.",
+                        null, 990500);
+            }
+        } catch (Exception ex) {
+            log.warn("[WorkflowService] CLIENT_DISCONNECTED event failed runId={} error={}",
+                    runId, ex.getClass().getSimpleName());
+        }
+    }
 
     private static boolean isCancelRequested(WorkflowRun run) {
         return run != null && ((run.getCancelRequested() != null && run.getCancelRequested() == 1)
@@ -1090,6 +1139,14 @@ public class WorkflowService {
             }
         }
         return mapper.findRun(runId);
+    }
+
+    /** P2-19 (待确认): stop reading and cancel the run when the SSE client goes away. */
+    @Value("${aegis.workflow.stream.cancel-on-disconnect:false}")
+    private boolean cancelStreamOnDisconnect = false;
+
+    void setCancelStreamOnDisconnect(boolean cancelStreamOnDisconnect) {
+        this.cancelStreamOnDisconnect = cancelStreamOnDisconnect;
     }
 
     /** Roles allowed to approve/reject runs paused at the approval gate (comma separated). */
