@@ -32,6 +32,10 @@ import java.util.regex.Pattern;
 
 @Service
 public class ChatService {
+    /** P2-11: Copilot system prompt lives in a resource; missing data must be stated explicitly. */
+    static final String COPILOT_PROMPT_RESOURCE = "prompts/copilot-system.md";
+    static final String COPILOT_SYSTEM_PROMPT = loadCopilotPrompt();
+
     private static final org.slf4j.Logger log = org.slf4j.LoggerFactory.getLogger(ChatService.class);
     private static final Pattern TICKER_PATTERN = Pattern.compile("\\b[A-Z]{1,5}(?:[._-][A-Z])?\\b");
 
@@ -664,7 +668,7 @@ public class ChatService {
         copilot.setDescription("Conversational investment research assistant.");
         copilot.setCategory("copilot");
         copilot.setTags("chat,copilot,research");
-        copilot.setPrompt("\u4f60\u662f Aegis Alpha Copilot\u3002\u8bf7\u7528\u4e2d\u6587\u56de\u7b54\u7528\u6237\u7684\u6295\u8d44\u7814\u7a76\u95ee\u9898\u3002\u5fc5\u987b\u5f15\u7528\u5f53\u524d\u4e0a\u4e0b\u6587\u4e2d\u7684\u5b9e\u65f6\u884c\u60c5\u6570\u636e\uff08\u4ef7\u683c\u3001\u6da8\u8dcc\u5e45\u3001PE\u3001PB\u3001\u5e02\u503c\u7b49\uff09\u548c\u65b0\u95fb\u6807\u9898\u6765\u5206\u6790\u3002\u5982\u679c\u5e02\u573a\u6570\u636e\u4e0a\u4e0b\u6587\u5df2\u7ecf\u63d0\u4f9b\uff0c\u5fc5\u987b\u57fa\u4e8e\u8fd9\u4e9b\u6570\u636e\u7ed9\u51fa\u5177\u4f53\u5206\u6790\uff0c\u4e0d\u8981\u8bf4\u6570\u636e\u4e0d\u8db3\u3002");
+        copilot.setPrompt(COPILOT_SYSTEM_PROMPT);
         copilot.setModelName(text(body, "modelName", ""));
         copilot.setToolsJson("[\"market-data\",\"portfolio\",\"news\",\"workflow\"]");
 
@@ -699,6 +703,30 @@ public class ChatService {
         response.put("escalateHuman", false);
         response.put("cacheHit", false);
         return response;
+    }
+
+    static String loadCopilotPrompt() {
+        java.io.InputStream in = ChatService.class.getClassLoader().getResourceAsStream(COPILOT_PROMPT_RESOURCE);
+        if (in == null) {
+            throw new IllegalStateException("Missing classpath resource " + COPILOT_PROMPT_RESOURCE);
+        }
+        try {
+            java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+            byte[] buffer = new byte[2048];
+            int read;
+            while ((read = in.read(buffer)) != -1) {
+                out.write(buffer, 0, read);
+            }
+            return new String(out.toByteArray(), java.nio.charset.StandardCharsets.UTF_8).trim();
+        } catch (java.io.IOException ex) {
+            throw new IllegalStateException("Cannot read " + COPILOT_PROMPT_RESOURCE, ex);
+        } finally {
+            try {
+                in.close();
+            } catch (java.io.IOException ignored) {
+                // nothing to do
+            }
+        }
     }
 
     /* ================================================================ *
