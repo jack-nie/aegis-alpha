@@ -118,6 +118,9 @@ public class WorkflowController {
         if (principal == null) {
             return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build();
         }
+        if (workflowService.runForPrincipal(runId, principal) == null) {
+            return ResponseEntity.notFound().build();
+        }
         return ResponseEntity.ok(workflowService.nodeRunsForPrincipal(runId, principal));
     }
 
@@ -127,6 +130,9 @@ public class WorkflowController {
         AuthenticatedPrincipal principal = authService.principal(authorization);
         if (principal == null) {
             return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build();
+        }
+        if (workflowService.runForPrincipal(runId, principal) == null) {
+            return ResponseEntity.notFound().build();
         }
         return ResponseEntity.ok(workflowService.runEventsForPrincipal(runId, principal));
     }
@@ -276,6 +282,45 @@ public class WorkflowController {
             return denied;
         }
         return ResponseEntity.ok(workflowService.cancelRun(runId));
+    }
+
+    /**
+     * Approve or reject a run paused at the approval gate: body {@code {"approved": boolean, "comment"?: string}}.
+     * 401 unauthenticated, 404 run not visible, 403 caller lacks an approver role,
+     * 400 missing/non-boolean {@code approved}, 409 run is not awaiting approval.
+     * Repeated submissions return the current run without resuming the orchestrator again.
+     */
+    @PostMapping("/workflow/runs/{runId}/approval")
+    public ResponseEntity<Object> decideApproval(@RequestHeader(value = "Authorization", required = false) String authorization,
+                                                 @PathVariable String runId,
+                                                 @RequestBody(required = false) Map<String, Object> body) {
+        AuthenticatedPrincipal principal = authService.principal(authorization);
+        if (principal == null) {
+            return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build();
+        }
+        if (workflowService.runForPrincipal(runId, principal) == null) {
+            return ResponseEntity.notFound().build();
+        }
+        if (!workflowService.isApprover(principal)) {
+            return ResponseEntity.status(HttpStatus.FORBIDDEN).body(approvalError("approver role required"));
+        }
+        Object approved = body == null ? null : body.get("approved");
+        if (!(approved instanceof Boolean)) {
+            return ResponseEntity.badRequest().body(approvalError("'approved' must be a boolean"));
+        }
+        String comment = body.get("comment") == null ? null : String.valueOf(body.get("comment"));
+        try {
+            return ResponseEntity.ok(workflowService.decideApproval(runId, (Boolean) approved, comment, principal));
+        } catch (IllegalStateException ex) {
+            return ResponseEntity.status(HttpStatus.CONFLICT).body(approvalError(ex.getMessage()));
+        }
+    }
+
+    private static Map<String, Object> approvalError(String message) {
+        Map<String, Object> error = new LinkedHashMap<String, Object>();
+        error.put("ok", false);
+        error.put("error", message);
+        return error;
     }
 
     /**

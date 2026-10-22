@@ -20,6 +20,25 @@ DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-flash"
 SUPPORTED_DEEPSEEK_MODELS = {"deepseek-v4-pro", "deepseek-v4-flash"}
 
 
+INTENT_CLASSIFIER_SYSTEM_PROMPT = (
+    "You are the workflow router of an investment-research product. Each function starts a "
+    "long, expensive research WORKFLOW. Call exactly ONE function only when the user clearly asks "
+    "to run that kind of research/report. Set `confidence` (0-1) to how sure you are.\n"
+    "Do NOT call any function (reply with an empty message) when the message is:\n"
+    "- product usage help (how to use / where is / what does X mean, e.g. 'DEGRADED', 'published workflow');\n"
+    "- run diagnosis (why did a run fail / time out / degrade);\n"
+    "- greetings or chit-chat;\n"
+    "- a request to trade, place orders, approve/reject recommendations, or read other users' data;\n"
+    "- anything outside investment research.\n"
+    "Examples:\n"
+    "- '给我一份盘前日报' -> call the daily briefing function, confidence 0.95\n"
+    "- '帮我深度分析一下 NVDA' -> call the deep-dive/stock analysis function with ticker NVDA, confidence 0.9\n"
+    "- '怎么运行一个工作流？' -> no function (product help)\n"
+    "- '这个 run 为什么失败了？' -> no function (run diagnosis)\n"
+    "- '你好' / '帮我下单买入 100 股 AAPL' -> no function"
+)
+
+
 class AgentToolResult:
     """Result of a single agent turn that may request tools."""
 
@@ -159,8 +178,15 @@ class LLMClient:
         temperature: float = 0.2,
         timeout_ms: int | None = None,
         tools: list | None = None,
+        structured: bool | None = None,
     ) -> LLMResponse:
-        """Invoke LLM with system prompt and user message."""
+        """Invoke LLM with system prompt and user message.
+
+        ``structured`` selects the output protocol explicitly: ``True`` → AnalystResult via
+        ``with_structured_output`` (one model call on success, at most one plain fallback call on
+        failure); ``False`` → plain text/markdown. ``None`` keeps the legacy prompt-substring
+        heuristic for callers that have not been migrated.
+        """
         resolved_model = self._resolve_model(model)
         effective_timeout = timeout_ms or self._config.timeout_ms
 
@@ -179,13 +205,18 @@ class LLMClient:
         ]
 
         try:
-            use_structured = tools is None and not self._is_aggregate_handler(system)
+            if structured is None:
+                use_structured = tools is None and not self._is_aggregate_handler(system)
+            else:
+                use_structured = bool(structured) and tools is None
             if use_structured:
                 try:
                     # include_raw keeps the AIMessage so usage_metadata survives parsing.
-                    # A bare AnalystResult has no token counts, and finance plus aggregate
-                    # both take this branch.
-                    structured_llm = client.with_structured_output(AnalystResult, include_raw=True)
+                    structured_llm = client.with_structured_output(
+                        AnalystResult,
+                        method=self._structured_output_method(),
+                        include_raw=True,
+                    )
                     response = await structured_llm.ainvoke(messages)
                     parsed, usage = self._structured_payload(response)
                     if isinstance(parsed, AnalystResult):
@@ -370,38 +401,50 @@ class LLMClient:
     async def classify_intent(
         self, message: str, tools: list[dict[str, Any]]
     ) -> dict[str, Any] | None:
-        """Classify intent using function calling."""
-        resolved_model = self._resolve_model()
-        client = self._build_client(resolved_model, temperature=0, timeout_ms=5000)
+        """Classify intent using function calling.
 
-        messages = [
-            SystemMessage(
-                content=(
-                    "You are an intent classifier. Based on the user message, call exactly ONE "
-                    "function that best matches the user's intent. If no function matches, do not "
-                    "call any function. Always respond with a function call or empty response."
-                )
-            ),
-            HumanMessage(content=message),
-        ]
+        Returns ``{"function", "ticker", "confidence", "argsError"}`` when the model called a
+        workflow function, ``None`` when it deliberately called nothing (non-workflow intent)
+        or the call failed. ``confidence`` is the model-provided value (may be ``None``).
+        """
+        resolved_model = self._resolve_model(getattr(self._config, "router_model", "") or None)
+        timeout_ms = int(getattr(self._config, "router_timeout_ms", 0) or 2500)
+        client = self._build_client(resolved_model, temperature=0, timeout_ms=timeout_ms)
+
+        messages: list[BaseMessage] = [SystemMessage(content=INTENT_CLASSIFIER_SYSTEM_PROMPT)]
+        messages.append(HumanMessage(content=message))
 
         try:
             response = await client.ainvoke(
                 messages, tools=tools, tool_choice="auto"
             )
-            tool_calls = getattr(response, "additional_kwargs", {}).get("tool_calls", [])
-            if tool_calls:
-                call = tool_calls[0]
-                fn = call.get("function", {})
-                args = json.loads(fn.get("arguments", "{}"))
-                return {
-                    "function": fn.get("name", ""),
-                    "ticker": args.get("ticker", ""),
-                }
-            return None
         except Exception as e:
-            logger.error(f"Intent classification failed: {e}")
+            logger.warning("Intent classification call failed: %s", type(e).__name__)
             return None
+
+        tool_calls = getattr(response, "additional_kwargs", {}).get("tool_calls", [])
+        if not tool_calls:
+            return None
+        call = tool_calls[0]
+        fn = call.get("function", {}) or {}
+        raw_args = fn.get("arguments") or "{}"
+        try:
+            args = json.loads(raw_args)
+            if not isinstance(args, dict):
+                raise ValueError("arguments is not an object")
+        except (ValueError, TypeError) as e:
+            logger.warning(
+                "Intent classification returned unparsable arguments (len=%d): %s",
+                len(str(raw_args)),
+                type(e).__name__,
+            )
+            return {"function": fn.get("name", ""), "ticker": "", "confidence": None, "argsError": True}
+        return {
+            "function": fn.get("name", ""),
+            "ticker": args.get("ticker", "") or "",
+            "confidence": args.get("confidence"),
+            "argsError": False,
+        }
 
     def _normalize_content(self, content: str, usage: Any = None) -> LLMResponse:
         """Normalize LLM response content to structured format."""
@@ -501,6 +544,10 @@ class LLMClient:
         if isinstance(response, AnalystResult):
             return response, getattr(response, "usage_metadata", None)
         return None, None
+
+    def _structured_output_method(self) -> str:
+        method = (getattr(self._config, "structured_output_method", "") or "").strip()
+        return method if method in ("function_calling", "json_schema", "json_mode") else "function_calling"
 
     @staticmethod
     def _is_aggregate_handler(system_prompt: str) -> bool:

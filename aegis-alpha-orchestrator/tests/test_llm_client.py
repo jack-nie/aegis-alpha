@@ -204,3 +204,73 @@ def test_client_cache_different_params(mock_settings):
     c1 = client._build_client("gpt-4o-mini", 0.2, 25000)
     c2 = client._build_client("gpt-4o-mini", 0.5, 25000)
     assert c1 is not c2
+
+# ---- P1-1: classify_intent parsing / prompt / router config ----
+
+
+class _FakeRouterClient:
+    def __init__(self, response):
+        self.response = response
+        self.messages = None
+
+    async def ainvoke(self, messages, **kwargs):
+        self.messages = messages
+        return self.response
+
+
+def _router_client(arguments, monkeypatch, **settings_kwargs):
+    from langchain_core.messages import AIMessage
+    from app.config import Settings
+    from app.core.llm_client import LLMClient
+
+    settings = Settings(AEGIS_ALPHA_LANGCHAIN_API_KEY="test", **settings_kwargs)
+    client = LLMClient(settings)
+    response = AIMessage(
+        content="",
+        additional_kwargs={
+            "tool_calls": [
+                {"id": "c1", "type": "function", "function": {"name": "run_daily", "arguments": arguments}}
+            ]
+        },
+    )
+    fake = _FakeRouterClient(response)
+    built = {}
+
+    def fake_build(model, temperature=0.2, timeout_ms=25000):
+        built.update(model=model, temperature=temperature, timeout_ms=timeout_ms)
+        return fake
+
+    monkeypatch.setattr(client, "_build_client", fake_build)
+    return client, fake, built
+
+
+@pytest.mark.asyncio
+async def test_classify_intent_returns_model_confidence(monkeypatch):
+    client, fake, _ = _router_client('{"ticker": "", "confidence": 0.82}', monkeypatch)
+    result = await client.classify_intent("给我一份盘前日报", [])
+    assert result == {"function": "run_daily", "ticker": "", "confidence": 0.82, "argsError": False}
+    system_prompt = fake.messages[0].content
+    assert "Do NOT call any function" in system_prompt
+    assert "怎么运行一个工作流" in system_prompt  # negative few-shot present
+
+
+@pytest.mark.asyncio
+async def test_classify_intent_flags_corrupted_arguments(monkeypatch):
+    client, _, _ = _router_client('{"ticker": ', monkeypatch)
+    result = await client.classify_intent("给我一份盘前日报", [])
+    assert result["argsError"] is True
+    assert result["confidence"] is None
+
+
+@pytest.mark.asyncio
+async def test_classify_intent_uses_router_model_and_timeout(monkeypatch):
+    client, _, built = _router_client(
+        '{"ticker": "", "confidence": 0.9}',
+        monkeypatch,
+        AEGIS_ALPHA_ROUTER_MODEL="router-mini",
+        AEGIS_ALPHA_ROUTER_TIMEOUT_MS=1234,
+    )
+    await client.classify_intent("hi", [])
+    assert built["timeout_ms"] == 1234
+    assert built["temperature"] == 0
+    assert built["model"] == "router-mini"

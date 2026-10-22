@@ -37,6 +37,7 @@ import java.util.Queue;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.Executor;
+import java.util.concurrent.atomic.AtomicInteger;
 
 @Service
 public class WorkflowService {
@@ -323,6 +324,7 @@ public class WorkflowService {
         requireEditable(definition, username);
         Map<String, Object> currentLayout = layout(workflowKey);
         validationService.validateLayout(currentLayout);
+        validationService.validateExecutableFields(currentLayout);
         WorkflowVersion version = new WorkflowVersion();
         version.setVersionId(UUID.randomUUID().toString());
         version.setWorkflowKey(workflowKey);
@@ -376,6 +378,7 @@ public class WorkflowService {
      */
     public Map<String, Object> saveLayoutForUser(String username, String workflowKey, Map<String, Object> body) {
         requireEditable(mapper.findDefinition(workflowKey), username);
+        validationService.validateExecutableFields(body);
         return saveLayoutInternal(workflowKey, body, username);
     }
 
@@ -476,7 +479,7 @@ public class WorkflowService {
         WorkflowVersion version = mapper.findLatestVersion(workflowKey);
         Map<String, Object> runLayout = layoutForRun(workflowKey, version);
         try {
-            execute(run, inputs, runLayout);
+            runWorkflow(run, inputs, runLayout);
             backtestService.createFromWorkflowRun(mapper.findRun(run.getRunId()), inputs);
         } catch (WorkflowStoppedException stopped) {
             // run already updated by execute()
@@ -533,7 +536,7 @@ public class WorkflowService {
         recordRunEvent(run, "RUN_CREATED", null, null, "RUNNING", "Workflow run created.", null, 0);
 
         try {
-            execute(run, safeInputs, runLayout);
+            runWorkflow(run, safeInputs, runLayout);
             WorkflowRun completed = mapper.findRun(run.getRunId());
             backtestService.createFromWorkflowRun(completed, inputs);
             return completed;
@@ -601,25 +604,26 @@ public class WorkflowService {
         String streamBody = langChainGateway.buildStreamBody(
                 runLayout, subject, safeInputs, delegatedToken, run.getRunId(), requireApproval);
         final String runId = run.getRunId();
+        // P1-16: monotonic sort order for streamed node events; node_update upserts workflow_node_run.
+        final AtomicInteger streamSequence = new AtomicInteger(0);
+        final Map<String, WorkflowNodeRun> streamedNodeRuns = new LinkedHashMap<>();
+        final Map<String, Map<String, Object>> streamLayoutNodes = new LinkedHashMap<>();
+        for (Map<String, Object> layoutNode : castList(runLayout.get("nodes"))) {
+            streamLayoutNodes.put(nodeId(layoutNode), layoutNode);
+        }
         SseStreamReader.readSse(streamUrl, streamBody, langChainGateway.serviceAuthorizationHeader(),
                 new SseStreamReader.SseEventHandler() {
             @Override public void onEvent(String eventName, String data) {
                 try {
                     if ("node_update".equals(eventName)) {
-                        JsonNode nd = objectMapper.readTree(data);
-                        String nodeId = nd.has("nodeId") ? nd.get("nodeId").asText() : "unknown";
-                        String nodeName = nd.has("nodeName") ? nd.get("nodeName").asText() : nodeId;
-                        WorkflowRunEvent ev = new WorkflowRunEvent();
-                        ev.setEventId(UUID.randomUUID().toString());
-                        ev.setRunId(runId);
-                        ev.setEventType("NODE_COMPLETED");
-                        ev.setNodeId(nodeId);
-                        ev.setStatus("COMPLETED");
-                        ev.setMessage("Node completed: " + nodeName);
-                        ev.setPayloadJson(data);
-                        ev.setCreatedAt(now());
-                        ev.setSortOrder(0);
-                        mapper.insertRunEvent(ev);
+                        Map<String, Object> nodePayload = parseJsonMap(data);
+                        WorkflowNodeRun nodeRun = upsertStreamedNodeRun(run, nodePayload, streamedNodeRuns,
+                                streamLayoutNodes, streamSequence.incrementAndGet());
+                        boolean nodeOk = "COMPLETED".equals(nodeRun.getStatus());
+                        recordRunEvent(run, nodeOk ? "NODE_COMPLETED" : "NODE_FAILED", nodeRun, nodeRun.getNodeId(),
+                                nodeRun.getStatus(), (nodeOk ? "Node completed: " : "Node failed: ") + nodeRun.getNodeName(),
+                                nodePayload, nodeRun.getSortOrder() + 1);
+                        recordStreamedNodeSpan(run, nodeRun, nodePayload);
                         emitter.send(org.springframework.web.servlet.mvc.method.annotation.SseEmitter.event().name("node_update").data(data));
                     } else if ("degraded".equals(eventName)) {
                         Map<String, Object> payload = parseJsonMap(data);
@@ -650,6 +654,7 @@ public class WorkflowService {
                         run.setControlStatus("COMPLETED");
                         run.setPauseRequested(0);
                         run.setCancelRequested(0);
+                        run.setNodeCount(streamedNodeRuns.size());
                         Map<String, Object> result = buildStreamingCompleteResult(payload, degraded);
                         if (degraded) {
                             if (run.getErrorMessage() == null || run.getErrorMessage().trim().isEmpty()) {
@@ -714,6 +719,62 @@ public class WorkflowService {
         return mapper.findRun(runId);
     }
 
+    /**
+     * Upsert one workflow_node_run per streamed node id (repeat updates, e.g. agent/tool loops, update the row).
+     * sortOrder = sequence * 100 so streamed rows/events keep the arrival order.
+     */
+    WorkflowNodeRun upsertStreamedNodeRun(WorkflowRun run, Map<String, Object> payload,
+                                          Map<String, WorkflowNodeRun> streamedNodeRuns,
+                                          Map<String, Map<String, Object>> layoutNodes, int sequence) {
+        String nodeId = firstNonBlank(string(payload.get("nodeId")), null, "unknown");
+        boolean ok = !Boolean.FALSE.equals(payload.get("ok"))
+                && !"failed".equalsIgnoreCase(String.valueOf(payload.get("status")));
+        WorkflowNodeRun nodeRun = streamedNodeRuns.get(nodeId);
+        boolean exists = nodeRun != null;
+        if (!exists) {
+            Map<String, Object> layoutNode = layoutNodes.get(nodeId);
+            nodeRun = new WorkflowNodeRun();
+            nodeRun.setNodeRunId(UUID.randomUUID().toString());
+            nodeRun.setRunId(run.getRunId());
+            nodeRun.setNodeId(nodeId);
+            String nodeName = string(payload.get("nodeName"));
+            nodeRun.setNodeName(nodeName == null || nodeName.isEmpty()
+                    ? (layoutNode == null ? nodeId : nodeName(layoutNode)) : nodeName);
+            nodeRun.setNodeType(layoutNode == null ? null : nodeType(layoutNode));
+            nodeRun.setAgentId(layoutNode == null ? null : agentId(layoutNode));
+            nodeRun.setAttempt(1);
+            nodeRun.setMaxAttempts(1);
+            nodeRun.setStartedAt(firstNonBlank(string(payload.get("startedAt")), null, now()));
+            nodeRun.setSortOrder(sequence * 100);
+        } else {
+            nodeRun.setAttempt((nodeRun.getAttempt() == null ? 1 : nodeRun.getAttempt()) + 1);
+        }
+        nodeRun.setStatus(ok ? "COMPLETED" : "FAILED");
+        nodeRun.setOutputJson(toJson(payload));
+        nodeRun.setCompletedAt(firstNonBlank(string(payload.get("completedAt")), null, now()));
+        if (exists) {
+            mapper.updateNodeRun(nodeRun);
+        } else {
+            mapper.insertNodeRun(nodeRun);
+            streamedNodeRuns.put(nodeId, nodeRun);
+        }
+        return nodeRun;
+    }
+
+    private void recordStreamedNodeSpan(WorkflowRun run, WorkflowNodeRun nodeRun, Map<String, Object> payload) {
+        if (agentTraceService == null) {
+            return;
+        }
+        try {
+            Map<String, Object> input = new LinkedHashMap<>();
+            input.put("nodeId", nodeRun.getNodeId());
+            input.put("source", "stream");
+            agentTraceService.recordNodeSpan(run, nodeRun, string(payload.get("handler")), input, payload);
+        } catch (Exception ignored) {
+            // span recording must never break the client stream
+        }
+    }
+
     private void materializeStreamingCompletedRun(String runId, Map<String, Object> inputs) {
         try {
             WorkflowRun completed = mapper.findRun(runId);
@@ -767,15 +828,13 @@ public class WorkflowService {
      * The orchestrator loads preferences from final_state.userId / user_id.
      * Streaming used to send inputs only, so an authenticated caller was dropped.
      */
-    private static void applyAuthenticatedUserId(Map<String, Object> safeInputs, String userId) {
+    static void applyAuthenticatedUserId(Map<String, Object> safeInputs, String userId) {
         if (userId == null || userId.trim().isEmpty() || safeInputs == null) {
             return;
         }
-        Object existingUserId = safeInputs.get("userId");
-        Object existingUserSnake = safeInputs.get("user_id");
-        if (hasText(existingUserId) || hasText(existingUserSnake)) {
-            return;
-        }
+        /* The authenticated id always wins: a client-supplied userId/user_id would otherwise select
+         * another user's memory and preferences in the orchestrator. */
+        safeInputs.remove("user_id");
         safeInputs.put("userId", userId.trim());
     }
 
@@ -874,7 +933,7 @@ public class WorkflowService {
         Map<String, Object> inputs = parseJsonMap(run.getInputsJson());
         Map<String, Object> runLayout = layoutForRun(run.getWorkflowKey(), run.getWorkflowVersionId());
         try {
-            execute(run, inputs, runLayout);
+            runWorkflow(run, inputs, runLayout);
             WorkflowRun completed = mapper.findRun(run.getRunId());
             backtestService.createFromWorkflowRun(completed, inputs);
             return completed;
@@ -929,24 +988,87 @@ public class WorkflowService {
         return mapper.findRun(runId);
     }
 
+    /** Roles allowed to approve/reject runs paused at the approval gate (comma separated). */
+    @Value("${aegis.workflow.approver-roles:desk,admin}")
+    private String approverRoles = "desk,admin";
+
+    /** True when the principal holds one of the configured approver roles. */
+    public boolean isApprover(AuthenticatedPrincipal principal) {
+        if (principal == null || approverRoles == null) {
+            return false;
+        }
+        for (String role : approverRoles.split(",")) {
+            if (!role.trim().isEmpty() && principal.hasRole(role.trim())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void setApproverRoles(String approverRoles) {
+        this.approverRoles = approverRoles;
+    }
+
+    /** Control status held while one request owns the approval decision (CAS from HUMAN_INTERRUPT). */
+    static final String APPROVAL_IN_PROGRESS = "APPROVAL_IN_PROGRESS";
+
     /**
      * Continue a run paused at the orchestrator approval gate. Does not start a new execution.
      */
     public WorkflowRun decideApproval(String runId, boolean approved) {
+        return decideApproval(runId, approved, null, null);
+    }
+
+    /**
+     * Approve or reject a run paused at the approval gate.
+     *
+     * <ul>
+     *   <li>Only one caller wins the {@code HUMAN_INTERRUPT → APPROVAL_IN_PROGRESS} compare-and-set,
+     *       so the orchestrator is resumed at most once; repeated submissions for an already
+     *       decided run return its current state.</li>
+     *   <li>Approval completes the run ({@code COMPLETED}); rejection ends it as {@code REJECTED}
+     *       (status name 待确认 with product) and the orchestrator skips the aggregate node.</li>
+     *   <li>A failed resume returns the run to {@code HUMAN_INTERRUPT} so it can be retried.</li>
+     * </ul>
+     *
+     * @throws IllegalStateException when the run never waited for approval
+     */
+    public WorkflowRun decideApproval(String runId, boolean approved, String comment, AuthenticatedPrincipal approver) {
         WorkflowRun run = requireRun(runId);
         if (!isHumanInterrupt(run)) {
+            if (isApprovalDecidedOrInFlight(run)) {
+                return mapper.findRun(runId);
+            }
             throw new IllegalStateException("Workflow run is not awaiting human approval: " + runId);
         }
+        if (mapper.transitionControlStatus(runId, "HUMAN_INTERRUPT", APPROVAL_IN_PROGRESS) == 0) {
+            /* Another request claimed the decision first. */
+            return mapper.findRun(runId);
+        }
+        Map<String, Object> audit = new LinkedHashMap<>();
+        audit.put("approved", approved);
+        if (approver != null) {
+            audit.put("approverUserId", approver.getUserId());
+            audit.put("approverUsername", approver.getUsername());
+        }
+        if (comment != null && !comment.trim().isEmpty()) {
+            String trimmed = comment.trim();
+            audit.put("comment", trimmed.length() > 500 ? trimmed.substring(0, 500) : trimmed);
+        }
+        recordRunEvent(run, "RUN_APPROVAL_DECISION", null, null, "PAUSED",
+                approved ? "Approval submitted." : "Rejection submitted.", audit, 955000);
+
         Map<String, Object> resume = langChainGateway.resumeWorkflow(run.getRunId(), approved);
         if (isResumeOk(resume)) {
-            run.setStatus("COMPLETED");
+            run.setStatus(approved ? "COMPLETED" : "REJECTED");
             run.setCompletedAt(now());
-            run.setControlStatus("COMPLETED");
+            run.setControlStatus(approved ? "COMPLETED" : "REJECTED");
             run.setPauseRequested(0);
             Map<String, Object> result = new LinkedHashMap<>();
             if (resume != null) {
                 result.putAll(resume);
             }
+            result.putAll(audit);
             if (approved) {
                 result.put("approval", "approved");
             } else {
@@ -958,18 +1080,31 @@ public class WorkflowService {
             }
             run.setResultJson(toJson(result));
             mapper.updateRun(run);
-            recordRunEvent(run, approved ? "RUN_APPROVED" : "RUN_REJECTED", null, null, "COMPLETED",
+            recordRunEvent(run, approved ? "RUN_APPROVED" : "RUN_REJECTED", null, null,
+                    approved ? "COMPLETED" : "REJECTED",
                     approved ? "Human approval accepted; workflow resumed."
-                            : "Human approval rejected; workflow completed.",
+                            : "Human approval rejected; final report skipped.",
                     result, 1000000);
         } else {
             String error = resume == null ? "" : string(resume.get("error"));
+            run.setControlStatus("HUMAN_INTERRUPT");
             run.setErrorMessage(error == null || error.trim().isEmpty() ? "resume failed" : error);
             mapper.updateRun(run);
             recordRunEvent(run, "RUN_RESUME_FAILED", null, null, "PAUSED",
                     "Human approval resume failed.", resume, 960000);
         }
         return mapper.findRun(runId);
+    }
+
+    private boolean isApprovalDecidedOrInFlight(WorkflowRun run) {
+        if (run == null) {
+            return false;
+        }
+        if (APPROVAL_IN_PROGRESS.equals(run.getControlStatus()) || "REJECTED".equals(run.getStatus())) {
+            return true;
+        }
+        Map<String, Object> result = parseJsonMap(run.getResultJson());
+        return result.get("approval") != null;
     }
 
     private boolean isHumanInterrupt(WorkflowRun run) {
@@ -1045,6 +1180,130 @@ public class WorkflowService {
     }
 
     @SuppressWarnings("unchecked")
+    /** Result marker for the engine that produced a run. */
+    static final String ENGINE_LANGGRAPH = "langgraph";
+    static final String ENGINE_JAVA_FALLBACK = "java-fallback";
+
+    /**
+     * Single execution entry for sync start, queued dispatch and async (copilot) runs.
+     * The LangGraph orchestrator executes the whole graph (same engine as streaming, with the
+     * approval gate); the node-by-node Java loop only runs when the orchestrator is explicitly
+     * disabled ({@code aegis.langchain.enabled=false}) and marks the result {@code engine=java-fallback}.
+     */
+    private void runWorkflow(WorkflowRun run, Map<String, Object> inputs, Map<String, Object> layout) throws Exception {
+        if (langChainGateway != null && langChainGateway.isEnabled()) {
+            executeViaOrchestrator(run, inputs, layout);
+            return;
+        }
+        execute(run, inputs, layout);
+    }
+
+    @SuppressWarnings("unchecked")
+    private void executeViaOrchestrator(WorkflowRun run, Map<String, Object> inputs, Map<String, Object> layout) {
+        enforceRunControl(run);
+        Map<String, Object> state = new LinkedHashMap<>(inputs == null ? new LinkedHashMap<String, Object>() : inputs);
+        state.put("workflowKey", run.getWorkflowKey());
+        state.put("runId", run.getRunId());
+        state.put("subject", run.getSubject());
+        String delegatedToken = issueDelegatedPortfolioReadToken(run.getRunId(), run.getUserId(), run.getTenantId(), inputs);
+        boolean requireApproval = requireApprovalRequested(inputs == null ? new LinkedHashMap<String, Object>() : inputs, layout);
+        Map<String, Object> response = langChainGateway.executeWorkflow(
+                layout, run.getSubject(), state, delegatedToken, run.getRunId(), requireApproval);
+        if (response == null || Boolean.FALSE.equals(response.get("ok"))) {
+            String error = response == null ? "" : string(response.get("error"));
+            throw new IllegalStateException(error == null || error.trim().isEmpty()
+                    ? "Orchestrator workflow failed" : "Orchestrator workflow failed: " + error);
+        }
+        Map<String, Object> finalState = response.get("final_state") instanceof Map
+                ? new LinkedHashMap<>((Map<String, Object>) response.get("final_state"))
+                : new LinkedHashMap<String, Object>();
+        Map<String, Object> nodeOutputs = response.get("node_outputs") instanceof Map
+                ? (Map<String, Object>) response.get("node_outputs") : new LinkedHashMap<String, Object>();
+        List<Object> trace = response.get("trace") instanceof List
+                ? (List<Object>) response.get("trace") : new ArrayList<Object>();
+        int materialized = materializeOrchestratorTrace(run, layout, trace, nodeOutputs);
+        boolean degraded = false;
+        for (Object entry : trace) {
+            if (entry instanceof Map && Boolean.TRUE.equals(((Map<String, Object>) entry).get("degraded"))) {
+                degraded = true;
+            }
+        }
+
+        Map<String, Object> result = new LinkedHashMap<>(finalState);
+        result.put("engine", ENGINE_LANGGRAPH);
+        run.setNodeCount(materialized);
+        run.setResultJson(toJson(result));
+        if (Boolean.TRUE.equals(finalState.get("interrupted"))) {
+            run.setStatus("PAUSED");
+            run.setControlStatus("HUMAN_INTERRUPT");
+            run.setPauseRequested(1);
+            mapper.updateRun(run);
+            recordRunEvent(run, "RUN_PAUSED", null, null, "PAUSED",
+                    "Workflow paused for human approval.", null, 950000);
+            return;
+        }
+        run.setStatus("COMPLETED");
+        run.setCompletedAt(now());
+        run.setControlStatus("COMPLETED");
+        run.setPauseRequested(0);
+        run.setCancelRequested(0);
+        if (degraded && (run.getErrorMessage() == null || run.getErrorMessage().trim().isEmpty())) {
+            run.setErrorMessage("DEGRADED");
+        }
+        mapper.updateRun(run);
+        if (degraded) {
+            recordRunEvent(run, "RUN_DEGRADED", null, null, "COMPLETED",
+                    "Workflow completed with degraded nodes.", null, 999999);
+        }
+        recordRunEvent(run, "RUN_COMPLETED", null, null, "COMPLETED", "Workflow run completed.", null, 1000000);
+        cacheService.put("aegis:workflow:run:" + run.getRunId(), run, Duration.ofHours(2));
+    }
+
+    /** Persist one node run + NODE_COMPLETED/NODE_FAILED event per orchestrator trace entry, in order. */
+    @SuppressWarnings("unchecked")
+    private int materializeOrchestratorTrace(WorkflowRun run, Map<String, Object> layout, List<Object> trace,
+                                             Map<String, Object> nodeOutputs) {
+        Map<String, Map<String, Object>> layoutNodes = new LinkedHashMap<>();
+        for (Map<String, Object> node : castList(layout.get("nodes"))) {
+            layoutNodes.put(nodeId(node), node);
+        }
+        int sort = 0;
+        for (Object raw : trace) {
+            if (!(raw instanceof Map)) {
+                continue;
+            }
+            Map<String, Object> entry = (Map<String, Object>) raw;
+            String nodeId = string(entry.get("nodeId"));
+            if (nodeId == null || nodeId.isEmpty()) {
+                nodeId = string(entry.get("node_id"));
+            }
+            sort += 1;
+            Map<String, Object> layoutNode = layoutNodes.get(nodeId);
+            boolean ok = !Boolean.FALSE.equals(entry.get("ok"));
+            Object output = nodeOutputs.get(nodeId);
+            WorkflowNodeRun nodeRun = new WorkflowNodeRun();
+            nodeRun.setNodeRunId(UUID.randomUUID().toString());
+            nodeRun.setRunId(run.getRunId());
+            nodeRun.setNodeId(nodeId);
+            String nodeName = string(entry.get("nodeName"));
+            nodeRun.setNodeName(nodeName == null || nodeName.isEmpty()
+                    ? (layoutNode == null ? nodeId : nodeName(layoutNode)) : nodeName);
+            nodeRun.setNodeType(layoutNode == null ? null : nodeType(layoutNode));
+            nodeRun.setAgentId(layoutNode == null ? null : agentId(layoutNode));
+            nodeRun.setStatus(ok ? "COMPLETED" : "FAILED");
+            nodeRun.setAttempt(1);
+            nodeRun.setMaxAttempts(1);
+            nodeRun.setOutputJson(toJson(output == null ? entry : output));
+            nodeRun.setStartedAt(firstNonBlank(string(entry.get("startedAt")), null, now()));
+            nodeRun.setCompletedAt(firstNonBlank(string(entry.get("completedAt")), null, now()));
+            nodeRun.setSortOrder(sort * 100);
+            mapper.insertNodeRun(nodeRun);
+            recordRunEvent(run, ok ? "NODE_COMPLETED" : "NODE_FAILED", nodeRun, nodeId,
+                    ok ? "COMPLETED" : "FAILED", ok ? "Node completed." : "Node failed.", entry, sort * 100 + 1);
+        }
+        return sort;
+    }
+
     private void execute(WorkflowRun run, Map<String, Object> inputs, Map<String, Object> layout) throws Exception {
         List<Map<String, Object>> nodes = castList(layout.get("nodes"));
         List<Map<String, Object>> edges = castList(layout.get("edges"));
@@ -1055,6 +1314,7 @@ public class WorkflowService {
         state.put("subject", run.getSubject());
         // Sync path: same portfolio:read delegation as streaming (fail soft)
         String delegatedToken = issueDelegatedPortfolioReadToken(run.getRunId(), null, null, inputs);
+        List<String> degradedNodes = new ArrayList<>();
 
         int index = 0;
         for (Map<String, Object> node : orderedNodes) {
@@ -1090,6 +1350,15 @@ public class WorkflowService {
                 try {
                     long started = System.currentTimeMillis();
                     Map<String, Object> output = executeNode(node, state, run, delegatedToken);
+                    if (output != null && Boolean.FALSE.equals(output.get("ok"))) {
+                        /* Orchestrator reported failure: retry per retryPolicy instead of storing it as success. */
+                        Object error = output.get("error") != null ? output.get("error") : output.get("summary");
+                        throw new IllegalStateException("Node returned ok=false"
+                                + (error == null ? "" : ": " + String.valueOf(error)));
+                    }
+                    if (output != null && Boolean.TRUE.equals(output.get("degraded"))) {
+                        degradedNodes.add(nodeId(node));
+                    }
                     long elapsed = System.currentTimeMillis() - started;
                     if (timeoutMs > 0 && elapsed > timeoutMs) {
                         throw new IllegalStateException("Node timed out after " + elapsed + "ms; timeout=" + timeoutMs + "ms");
@@ -1131,14 +1400,25 @@ public class WorkflowService {
             }
         }
 
+        Map<String, Object> result = new LinkedHashMap<>(state);
+        result.put("engine", ENGINE_JAVA_FALLBACK);
         run.setStatus("COMPLETED");
         run.setCompletedAt(now());
-        run.setResultJson(toJson(state));
+        run.setResultJson(toJson(result));
         run.setNodeCount(orderedNodes.size());
         run.setControlStatus("COMPLETED");
         run.setPauseRequested(0);
         run.setCancelRequested(0);
+        if (!degradedNodes.isEmpty() && (run.getErrorMessage() == null || run.getErrorMessage().trim().isEmpty())) {
+            run.setErrorMessage("DEGRADED");
+        }
         mapper.updateRun(run);
+        if (!degradedNodes.isEmpty()) {
+            Map<String, Object> degradedPayload = new LinkedHashMap<>();
+            degradedPayload.put("nodes", degradedNodes);
+            recordRunEvent(run, "RUN_DEGRADED", null, null, "COMPLETED",
+                    "Workflow completed with degraded (local) node results.", degradedPayload, 999999);
+        }
         recordRunEvent(run, "RUN_COMPLETED", null, null, "COMPLETED", "Workflow run completed.", state, 1000000);
         cacheService.put("aegis:workflow:run:" + run.getRunId(), run, Duration.ofHours(2));
     }

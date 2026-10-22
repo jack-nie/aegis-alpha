@@ -12,6 +12,10 @@ _env_path = Path(__file__).parent.parent.parent / ".env"
 load_dotenv(_env_path, override=True)
 
 
+# Documented sample value; never accepted outside explicit dev/mock mode.
+EXAMPLE_SERVICE_TOKEN = "local-workflow-node-token"
+
+
 class Settings(BaseSettings):
     """Application settings loaded from environment variables."""
 
@@ -27,11 +31,30 @@ class Settings(BaseSettings):
     timeout_ms: int = Field(default=25000, alias="AEGIS_ALPHA_LANGCHAIN_TIMEOUT_MS")
     mock_mode: bool = Field(default=False, alias="AEGIS_ALPHA_LANGCHAIN_MOCK")
 
+    # Intent router (classification). Empty model -> fall back to the main model.
+    router_model: str = Field(default="", alias="AEGIS_ALPHA_ROUTER_MODEL")
+    router_timeout_ms: int = Field(default=2500, alias="AEGIS_ALPHA_ROUTER_TIMEOUT_MS")
+
+    # Structured output: "function_calling" (portable across OpenAI-compatible providers such as
+    # DeepSeek) or "json_schema" / "json_mode" where the provider supports them.
+    structured_output_method: str = Field(
+        default="function_calling", alias="AEGIS_ALPHA_STRUCTURED_OUTPUT_METHOD"
+    )
+    # Node-level LLM retry budget: total wall time across attempts (including backoff).
+    node_retry_deadline_ms: int = Field(default=120000, alias="AEGIS_ALPHA_NODE_RETRY_DEADLINE_MS")
+    node_retry_max_attempts: int = Field(default=3, alias="AEGIS_ALPHA_NODE_RETRY_MAX_ATTEMPTS")
+
     # Backend
     backend_url: str = Field(default="http://127.0.0.1:5178", alias="AEGIS_ALPHA_BACKEND_URL")
     node_callback_base_url: str = Field(default="", alias="AEGIS_ALPHA_NODE_CALLBACK_BASE_URL")
-    node_execution_token: str = Field(
-        default="local-workflow-node-token", alias="AEGIS_ALPHA_NODE_EXECUTION_TOKEN"
+    # Shared service token (Java <-> orchestrator). No default: set it explicitly. The documented
+    # example value is only accepted in explicit dev/mock mode.
+    node_execution_token: str = Field(default="", alias="AEGIS_ALPHA_NODE_EXECUTION_TOKEN")
+    dev_mode: bool = Field(default=False, alias="AEGIS_ALPHA_DEV_MODE")
+    # Comma-separated CORS allow-list (no wildcard). Defaults to local web/API origins only.
+    cors_allowed_origins: str = Field(
+        default="http://127.0.0.1:5174,http://localhost:5174,http://127.0.0.1:5178,http://localhost:5178",
+        alias="AEGIS_ALPHA_CORS_ALLOWED_ORIGINS",
     )
     # Optional run-scoped portfolio:read delegation token (tests / explicit inject).
     # Prefer contextvar authorization_override on ToolBackendClient for per-run use.
@@ -66,6 +89,25 @@ class Settings(BaseSettings):
     def effective_backend_url(self) -> str:
         """Get the effective backend URL."""
         return self.node_callback_base_url or self.backend_url
+
+    @property
+    def allows_example_service_token(self) -> bool:
+        """The example token is only tolerated when dev or mock mode is set explicitly."""
+        return bool(self.dev_mode or self.mock_mode)
+
+    @property
+    def service_token_problem(self) -> str | None:
+        """``None`` when the service token is usable, else a short machine-readable reason."""
+        token = (self.node_execution_token or "").strip()
+        if not token:
+            return "service_token_not_configured"
+        if token == EXAMPLE_SERVICE_TOKEN and not self.allows_example_service_token:
+            return "service_token_is_example_value"
+        return None
+
+    @property
+    def cors_origins(self) -> list[str]:
+        return [o.strip() for o in (self.cors_allowed_origins or "").split(",") if o.strip() and o.strip() != "*"]
 
     @property
     def is_mock_mode(self) -> bool:

@@ -45,6 +45,16 @@ class PortfolioControllerAuthTest {
     }
 
     @Test
+    void unsetServiceTokenNeverMatchesEmptyBearer() {
+        PortfolioController unset = new PortfolioController(
+                authService, mock(PortfolioService.class), tokenService, "");
+        when(authService.me(org.mockito.ArgumentMatchers.anyString())).thenReturn(null);
+
+        assertThat(unset.isReadAuthorized("Bearer ")).isFalse();
+        assertThat(unset.isReadAuthorized("")).isFalse();
+    }
+
+    @Test
     void userTokenAllowedViaAuthService() {
         Map<String, Object> me = new HashMap<String, Object>();
         me.put("user_id", "u-1");

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import uuid
@@ -30,7 +31,7 @@ from .context_assembly import apply_trace_usage, memory_hit_count
 from .memory_selector import load_run_memory, read_store_value
 from .memory_store import MemoryStoreManager
 from .node_executor import NodeExecutor
-from .tool_registry import resolve_agent_roles, tools_for_roles
+from .tool_registry import TOOL_SPECS, resolve_agent_roles, tools_for_roles
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +100,78 @@ class WorkflowState(TypedDict):
     messages: Annotated[list[Any], concat_lists]
 
 
+
+# Size cap for the final_state carried by the SSE workflow_complete event (JSON characters).
+STREAM_FINAL_STATE_MAX_CHARS = 16000
+_STREAM_SUMMARY_CHARS = 600
+_STREAM_SIGNALS_MAX = 5
+_STREAM_RECOMMENDATION_KEYS = (
+    "recommendation", "confidence", "missingData", "degraded", "forcedInsufficient", "claims",
+)
+
+
+def build_stream_final_state(
+    final_state: dict[str, Any] | None,
+    node_outputs: dict[str, Any] | None,
+    *,
+    max_chars: int = STREAM_FINAL_STATE_MAX_CHARS,
+) -> dict[str, Any]:
+    """Trimmed final_state for ``workflow_complete``: recommendation + per-node summary/signals.
+
+    Never the raw graph state (prompts, tool dumps, memory); bounded by ``max_chars`` of JSON.
+    """
+    final_state = final_state if isinstance(final_state, dict) else {}
+    node_outputs = node_outputs if isinstance(node_outputs, dict) else {}
+    nodes: dict[str, Any] = {}
+    recommendation: dict[str, Any] = {}
+    for node_id, payload in node_outputs.items():
+        if not isinstance(payload, dict):
+            continue
+        summary = payload.get("summary")
+        signals = payload.get("signals") if isinstance(payload.get("signals"), list) else []
+        nodes[str(node_id)] = {
+            "handler": payload.get("handler", ""),
+            "ok": payload.get("ok", True),
+            "degraded": bool(payload.get("degraded", False)),
+            "summary": (str(summary) if summary is not None else "")[:_STREAM_SUMMARY_CHARS],
+            "signals": signals[:_STREAM_SIGNALS_MAX],
+        }
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+        if payload.get("handler") == "finance.stock_recommendation_aggregate" or "recommendation" in data:
+            recommendation = {k: data[k] for k in _STREAM_RECOMMENDATION_KEYS if k in data}
+    evidence = final_state.get("evidence")
+    trimmed: dict[str, Any] = {
+        "ticker": final_state.get("ticker") or final_state.get("symbol"),
+        "subject": final_state.get("subject"),
+        "recommendation": recommendation,
+        "nodes": nodes,
+        "evidenceIds": sorted(str(k) for k in evidence) if isinstance(evidence, dict) else [],
+    }
+
+    def size(value: Any) -> int:
+        return len(json.dumps(value, ensure_ascii=False, default=str))
+
+    if size(trimmed) > max_chars:
+        recommendation.pop("claims", None)
+        for entry in nodes.values():
+            entry["summary"] = entry["summary"][:160]
+            entry["signals"] = entry["signals"][:2]
+        trimmed["truncated"] = True
+    while size(trimmed) > max_chars and nodes:
+        nodes.pop(next(iter(nodes)))
+        trimmed["truncated"] = True
+    return trimmed
+
+
+def is_valid_resume_value(value: Any) -> bool:
+    """A resume payload must carry an explicit boolean decision."""
+    return isinstance(value, dict) and isinstance(value.get("approved"), bool)
+
+
+def is_explicit_approval(value: Any) -> bool:
+    """Only ``{"approved": True}`` approves; anything else (missing, None, truthy strings) rejects."""
+    return is_valid_resume_value(value) and value.get("approved") is True
+
 class WorkflowEngine:
     """LangGraph-based workflow orchestration engine."""
 
@@ -146,6 +219,30 @@ class WorkflowEngine:
             "functionName": data.function_name or "",
             "nodeType": data.node_type or "",
         }
+
+    @classmethod
+    def _node_result_cache_key(cls, node: Node, handler: str) -> str:
+        """Per-ticker node result cache key, bound to the node's executable content.
+
+        Uses a stable sha256 (not ``hash()``, which is salted per process) so two nodes sharing a
+        handler but with different prompts never read each other's cached result.
+        """
+        payload = json.dumps(cls._node_content_fingerprint(node), sort_keys=True, default=str)
+        digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+        return f"{handler}:v3:{digest}"
+
+    def _node_reads_portfolio(self, node: Node) -> bool:
+        """True when the node is a tool-bound agent that can call portfolio_read tools.
+
+        Such results are user-specific and must not live in the per-ticker cache.
+        """
+        if (node.data.handler or "") != "general.agent" or not self._has_tools_capability():
+            return False
+        for bound in self._tools_for_node(node):
+            spec = TOOL_SPECS.get(getattr(bound, "name", ""))
+            if spec is not None and spec.sandbox_class == "portfolio_read":
+                return True
+        return False
 
     @classmethod
     def _topology_hash(cls, nodes: list[Node], edges: list[Edge]) -> str:
@@ -266,6 +363,15 @@ class WorkflowEngine:
         if not isinstance(memory_context, dict):
             memory_context = {"snippets": [], "hitCount": 0}
         return {**final_state, "memoryContext": memory_context}
+
+    @staticmethod
+    def _merge_evidence(state_update: dict[str, Any], result: NodeResult) -> dict[str, Any]:
+        """Lift server-issued evidence ids from a node result into ``final_state.evidence``."""
+        data = result.data if isinstance(result.data, dict) else {}
+        evidence = data.get("evidence")
+        if isinstance(evidence, dict) and evidence:
+            state_update["evidence"] = {str(k): v for k, v in evidence.items()}
+        return state_update
 
     @staticmethod
     def _annotate_trace(
@@ -434,9 +540,10 @@ class WorkflowEngine:
                         if k != "marketDataContext"
                     },
                 })
-                if response and not response.get("approved"):
-                    return {"final_state": {"approval_status": "rejected"}}
-                return {"final_state": {"approval_status": "approved"}}
+                # Fail closed: only an explicit boolean approval releases the aggregate node.
+                if is_explicit_approval(response):
+                    return {"final_state": {"approval_status": "approved"}}
+                return {"final_state": {"approval_status": "rejected"}}
 
             graph.add_node("approval_gate", approval_gate)
 
@@ -520,7 +627,15 @@ class WorkflowEngine:
                 graph.add_edge(edge.source, target)
 
         if require_approval and aggregate_node:
-            graph.add_edge("approval_gate", aggregate_node.id)
+            def route_after_approval(state: WorkflowState, _target: str = aggregate_node.id) -> str:
+                status = (state.get("final_state") or {}).get("approval_status")
+                return _target if status == "approved" else END
+
+            graph.add_conditional_edges(
+                "approval_gate",
+                route_after_approval,
+                {aggregate_node.id: aggregate_node.id, END: END},
+            )
 
         for node in nodes:
             if not outgoing[node.id] and node.id not in agent_nodes:
@@ -558,11 +673,13 @@ class WorkflowEngine:
                 store=store,
             )
 
+            # Portfolio-reading agents are user-specific: never served from / written to the ticker cache.
+            cacheable = handler != "start" and handler != "end" and not self._node_reads_portfolio(node)
             # Skip ticker cache mid tool-loop so we re-enter with ToolMessages.
-            if store and handler != "start" and handler != "end" and not mid_tool_loop:
+            if store and cacheable and not mid_tool_loop:
                 try:
                     ticker = exec_state.get("ticker", "") or exec_state.get("symbol", "")
-                    cache_key = f"{handler}:v2"
+                    cache_key = self._node_result_cache_key(node, handler)
                     if ticker:
                         cached_data = await read_store_value(store, ("ticker", ticker), cache_key)
                         result = self._node_result_from_cache(cached_data)
@@ -572,7 +689,8 @@ class WorkflowEngine:
                                 {
                                     "nodeId": result.node_id, "nodeName": result.node_name,
                                     "handler": result.handler, "status": result.status,
-                                    "ok": result.ok, "degraded": True,
+                                    "ok": result.ok, "degraded": result.degraded,
+                                    "cacheHit": True,
                                     "startedAt": started_at,
                                     "completedAt": datetime.now(timezone.utc).isoformat(),
                                     "durationMs": 0,
@@ -583,6 +701,7 @@ class WorkflowEngine:
                             state_update = {node.id: result.model_dump()}
                             if result.handler:
                                 state_update[result.handler] = result.model_dump()
+                            self._merge_evidence(state_update, result)
                             return {
                                 "final_state": state_update,
                                 "trace": [trace_entry],
@@ -652,10 +771,10 @@ class WorkflowEngine:
             )
             logger.info(f"[THINKING] Workflow node completed: id={node.id} handler={result.handler} label={node_label} status={result.status} ok={result.ok} duration={result.duration_ms}ms")
 
-            if store and handler != "start" and handler != "end":
+            if store and cacheable:
                 try:
                     ticker = state.get("final_state", {}).get("ticker", "") or state.get("final_state", {}).get("symbol", "")
-                    cache_key = f"{handler}:v2"
+                    cache_key = self._node_result_cache_key(node, handler)
                     if ticker and result.ok:
                         await store.aput(
                             ("ticker", ticker), cache_key,
@@ -669,6 +788,7 @@ class WorkflowEngine:
             state_update = {node.id: result.model_dump()}
             if result.handler:
                 state_update[result.handler] = result.model_dump()
+            self._merge_evidence(state_update, result)
             if is_agent_with_tools:
                 # Attribution for tools → agent return path
                 state_update["last_agent_id"] = node.id
@@ -797,10 +917,10 @@ class WorkflowEngine:
             f"ok={result.ok} rounds={current_round}"
         )
 
-        if store and handler != "start" and handler != "end":
+        if store and handler != "start" and handler != "end" and not self._node_reads_portfolio(node):
             try:
                 ticker = final_state.get("ticker", "") or final_state.get("symbol", "")
-                cache_key = f"{handler}:v2"
+                cache_key = self._node_result_cache_key(node, handler)
                 if ticker and result.ok:
                     await store.aput(
                         ("ticker", ticker),
@@ -817,6 +937,7 @@ class WorkflowEngine:
         }
         if result.handler:
             state_update[result.handler] = result.model_dump()
+        self._merge_evidence(state_update, result)
 
         out: dict[str, Any] = {
             "final_state": state_update,
@@ -901,6 +1022,8 @@ class WorkflowEngine:
 
         degraded_reasons: list[str] = []
         saw_interrupt = False
+        streamed_state: dict[str, Any] = dict(state or {})
+        streamed_outputs: dict[str, Any] = {}
         try:
             async for chunk in graph.astream(
                 initial_state,
@@ -920,6 +1043,10 @@ class WorkflowEngine:
                         continue
                     if not isinstance(update, dict):
                         continue
+                    if isinstance(update.get("final_state"), dict):
+                        streamed_state = deep_merge(streamed_state, update["final_state"])
+                    if isinstance(update.get("node_outputs"), dict):
+                        streamed_outputs.update(update["node_outputs"])
                     trace_entry = (update.get("trace") or [{}])[0]
                     if _is_tools_node_name(str(node_name)):
                         yield SSEEvent(
@@ -976,7 +1103,11 @@ class WorkflowEngine:
                 yield SSEEvent(event="degraded", data={"ok": True, "reasons": unique_reasons})
             yield SSEEvent(
                 event="workflow_complete",
-                data={"ok": True, "degraded": bool(degraded_reasons)},
+                data={
+                    "ok": True,
+                    "degraded": bool(degraded_reasons),
+                    "final_state": build_stream_final_state(streamed_state, streamed_outputs),
+                },
             )
         except GraphInterrupt:
             yield SSEEvent(
@@ -1017,6 +1148,8 @@ class WorkflowEngine:
         )
 
         saw_interrupt = False
+        streamed_state: dict[str, Any] = dict(state or {})
+        streamed_outputs: dict[str, Any] = {}
         try:
             async for chunk in graph.astream(
                 initial_state,
@@ -1036,6 +1169,10 @@ class WorkflowEngine:
                         continue
                     if not isinstance(update, dict):
                         continue
+                    if isinstance(update.get("final_state"), dict):
+                        streamed_state = deep_merge(streamed_state, update["final_state"])
+                    if isinstance(update.get("node_outputs"), dict):
+                        streamed_outputs.update(update["node_outputs"])
                     trace_entry = (update.get("trace") or [{}])[0]
 
                     if aggregate_node and node_name == aggregate_node.id:
@@ -1090,7 +1227,10 @@ class WorkflowEngine:
 
             if saw_interrupt:
                 return
-            yield SSEEvent(event="workflow_complete", data={"ok": True})
+            yield SSEEvent(
+                event="workflow_complete",
+                data={"ok": True, "final_state": build_stream_final_state(streamed_state, streamed_outputs)},
+            )
         except GraphInterrupt:
             yield SSEEvent(
                 event="human_interrupt",
@@ -1115,6 +1255,12 @@ class WorkflowEngine:
         When unknown, defaults require_approval=True because resume is used for
         approval-gate interrupts.
         """
+        if not is_valid_resume_value(resume_value):
+            return WorkflowResult(
+                ok=False,
+                error="resume_value must be an object with a boolean 'approved' field",
+                final_state={},
+            )
         meta = dict(self._thread_meta.get(thread_id) or {})
         had_layout = bool(meta.get("nodes")) and bool(meta.get("edges"))
         if nodes is None:
@@ -1155,7 +1301,7 @@ class WorkflowEngine:
         try:
             from langgraph.types import Command as LgCommand
             final_state = await graph.ainvoke(
-                LgCommand(resume=resume_value or {"approved": True}),
+                LgCommand(resume=resume_value),
                 config=config,
                 **self._graph_run_kwargs(),
             )

@@ -91,7 +91,7 @@ class ChatServiceSecurityTest {
         when(workflowMapper.findRunEvents(anyString())).thenReturn(Collections.<WorkflowRunEvent>emptyList());
         when(workflowMapper.findNodeRuns(anyString())).thenReturn(Collections.<WorkflowNodeRun>emptyList());
         /* Mockito returns an empty Map for Map-returning mocks; a cache "hit" would short-circuit reply(). */
-        when(helpAnswerCacheService.getIfAllowed(anyString(), any())).thenReturn(null);
+        when(helpAnswerCacheService.getIfAllowed(anyString(), any(), any())).thenReturn(null);
         when(langChainGateway.runAgent(any(), any(), any(), any())).thenAnswer(invocation -> {
             Map<String, Object> result = new LinkedHashMap<String, Object>();
             result.put("content", "copilot reply");
@@ -187,6 +187,7 @@ class ChatServiceSecurityTest {
     @Test
     void legacyThreadWithoutOwnerIsClaimedByTheCaller() {
         when(chatMapper.findThreadOwner("thread-legacy")).thenReturn(new LinkedHashMap<String, Object>());
+        when(chatMapper.updateThreadOwner("thread-legacy", "u-1", "tenant-1")).thenReturn(1);
         when(helpRoutingService.classifyExtended(anyString(), any())).thenReturn(intent(HelpIntent.RouteAction.COPILOT));
 
         Map<String, Object> body = body("继续这个会话");
@@ -196,6 +197,43 @@ class ChatServiceSecurityTest {
 
         assertThat(response.get("threadId")).isEqualTo("thread-legacy");
         verify(chatMapper).updateThreadOwner("thread-legacy", "u-1", "tenant-1");
+    }
+
+    @Test
+    void legacyClaimLostToAnotherUserIsRejected() {
+        Map<String, Object> winner = new LinkedHashMap<String, Object>();
+        winner.put("user_id", "u-2");
+        winner.put("tenant_id", "tenant-1");
+        when(chatMapper.findThreadOwner("thread-race"))
+                .thenReturn(new LinkedHashMap<String, Object>())
+                .thenReturn(winner);
+        when(chatMapper.updateThreadOwner("thread-race", "u-1", "tenant-1")).thenReturn(0);
+
+        Map<String, Object> body = body("继续这个会话");
+        body.put("threadId", "thread-race");
+
+        assertThatThrownBy(() -> chatService.reply(body, principal("u-1", "tenant-1")))
+                .isInstanceOf(IllegalArgumentException.class);
+        verify(chatMapper, never()).insertMessage(anyString(), eq("thread-race"), anyString(), anyString());
+    }
+
+    @Test
+    void reusingOwnThreadDoesNotInsertAgain() {
+        Map<String, Object> mine = new LinkedHashMap<String, Object>();
+        mine.put("user_id", "u-1");
+        mine.put("tenant_id", "tenant-1");
+        when(chatMapper.findThreadOwner("thread-mine")).thenReturn(mine);
+        when(helpRoutingService.classifyExtended(anyString(), any())).thenReturn(intent(HelpIntent.RouteAction.COPILOT));
+
+        for (int i = 0; i < 2; i++) {
+            Map<String, Object> body = body("继续这个会话");
+            body.put("threadId", "thread-mine");
+            chatService.reply(body, principal("u-1", "tenant-1"));
+        }
+
+        verify(chatMapper, never()).insertThread(anyString(), anyString());
+        verify(chatMapper, never()).insertThreadOwned(anyString(), anyString(), anyString(), anyString());
+        verify(chatMapper, never()).updateThreadOwner(anyString(), anyString(), anyString());
     }
 
     @Test

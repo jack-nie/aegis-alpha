@@ -262,7 +262,8 @@ def _draft_success(
     )
 
 
-# Default in-process corpus for orchestrator /help/execute when no chunks provided.
+# Test fixture only. Production help answers use Java-provided chunks (see routers/help.py);
+# this list is NOT served by /help/execute.
 DEFAULT_CORPUS: list[dict[str, Any]] = [
     {
         "id": "workflow-ops",

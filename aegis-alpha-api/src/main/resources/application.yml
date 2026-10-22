@@ -41,6 +41,12 @@ aegis:
     # When true, stale research layouts (layoutVersion < 2) are async-written back to DB after read-path refresh.
     # Read-path version check always applies for research keys regardless of this flag.
     refresh-default-layouts: ${AEGIS_ALPHA_REFRESH_DEFAULT_LAYOUTS:false}
+    # Roles allowed to approve/reject runs paused at the approval gate (待确认: seed users only have
+    # portfolio_manager/research_user; add e.g. portfolio_manager here if they should approve).
+    approver-roles: ${AEGIS_ALPHA_APPROVER_ROLES:desk,admin}
+    # User-authored layout limits (待确认): prompt/systemPrompt max length; modelName whitelist (empty = any).
+    max-prompt-chars: ${AEGIS_ALPHA_WORKFLOW_MAX_PROMPT_CHARS:8000}
+    allowed-model-names: ${AEGIS_ALPHA_WORKFLOW_ALLOWED_MODEL_NAMES:}
   langchain:
     enabled: ${AEGIS_ALPHA_LANGCHAIN_ENABLED:true}
     engine-url: ${AEGIS_ALPHA_LANGCHAIN_ENGINE_URL:http://127.0.0.1:8787}
@@ -50,6 +56,22 @@ aegis:
     base-url: ${AEGIS_ALPHA_LANGCHAIN_BASE_URL:${OPENAI_BASE_URL:}}
     connect-timeout-ms: ${AEGIS_ALPHA_LANGCHAIN_CONNECT_TIMEOUT_MS:5000}
     read-timeout-ms: ${AEGIS_ALPHA_LANGCHAIN_READ_TIMEOUT_MS:120000}
+  router:
+    # Intent routing: LLM results below llm-min-confidence never short-circuit keyword rules;
+    # research-priority-confidence is the minimum to dispatch a workflow from chat.
+    llm-min-confidence: ${AEGIS_ALPHA_ROUTER_LLM_MIN_CONFIDENCE:0.6}
+    research-priority-confidence: ${AEGIS_ALPHA_ROUTER_RESEARCH_PRIORITY_CONFIDENCE:0.6}
+    # Java classify read timeout must exceed the orchestrator AEGIS_ALPHA_ROUTER_TIMEOUT_MS (2500ms).
+    classify-connect-timeout-ms: ${AEGIS_ALPHA_ROUTER_CLASSIFY_CONNECT_TIMEOUT_MS:1000}
+    classify-read-timeout-ms: ${AEGIS_ALPHA_ROUTER_CLASSIFY_READ_TIMEOUT_MS:4000}
+    cache-ttl-ms: ${AEGIS_ALPHA_ROUTER_CACHE_TTL_MS:600000}
+    cache-max-entries: ${AEGIS_ALPHA_ROUTER_CACHE_MAX_ENTRIES:500}
+    breaker-failure-threshold: ${AEGIS_ALPHA_ROUTER_BREAKER_FAILURES:3}
+    breaker-open-ms: ${AEGIS_ALPHA_ROUTER_BREAKER_OPEN_MS:30000}
+  help:
+    # Local HelpLoopService is the single retrieval implementation. When true, the orchestrator
+    # /help/execute may re-draft the answer from the Java-selected chunks (falls back to local).
+    remote-generation-enabled: ${AEGIS_ALPHA_HELP_REMOTE_GENERATION_ENABLED:false}
   dify:
     enabled: ${AEGIS_ALPHA_DIFY_ENABLED:false}
     base-url: ${AEGIS_ALPHA_DIFY_BASE_URL:https://api.dify.ai/v1}
@@ -58,7 +80,7 @@ aegis:
     console-base-url: ${AEGIS_ALPHA_DIFY_CONSOLE_BASE_URL:}
     console-token: ${AEGIS_ALPHA_DIFY_CONSOLE_TOKEN:}
     node-callback-base-url: ${AEGIS_ALPHA_NODE_CALLBACK_BASE_URL:http://127.0.0.1:5178}
-    node-execution-token: ${AEGIS_ALPHA_NODE_EXECUTION_TOKEN:local-workflow-node-token}
+    node-execution-token: ${AEGIS_ALPHA_NODE_EXECUTION_TOKEN:}  # no default: set the shared service token explicitly
   market-data:
     yahoo-chart-url: ${AEGIS_ALPHA_YAHOO_CHART_URL:https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1m&range=1d}
     stooq-quote-url: ${AEGIS_ALPHA_STOOQ_QUOTE_URL:https://stooq.com/q/l/?s={symbol}.us&f=sd2t2ohlcv&h&e=csv}

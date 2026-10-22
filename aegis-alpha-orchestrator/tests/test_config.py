@@ -59,3 +59,12 @@ def test_effective_backend_url_with_callback():
         AEGIS_ALPHA_NODE_CALLBACK_BASE_URL="http://backend:5178",
     )
     assert s.effective_backend_url == "http://backend:5178"
+
+def test_router_defaults_are_below_java_classify_timeout():
+    """P1-2: Java classify read timeout (4000ms) must exceed the router LLM timeout."""
+    from app.config import Settings
+
+    settings = Settings()
+    assert settings.router_timeout_ms == 2500
+    assert settings.router_timeout_ms < 4000
+    assert settings.router_model == ""

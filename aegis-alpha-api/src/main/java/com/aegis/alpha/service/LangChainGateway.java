@@ -39,10 +39,11 @@ public class LangChainGateway {
                             @Value("${aegis.langchain.base-url:}") String baseUrl,
                             @Value("${aegis.langchain.connect-timeout-ms:3000}") int connectTimeoutMs,
                             @Value("${aegis.langchain.read-timeout-ms:30000}") int readTimeoutMs,
-                            @Value("${aegis.dify.node-execution-token:local-workflow-node-token}") String serviceToken) {
+                            @Value("${aegis.dify.node-execution-token:}") String serviceToken) {
         this.objectMapper = objectMapper;
         this.restTemplate = restTemplate(connectTimeoutMs, readTimeoutMs);
         this.shortTimeoutRestTemplate = restTemplate(2000, 5000);
+        this.classifyRestTemplate = restTemplate(DEFAULT_CLASSIFY_CONNECT_TIMEOUT_MS, DEFAULT_CLASSIFY_READ_TIMEOUT_MS);
         this.enabled = enabled;
         this.engineUrl = engineUrl;
         this.provider = provider;
@@ -94,8 +95,10 @@ public class LangChainGateway {
                 return callLangGraph(agent, state, node, subject, "/execute-node", delegatedToken);
             } catch (Exception ex) {
                 String handler = handler(node);
-                log.warn("[LangChainGateway] Orchestrator call failed for handler={}, subject={}, error={}", handler, subject, ex.getMessage());
-                return localStructuredNode(agent, state, node, subject, "LangGraph call failed: " + ex.getMessage());
+                log.warn("[LangChainGateway] Orchestrator call failed for handler={}, errorType={}", handler, ex.getClass().getSimpleName());
+                /* Enabled-but-failed is a failure, not a local result: let the caller retry / fail the node. */
+                throw new OrchestratorCallException("Orchestrator execute-node failed for handler " + handler
+                        + ": " + ex.getClass().getSimpleName(), ex);
             }
         }
         return localStructuredNode(agent, state, node, subject, "LangGraph disabled. Set AEGIS_ALPHA_LANGCHAIN_ENABLED=true to use the external engine.");
@@ -215,6 +218,42 @@ public class LangChainGateway {
         }
     }
 
+    /** True when the external LangGraph orchestrator is the configured execution engine. */
+    public boolean isEnabled() {
+        return enabled;
+    }
+
+    /**
+     * Run a whole workflow on the orchestrator ({@code POST /execute-workflow}) with the run id as the
+     * LangGraph thread id, so approval interrupts can later be resumed by {@link #resumeWorkflow}.
+     *
+     * @throws IllegalStateException when the orchestrator is disabled, unreachable or returns no body;
+     *         callers treat that as a run failure instead of fabricating node output.
+     */
+    @SuppressWarnings("unchecked")
+    public Map<String, Object> executeWorkflow(Map<String, Object> layout, String subject, Map<String, Object> state,
+                                               String delegatedToken, String threadId, boolean requireApproval) {
+        if (!enabled) {
+            throw new IllegalStateException("LangGraph orchestrator disabled");
+        }
+        String body = buildStreamBody(layout, subject, state, delegatedToken, threadId, requireApproval);
+        HttpHeaders headers = new HttpHeaders();
+        headers.setContentType(MediaType.APPLICATION_JSON);
+        applyServiceAuth(headers);
+        Object response;
+        try {
+            response = restTemplate.postForObject(
+                    trimSlash(engineUrl) + "/execute-workflow", new HttpEntity<String>(body, headers), Object.class);
+        } catch (Exception ex) {
+            log.warn("[LangChainGateway] execute-workflow failed: type={}", ex.getClass().getSimpleName());
+            throw new OrchestratorCallException("Orchestrator execute-workflow call failed: " + ex.getClass().getSimpleName(), ex);
+        }
+        if (!(response instanceof Map)) {
+            throw new IllegalStateException("Unexpected execute-workflow response");
+        }
+        return (Map<String, Object>) response;
+    }
+
     /**
      * Resume a paused approval thread. Does not throw: disabled or failed calls return ok=false.
      */
@@ -270,23 +309,29 @@ public class LangChainGateway {
             headers.setContentType(MediaType.APPLICATION_JSON);
             applyServiceAuth(headers);
             HttpEntity<Map<String, Object>> request = new HttpEntity<>(body, headers);
-            Object response = shortTimeoutRestTemplate.postForObject(trimSlash(engineUrl) + "/classify-intent", request, Object.class);
+            Object response = classifyRestTemplate.postForObject(trimSlash(engineUrl) + "/classify-intent", request, Object.class);
             if (response instanceof Map) {
                 return (Map<String, Object>) response;
             }
+            log.warn("[LangChainGateway] classifyIntent returned a non-object response (messageLength={})",
+                    message == null ? 0 : message.length());
             return null;
         } catch (Exception ex) {
+            log.warn("[LangChainGateway] classifyIntent failed: {} (messageLength={})",
+                    ex.getClass().getSimpleName(), message == null ? 0 : message.length());
             return null;
         }
     }
 
     /**
-     * Call orchestrator POST /help/execute (retrieve→grade→≤3→draft/escalate).
+     * Call orchestrator POST /help/execute to draft an answer from Java-selected, ACL pre-filtered
+     * {@code chunks} (the orchestrator holds no corpus of its own).
      * Returns null when disabled or remote call fails.
      */
     @SuppressWarnings("unchecked")
     public Map<String, Object> executeHelp(String message, java.util.List<String> principalRoles,
-                                           Map<String, Object> intentEnvelope) {
+                                           Map<String, Object> intentEnvelope,
+                                           java.util.List<Map<String, Object>> chunks) {
         if (!enabled) {
             return null;
         }
@@ -297,6 +342,7 @@ public class LangChainGateway {
             if (intentEnvelope != null) {
                 body.put("intent", intentEnvelope);
             }
+            body.put("chunks", chunks == null ? java.util.Collections.emptyList() : chunks);
             if (apiKey != null && !apiKey.trim().isEmpty()) {
                 body.put("apiKey", apiKey);
             }
@@ -312,7 +358,7 @@ public class LangChainGateway {
             }
             return null;
         } catch (Exception ex) {
-            log.debug("[LangChainGateway] executeHelp failed: {}", ex.getMessage());
+            log.warn("[LangChainGateway] executeHelp failed: {}", ex.getClass().getSimpleName());
             return null;
         }
     }
@@ -332,7 +378,8 @@ public class LangChainGateway {
         result.put("summary", localSummary(handler, subject, state));
         result.put("signals", java.util.Arrays.asList(signal("handler", handler), signal("subject", subject)));
         result.put("sources", java.util.Collections.singletonList(source("Local deterministic workflow fallback", "local")));
-        result.put("confidence", "finance.stock_recommendation_aggregate".equals(handler) ? 0.67 : 0.58);
+        /* No model ran, so there is no confidence to report (was a fabricated 0.58 / 0.67). */
+        result.put("confidence", null);
         Map<String, Object> data = new LinkedHashMap<>();
         data.put("reason", reason);
         data.put("fallback", true);
@@ -439,6 +486,27 @@ public class LangChainGateway {
     }
 
     private final RestTemplate shortTimeoutRestTemplate;
+
+    /*
+     * Classification must out-wait the orchestrator's own LLM timeout
+     * (AEGIS_ALPHA_ROUTER_TIMEOUT_MS, default 2500ms) or the paid-for answer is discarded.
+     */
+    static final int DEFAULT_CLASSIFY_CONNECT_TIMEOUT_MS = 1000;
+    static final int DEFAULT_CLASSIFY_READ_TIMEOUT_MS = 4000;
+    private volatile RestTemplate classifyRestTemplate;
+    private volatile int classifyReadTimeoutMs = DEFAULT_CLASSIFY_READ_TIMEOUT_MS;
+
+    @Autowired(required = false)
+    void configureClassifyTimeouts(
+            @Value("${aegis.router.classify-connect-timeout-ms:" + DEFAULT_CLASSIFY_CONNECT_TIMEOUT_MS + "}") int connectTimeoutMs,
+            @Value("${aegis.router.classify-read-timeout-ms:" + DEFAULT_CLASSIFY_READ_TIMEOUT_MS + "}") int readTimeoutMs) {
+        this.classifyReadTimeoutMs = Math.max(1, readTimeoutMs);
+        this.classifyRestTemplate = restTemplate(connectTimeoutMs, this.classifyReadTimeoutMs);
+    }
+
+    int classifyReadTimeoutMs() {
+        return classifyReadTimeoutMs;
+    }
 
     private RestTemplate restTemplate(int connectTimeoutMs, int readTimeoutMs) {
         SimpleClientHttpRequestFactory factory = new SimpleClientHttpRequestFactory();

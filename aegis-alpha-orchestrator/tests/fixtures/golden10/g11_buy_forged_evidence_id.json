@@ -1,0 +1,49 @@
+{
+  "id": "g11_buy_forged_evidence_id",
+  "description": "BUY citing an evidenceId the server never issued must be downgraded to INSUFFICIENT_DATA (P1-13).",
+  "draft": {
+    "recommendation": "BUY",
+    "confidence": 0.9,
+    "claims": [
+      {
+        "claimId": "c_last_price",
+        "field": "last_price",
+        "value": 100.0,
+        "unit": "USD",
+        "asOf": "2026-07-01",
+        "evidenceId": "ev-forged-999"
+      },
+      {
+        "claimId": "c_revenue",
+        "field": "revenue",
+        "value": 1000000000,
+        "evidenceId": "ev-forged-999"
+      }
+    ],
+    "sources": [
+      {
+        "id": "ev-forged-999",
+        "title": "made up",
+        "type": "market"
+      }
+    ]
+  },
+  "state": {
+    "symbol": "MSFT",
+    "evidence": {
+      "ev-market-0123456789ab": {
+        "evidenceId": "ev-market-0123456789ab",
+        "kind": "market_snapshot",
+        "symbol": "MSFT",
+        "asOf": "2026-07-01"
+      }
+    }
+  },
+  "expect": {
+    "recommendation": "INSUFFICIENT_DATA",
+    "ok": false,
+    "degraded": true,
+    "forcedInsufficient": true,
+    "missing_data_contains": ["claims_with_unknown_evidence"]
+  }
+}

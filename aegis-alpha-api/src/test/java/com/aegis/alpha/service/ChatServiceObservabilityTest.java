@@ -51,6 +51,8 @@ class ChatServiceObservabilityTest {
     @BeforeEach
     void setUp() {
         chatMapper = mock(ChatMapper.class);
+        /* Unstubbed findThreadOwner returns an empty map (legacy thread); let the conditional claim succeed. */
+        when(chatMapper.updateThreadOwner(anyString(), anyString(), anyString())).thenReturn(1);
         langChainGateway = mock(LangChainGateway.class);
         marketDataService = mock(MarketDataService.class);
         workflowService = mock(WorkflowService.class);
@@ -61,7 +63,7 @@ class ChatServiceObservabilityTest {
         helpTraceService = new HelpTraceService();
 
         when(helpService.safetyRefuse(anyString(), anyString(), any())).thenReturn(null);
-        when(helpAnswerCacheService.getIfAllowed(anyString(), any())).thenReturn(null);
+        when(helpAnswerCacheService.getIfAllowed(anyString(), any(), any())).thenReturn(null);
 
         Executor direct = new Executor() {
             @Override
@@ -100,7 +102,7 @@ class ChatServiceObservabilityTest {
                 .thenReturn(intent(HelpIntent.Domain.PRODUCT_HELP, HelpIntent.RouteAction.PLAYBOOK));
         Map<String, Object> cached = response("help-playbook", "缓存答案");
         cached.put("cacheHit", true);
-        when(helpAnswerCacheService.getIfAllowed(anyString(), any())).thenReturn(cached);
+        when(helpAnswerCacheService.getIfAllowed(anyString(), any(), any())).thenReturn(cached);
 
         chatService.reply(body("什么是 DEGRADED？"), principal);
 

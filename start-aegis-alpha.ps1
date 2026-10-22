@@ -211,6 +211,12 @@ if (-not $env:AEGIS_ALPHA_DB_URL) {
 if (-not $env:AEGIS_ALPHA_TOKEN_SECRET) {
     $env:AEGIS_ALPHA_TOKEN_SECRET = "aegis-local-token-secret-2026"
 }
+if (-not $env:AEGIS_ALPHA_NODE_EXECUTION_TOKEN) {
+    # Local launcher only: the sample service token is accepted solely with an explicit dev flag.
+    Write-Warning "AEGIS_ALPHA_NODE_EXECUTION_TOKEN not set; using the local sample token with AEGIS_ALPHA_DEV_MODE=true."
+    $env:AEGIS_ALPHA_NODE_EXECUTION_TOKEN = "local-workflow-node-token"
+    $env:AEGIS_ALPHA_DEV_MODE = "true"
+}
 if (-not $env:AEGIS_ALPHA_REDIS_HOST) {
     $env:AEGIS_ALPHA_REDIS_HOST = "127.0.0.1"
 }

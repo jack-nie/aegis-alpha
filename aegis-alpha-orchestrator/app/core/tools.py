@@ -3,10 +3,10 @@
 Tool instances are built here; role allowlists live in ``tool_registry``.
 ``create_tools`` remains the public full-list factory (backward compatible).
 
-Portfolio reads on the Java backend accept:
-- user Bearer token
-- service node-execution-token
-- run-scoped delegation token (typ=delegation, scope portfolio:read)
+Portfolio tools only run with a run-scoped delegation token (typ=delegation,
+scope portfolio:read) from the context override or ``AEGIS_ALPHA_DELEGATED_TOKEN``;
+without one they return ``{"error": "delegation_required", "status": "denied"}``
+instead of using the shared node-execution token.
 
 Use ``authorization_override`` contextvar or ``AEGIS_ALPHA_DELEGATED_TOKEN`` to
 inject a delegation token without changing the default node token path.
@@ -15,6 +15,7 @@ inject a delegation token without changing the default node token path.
 from __future__ import annotations
 
 import logging
+import re
 from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Any, Iterator
@@ -63,6 +64,18 @@ class ToolBackendClient:
             return delegated if delegated.lower().startswith("bearer ") else f"Bearer {delegated}"
 
         return f"Bearer {self._config.node_execution_token}"
+
+    def has_delegation(self) -> bool:
+        """True when a run-scoped delegation (context override or configured delegated token) exists.
+
+        The shared node-execution token is deliberately not a delegation: it is not bound to a user,
+        so portfolio reads must not fall back to it.
+        """
+        override = authorization_override.get()
+        if override and override.strip():
+            return True
+        delegated = (getattr(self._config, "delegated_token", None) or "").strip()
+        return bool(delegated)
 
     def _request_headers(self) -> dict[str, str]:
         headers = dict(self._extra_headers)
@@ -115,6 +128,19 @@ def get_backend_client(config: Settings) -> ToolBackendClient:
     return _backend_client
 
 
+PORTFOLIO_ID_PATTERN = re.compile(r"^\d{1,12}$")
+
+
+async def portfolio_read(client: ToolBackendClient, portfolio_id: Any, resource: str) -> dict[str, Any]:
+    """Guarded portfolio read: requires a run-scoped delegation and a numeric portfolio id."""
+    if not client.has_delegation():
+        return {"error": "delegation_required", "status": "denied"}
+    pid = str(portfolio_id).strip() if portfolio_id is not None else ""
+    if not PORTFOLIO_ID_PATTERN.match(pid):
+        return {"error": "invalid_portfolio_id", "status": "denied"}
+    return await client.get(f"/_backend/portfolio/{pid}/{resource}")
+
+
 def create_tools(config: Settings) -> list:
     """Create all LangChain tools (full list; backward compatible with pre-registry callers)."""
     client = get_backend_client(config)
@@ -162,8 +188,8 @@ def create_tools(config: Settings) -> list:
         Args:
             portfolio_id: Portfolio ID (e.g., '1', '2')
         """
-        # Portfolio positions/summary accept user token, node token, or portfolio:read delegation.
-        return await client.get(f"/_backend/portfolio/{portfolio_id}/positions")
+        # Requires a run-scoped delegation; never falls back to the shared node token.
+        return await portfolio_read(client, portfolio_id, "positions")
 
     @tool
     async def get_portfolio_summary(portfolio_id: str) -> dict[str, Any]:
@@ -172,7 +198,7 @@ def create_tools(config: Settings) -> list:
         Args:
             portfolio_id: Portfolio ID (e.g., '1', '2')
         """
-        return await client.get(f"/_backend/portfolio/{portfolio_id}/summary")
+        return await portfolio_read(client, portfolio_id, "summary")
 
     return [
         get_stock_quote,

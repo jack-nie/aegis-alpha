@@ -143,3 +143,33 @@ def test_e2e_classify_intent_with_auth(client):
     data = resp.json()
     # Either LLM mock or keyword path; contract is camelCase workflowKey present
     assert "workflowKey" in data or "workflow_key" in data or "error" in data or data.get("source")
+
+
+def test_e2e_execute_workflow_with_require_approval_returns_interrupted(client, monkeypatch):
+    """P1-14: Java now runs sync/queued workflows via /execute-workflow; the approval gate must pause."""
+    import uuid
+
+    from langgraph.checkpoint.memory import MemorySaver
+
+    from app.routers import workflow as workflow_router
+
+    # Fresh in-memory checkpointer: the app-level one is closed by earlier TestClient lifespans.
+    WorkflowEngine._graph_cache.clear()
+    engine = WorkflowEngine(workflow_router.node_executor, checkpointer=MemorySaver())
+    monkeypatch.setattr(workflow_router, "workflow_engine", engine)
+
+    layout = build_single_name_research_layout()
+    body = {
+        "nodes": layout["nodes"],
+        "edges": layout["edges"],
+        "subject": "AAPL",
+        "state": {"ticker": "AAPL"},
+        "requireApproval": True,
+        "threadId": f"p1-14-{uuid.uuid4()}",
+    }
+    resp = client.post("/execute-workflow", json=body, headers=_auth_headers())
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["ok"] is True, data.get("error")
+    assert data["final_state"].get("interrupted") is True
+    WorkflowEngine._graph_cache.clear()

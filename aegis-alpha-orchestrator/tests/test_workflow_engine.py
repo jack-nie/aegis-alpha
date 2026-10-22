@@ -745,3 +745,223 @@ async def test_durable_approval_resume_reloads_layout_after_restart():
             await store_reopened.close()
         close_checkpointer()
         temp_dir.cleanup()
+
+# ---- P1-5: approval gate is fail-closed and rejection skips aggregate ----
+
+
+async def _paused_engine(thread_id):
+    from langgraph.checkpoint.memory import InMemorySaver
+
+    from app.core.workflow_engine import WorkflowEngine
+    from app.models.responses import NodeResult
+
+    WorkflowEngine._graph_cache.clear()
+
+    class CountingExecutor:
+        def __init__(self):
+            self.calls = []
+
+        async def execute(self, node, state, subject="", **kwargs):
+            self.calls.append(node.id)
+            return NodeResult(ok=True, summary="node", node_id=node.id,
+                              handler=node.data.handler or "logic", node_name=node.id, subject=subject or "")
+
+    executor = CountingExecutor()
+    engine = WorkflowEngine(executor, checkpointer=InMemorySaver())
+    nodes = [
+        Node(id="start", data=NodeData(handler="start", nodeType="start")),
+        Node(id="market", data=NodeData(handler="finance.market_analysis")),
+        Node(id="aggregate", data=NodeData(handler="finance.stock_recommendation_aggregate")),
+        Node(id="end", data=NodeData(handler="end", nodeType="end")),
+    ]
+    edges = [
+        Edge(source="start", target="market"),
+        Edge(source="market", target="aggregate"),
+        Edge(source="aggregate", target="end"),
+    ]
+    paused = await engine.execute_workflow(
+        nodes=nodes, edges=edges, state={"ticker": "AAPL"}, subject="AAPL",
+        require_approval=True, thread_id=thread_id,
+    )
+    assert paused.ok is True, paused.error
+    assert "aggregate" not in executor.calls
+    return engine, executor
+
+
+@pytest.mark.asyncio
+async def test_rejection_does_not_run_aggregate():
+    from app.core.workflow_engine import WorkflowEngine
+
+    engine, executor = await _paused_engine("reject-thread")
+    try:
+        result = await engine.resume_workflow("reject-thread", {"approved": False, "comment": "no"})
+        assert result.ok is True, result.error
+        assert executor.calls.count("aggregate") == 0
+        assert (result.final_state or {}).get("approval_status") == "rejected"
+    finally:
+        WorkflowEngine._graph_cache.clear()
+
+
+@pytest.mark.asyncio
+async def test_approval_runs_aggregate_once():
+    from app.core.workflow_engine import WorkflowEngine
+
+    engine, executor = await _paused_engine("approve-thread")
+    try:
+        result = await engine.resume_workflow("approve-thread", {"approved": True})
+        assert result.ok is True, result.error
+        assert executor.calls.count("aggregate") == 1
+        assert (result.final_state or {}).get("approval_status") == "approved"
+    finally:
+        WorkflowEngine._graph_cache.clear()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("resume_value", [None, {}, {"approved": "yes"}, {"comment": "lgtm"}, {"approved": 1}])
+async def test_resume_without_boolean_decision_is_rejected_and_does_not_approve(resume_value):
+    from app.core.workflow_engine import WorkflowEngine
+
+    engine, executor = await _paused_engine("missing-decision-thread")
+    try:
+        result = await engine.resume_workflow("missing-decision-thread", resume_value)
+        assert result.ok is False
+        assert "approved" in (result.error or "")
+        assert "aggregate" not in executor.calls
+    finally:
+        WorkflowEngine._graph_cache.clear()
+
+
+@pytest.mark.asyncio
+async def test_resume_router_has_no_default_approval(monkeypatch):
+    from app.routers import workflow as workflow_router
+
+    captured = {}
+
+    async def fake_resume(thread_id, resume_value=None, **kwargs):
+        captured["resume_value"] = resume_value
+        from app.models.responses import WorkflowResult
+        return WorkflowResult(ok=False, error="x", final_state={})
+
+    monkeypatch.setattr(workflow_router.workflow_engine, "resume_workflow", fake_resume)
+    body = workflow_router.ResumeRequest.model_validate({"threadId": "t-1"})
+    await workflow_router.resume_workflow(body)
+    assert captured["resume_value"] is None
+
+
+def test_gate_helpers_are_fail_closed():
+    from app.core.workflow_engine import is_explicit_approval
+
+    assert is_explicit_approval({"approved": True}) is True
+    for value in (None, {}, {"approved": False}, {"approved": "true"}, {"approved": 1}, "approved"):
+        assert is_explicit_approval(value) is False
+
+
+# ---------------- P1-10: node result cache key + portfolio agents not cached ----------------
+
+
+def test_node_result_cache_key_binds_prompt_and_is_stable(mock_node_executor):
+    from app.core.workflow_engine import WorkflowEngine
+
+    a = Node(id="n1", data=NodeData(handler="finance.market_analysis", prompt="analyze A"))
+    a2 = Node(id="n1", data=NodeData(handler="finance.market_analysis", prompt="analyze A"))
+    b = Node(id="n1", data=NodeData(handler="finance.market_analysis", prompt="analyze B"))
+    key_a = WorkflowEngine._node_result_cache_key(a, "finance.market_analysis")
+    assert key_a == WorkflowEngine._node_result_cache_key(a2, "finance.market_analysis")
+    assert key_a != WorkflowEngine._node_result_cache_key(b, "finance.market_analysis")
+    assert key_a.startswith("finance.market_analysis:v3:")
+
+
+def test_portfolio_agent_is_not_cacheable(mock_node_executor):
+    from app.core.workflow_engine import WorkflowEngine
+
+    class _Tool:
+        def __init__(self, name):
+            self.name = name
+
+    registry = {
+        "get_stock_quote": _Tool("get_stock_quote"),
+        "get_portfolio_positions": _Tool("get_portfolio_positions"),
+        "get_portfolio_summary": _Tool("get_portfolio_summary"),
+    }
+    engine = WorkflowEngine(mock_node_executor, tool_registry=registry)
+    portfolio_agent = Node(id="pa", data=NodeData(handler="general.agent", agentId="specialist_portfolio"))
+    research_agent = Node(id="ra", data=NodeData(handler="general.agent", agentId="specialist_fundamentals"))
+    plain_node = Node(id="pn", data=NodeData(handler="finance.portfolio_review"))
+    assert engine._node_reads_portfolio(portfolio_agent) is True
+    assert engine._node_reads_portfolio(research_agent) is False
+    assert engine._node_reads_portfolio(plain_node) is False
+
+
+@pytest.mark.asyncio
+async def test_same_handler_different_prompt_does_not_hit_cache_and_hit_is_not_degraded(tmp_path):
+    from langgraph.checkpoint.memory import MemorySaver
+
+    from app.config import Settings
+    from app.core.memory_store import MemoryStoreManager
+    from app.core.workflow_engine import WorkflowEngine
+    from app.models.responses import NodeResult
+
+    calls: list[str] = []
+
+    async def _execute(node, state, subject="", **kwargs):
+        calls.append(node.data.prompt or "")
+        return NodeResult(
+            ok=True, status="completed", handler=node.data.handler, node_id=node.id,
+            node_name=node.id, subject=subject, summary=f"ran {node.data.prompt}",
+        )
+
+    executor = type("Executor", (), {})()
+    executor.execute = AsyncMock(side_effect=_execute)
+    manager = MemoryStoreManager(Settings(
+        AEGIS_ALPHA_LANGCHAIN_API_KEY="test",
+        AEGIS_ALPHA_DATA_DIR=str(tmp_path),
+        AEGIS_ALPHA_STORE_TTL_SECONDS=3600,
+    ))
+    await manager.initialize()
+
+    def _graph(prompt):
+        nodes = [
+            Node(id="start", data=NodeData(handler="start", nodeType="start")),
+            Node(id="n1", data=NodeData(handler="finance.market_analysis", prompt=prompt)),
+            Node(id="end", data=NodeData(handler="end", nodeType="end")),
+        ]
+        edges = [Edge(source="start", target="n1"), Edge(source="n1", target="end")]
+        return nodes, edges
+
+    try:
+        WorkflowEngine._graph_cache.clear()
+        engine = WorkflowEngine(executor, store=manager.store, checkpointer=MemorySaver())
+        for prompt in ("prompt A", "prompt B"):
+            nodes, edges = _graph(prompt)
+            result = await engine.execute_workflow(nodes, edges, {"ticker": "AAPL"}, "AAPL", require_approval=False)
+            assert result.ok, result.error
+        assert calls.count("prompt A") == 1
+        assert calls.count("prompt B") == 1
+
+        nodes, edges = _graph("prompt A")
+        result = await engine.execute_workflow(nodes, edges, {"ticker": "AAPL"}, "AAPL", require_approval=False)
+        assert result.ok, result.error
+        assert calls.count("prompt A") == 1, "identical node should be served from cache"
+        hit = [
+            {**(t.model_dump() if hasattr(t, "model_dump") else dict(t)), **(getattr(t, "model_extra", None) or {})}
+            for t in result.trace
+        ]
+        n1 = [t for t in hit if t.get("nodeId") == "n1" or t.get("node_id") == "n1"]
+        assert n1 and n1[-1].get("cacheHit") is True
+        assert n1[-1].get("degraded") is False
+    finally:
+        await manager.close()
+        WorkflowEngine._graph_cache.clear()
+
+
+def test_merge_evidence_lifts_node_evidence_into_final_state():
+    from app.core.workflow_engine import WorkflowEngine, deep_merge
+    from app.models.responses import NodeResult
+
+    r1 = NodeResult(node_id="a", data={"evidence": {"ev-market-1": {"kind": "market_snapshot"}}})
+    r2 = NodeResult(node_id="b", data={"evidence": {"ev-market-2": {"kind": "market_snapshot"}}})
+    u1 = WorkflowEngine._merge_evidence({"a": {}}, r1)
+    u2 = WorkflowEngine._merge_evidence({"b": {}}, r2)
+    merged = deep_merge(deep_merge({}, u1), u2)
+    assert set(merged["evidence"]) == {"ev-market-1", "ev-market-2"}
+    assert "evidence" not in WorkflowEngine._merge_evidence({}, NodeResult(node_id="c"))
