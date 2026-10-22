@@ -127,9 +127,12 @@ def test_aggregate_prompt_is_shared_and_allows_insufficient_data():
 
     prompt = node_executor.aggregate_system_prompt("Agent")
     assert "INSUFFICIENT_DATA" in prompt
-    source = inspect.getsource(node_executor.NodeExecutor.invoke_stream)
-    assert "aggregate_system_prompt(" in source
     assert "Do NOT say 'data insufficient'" not in inspect.getsource(node_executor)
+    # P2-11: the unused streaming path (and its divergent prompt) is gone.
+    from app.core import llm_client
+
+    assert not hasattr(node_executor.NodeExecutor, "invoke_stream")
+    assert not hasattr(llm_client.LLMClient, "invoke_stream")
 
 
 def test_parse_aggregate_trailer_takes_last_valid_block():
