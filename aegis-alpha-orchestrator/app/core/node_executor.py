@@ -10,7 +10,7 @@ import random
 import re
 import time
 from datetime import datetime, timezone
-from typing import Any, AsyncIterator
+from typing import Any
 
 from ..config import Settings
 from ..models.workflow import Node, AgentTemplate
@@ -21,6 +21,7 @@ from .context_assembly import (
     DEFAULT_TOKEN_BUDGET,
     assemble_model_context,
 )
+from .prompt_safety import USER_INPUT_TAG, fence
 from .critique import critique_recommendation_draft
 from .llm_client import AgentToolResult, LLMClient, LLMResponse
 from .market_data import MarketDataService
@@ -46,7 +47,9 @@ def render_prompt(template: str | None, *, subject: str, agent_name: str) -> str
     user-authored prompts with braces failed the same way.
     """
     text = template or ""
-    return text.replace("{subject}", str(subject or "")).replace("{agent_name}", str(agent_name or ""))
+    # P2-9: the subject is end-user input, so it is substituted as a labelled inline block.
+    subject_block = fence(USER_INPUT_TAG, str(subject or ""), inline=True)
+    return text.replace("{agent_name}", str(agent_name or "")).replace("{subject}", subject_block)
 
 
 def aggregate_system_prompt(agent_name: str) -> str:
@@ -730,63 +733,6 @@ class NodeExecutor:
             provider=self._config.provider,
             model=model or self._config.model,
         )
-
-    async def invoke_stream(
-        self,
-        node: Node,
-        state: dict[str, Any],
-        subject: str = "",
-        agent: AgentTemplate | None = None,
-        api_key: str | None = None,
-        base_url: str | None = None,
-        provider: str | None = None,
-        model: str | None = None,
-    ) -> AsyncIterator[str]:
-        """Stream LLM response token by token for aggregate nodes."""
-        effective_api_key = api_key or self._config.effective_api_key
-        effective_provider = provider or self._config.provider
-        if effective_provider not in ("openai", "deepseek"):
-            yield self._mock_result(node, self._resolve_handler(node), subject, state, datetime.now(timezone.utc).isoformat()).content or ""
-            return
-
-        data = node.data
-        handler = self._resolve_handler(node)
-        is_aggregate = handler == "finance.stock_recommendation_aggregate"
-        if not is_aggregate:
-            result = await self.execute(node, state, subject, agent, api_key, base_url, provider, model)
-            yield result.content or result.summary or ""
-            return
-
-        agent_name = (
-            (agent.name if agent else None)
-            or data.label
-            or data.title
-            or "Aegis Alpha Agent"
-        )
-        prompt = render_prompt(
-            data.prompt
-            or (agent.prompt if agent else None)
-            or PromptManager.get_prompt(handler),
-            subject=subject,
-            agent_name=agent_name,
-        )
-
-        context = _assemble_context(state, aggregate=True)
-
-        # Same protocol as the non-streaming aggregate path (the old streaming prompt forbade
-        # INSUFFICIENT_DATA, contradicting the recommendation policy).
-        system = aggregate_system_prompt(agent_name)
-
-        effective_model = model or self._config.model
-        effective_base = base_url or self._config.effective_base_url
-        effective_key = api_key or self._config.effective_api_key
-        timeout_ms = max(self._config.timeout_ms, 60000)
-
-        async for token in self._llm_client.invoke_stream(
-            system=system, prompt=prompt, context=context,
-            model=effective_model, temperature=0.2, timeout_ms=timeout_ms,
-        ):
-            yield token
 
     def _unsupported_provider_result(
         self,

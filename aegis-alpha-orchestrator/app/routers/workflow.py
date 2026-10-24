@@ -135,8 +135,6 @@ async def execute_node(body: NodeRequest) -> NodeResult:
                 state=body.state,
                 subject=body.subject or "",
                 agent=body.agent,
-                api_key=body.api_key,
-                base_url=body.base_url,
                 provider=body.provider,
                 model=body.model,
             )
@@ -161,8 +159,6 @@ async def execute_agent(body: NodeRequest) -> NodeResult:
                 state=body.state,
                 subject=body.subject or "",
                 agent=body.agent,
-                api_key=body.api_key,
-                base_url=body.base_url,
                 provider=body.provider,
                 model=body.model,
             )

@@ -306,26 +306,45 @@ public class KnowledgeService {
         return score;
     }
 
-    private static List<String> tokenize(String lower) {
+    /**
+     * Keyword-scoring tokenizer. Han characters are checked before the ASCII branch (Han is
+     * also {@code isLetterOrDigit}), so CJK runs yield bigrams like {@code help_loop.tokenize}.
+     */
+    static List<String> tokenize(String lower) {
         List<String> tokens = new ArrayList<String>();
+        if (lower == null || lower.isEmpty()) {
+            return tokens;
+        }
         StringBuilder ascii = new StringBuilder();
-        for (int i = 0; i < lower.length(); i++) {
+        int i = 0;
+        while (i < lower.length()) {
             char c = lower.charAt(i);
-            if (Character.isLetterOrDigit(c) || c == '_' || c == '-') {
-                ascii.append(c);
-            } else {
+            if (isHan(c)) {
                 if (ascii.length() > 0) {
                     tokens.add(ascii.toString());
                     ascii.setLength(0);
                 }
-                if (Character.UnicodeScript.of(c) == Character.UnicodeScript.HAN) {
-                    // CJK bigrams
-                    if (i + 1 < lower.length()
-                            && Character.UnicodeScript.of(lower.charAt(i + 1)) == Character.UnicodeScript.HAN) {
-                        tokens.add(lower.substring(i, i + 2));
+                int start = i;
+                while (i < lower.length() && isHan(lower.charAt(i))) {
+                    i++;
+                }
+                String run = lower.substring(start, i);
+                if (run.length() == 1) {
+                    tokens.add(run);
+                } else {
+                    for (int k = 0; k + 1 < run.length(); k++) {
+                        tokens.add(run.substring(k, k + 2));
                     }
                 }
+                continue;
             }
+            if (Character.isLetterOrDigit(c) || c == '_' || c == '-') {
+                ascii.append(c);
+            } else if (ascii.length() > 0) {
+                tokens.add(ascii.toString());
+                ascii.setLength(0);
+            }
+            i++;
         }
         if (ascii.length() > 0) {
             tokens.add(ascii.toString());

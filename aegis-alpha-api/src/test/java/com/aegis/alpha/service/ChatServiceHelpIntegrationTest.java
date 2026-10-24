@@ -246,6 +246,24 @@ class ChatServiceHelpIntegrationTest {
         verify(langChainGateway).runAgent(any(), any(), any(), any());
     }
 
+    // P2-11: the Copilot prompt comes from prompts/copilot-system.md and asks to state missing data.
+    @Test
+    void copilotUsesResourcePromptThatRequiresStatingMissingData() throws Exception {
+        when(langChainGateway.runAgent(any(), any(), any(), any())).thenReturn(new LinkedHashMap<String, Object>());
+        chatService.reply(body("你好", null));
+        ArgumentCaptor<com.aegis.alpha.domain.AgentTemplate> agent =
+                ArgumentCaptor.forClass(com.aegis.alpha.domain.AgentTemplate.class);
+        verify(langChainGateway).runAgent(agent.capture(), any(), any(), any());
+        String prompt = agent.getValue().getPrompt();
+        assertThat(prompt).isEqualTo(ChatService.loadCopilotPrompt());
+        assertThat(prompt).contains("明确说明缺失").doesNotContain("不要说数据不足");
+
+        String source = new String(java.nio.file.Files.readAllBytes(java.nio.file.Paths.get(
+                "src/main/java/com/aegis/alpha/service/ChatService.java")), java.nio.charset.StandardCharsets.UTF_8);
+        assertThat(source).doesNotContain("Do NOT say 'data insufficient'")
+                .doesNotContain("\\u4e0d\\u8981\\u8bf4\\u6570\\u636e\\u4e0d\\u8db3");
+    }
+
     @Test
     void replyKnowledgePathWhenPlaybookMissesButDocsMatch() {
         // Multi-step phrasing that is help-like but may miss exact playbook keywords

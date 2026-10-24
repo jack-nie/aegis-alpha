@@ -11,8 +11,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from .config import settings
-from .core.checkpointer_lifecycle import close_checkpointer
-from .dependencies import market_data, memory_store_manager
+from .core.checkpointer_lifecycle import close_async_checkpointer, open_async_checkpointer
+from .dependencies import CHECKPOINT_DB_PATH, market_data, memory_store_manager, workflow_engine
 from .core.tools import get_backend_client
 from .routers import health, workflow, intent, help as help_router
 
@@ -48,12 +48,20 @@ async def lifespan(app: FastAPI):
         )
     await market_data.start()
     await memory_store_manager.initialize()
+    try:
+        workflow_engine.attach_checkpointer(await open_async_checkpointer(CHECKPOINT_DB_PATH))
+        logger.info("Durable AsyncSqliteSaver checkpointer attached")
+    except ImportError:
+        logger.warning("langgraph-checkpoint-sqlite/aiosqlite missing; checkpoints stay in memory")
     yield
     await market_data.close()
     await get_backend_client(settings).close()
     await memory_store_manager.cleanup()
     await memory_store_manager.close()
-    close_checkpointer()
+    from langgraph.checkpoint.memory import MemorySaver
+
+    workflow_engine.attach_checkpointer(MemorySaver())
+    await close_async_checkpointer()
     logger.info("Shutting down Aegis Alpha Orchestrator")
 
 

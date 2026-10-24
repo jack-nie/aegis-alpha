@@ -4,6 +4,8 @@ import com.aegis.alpha.domain.Portfolio;
 import com.aegis.alpha.service.AuthService;
 import com.aegis.alpha.service.PortfolioService;
 import com.aegis.alpha.service.TokenService;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -16,6 +18,7 @@ import java.util.Map;
 @RequestMapping("/_backend/portfolio")
 public class PortfolioController {
     static final String SCOPE_PORTFOLIO_READ = "portfolio:read";
+    private static final Logger log = LoggerFactory.getLogger(PortfolioController.class);
 
     private final AuthService authService;
     private final PortfolioService portfolioService;
@@ -39,6 +42,14 @@ public class PortfolioController {
      * 3) run-scoped delegation token with portfolio:read
      */
     boolean isReadAuthorized(String authorization) {
+        return isReadAuthorized(authorization, null);
+    }
+
+    /**
+     * P2-21: a delegated read is audited with the token subject (uid), run and portfolio.
+     * There is no portfolio ownership model yet, so the subject is logged, not enforced (待确认).
+     */
+    boolean isReadAuthorized(String authorization, String portfolioId) {
         if (authorization == null) {
             return false;
         }
@@ -48,9 +59,22 @@ public class PortfolioController {
             return true;
         }
         if (tokenService.hasDelegationScope(token, SCOPE_PORTFOLIO_READ)) {
+            Map<String, Object> claims = tokenService.verify(token);
+            log.info("[PortfolioAudit] delegated portfolio:read sub={} tenant={} runId={} portfolioId={}",
+                    delegatedSubject(claims), claims == null ? null : claims.get("tenantId"),
+                    claims == null ? null : claims.get("runId"), portfolioId);
             return true;
         }
         return authService.me(authorization) != null;
+    }
+
+    /** Subject of a delegation token (uid, or sub when present). */
+    static String delegatedSubject(Map<String, Object> claims) {
+        if (claims == null) {
+            return null;
+        }
+        Object sub = claims.get("sub") != null ? claims.get("sub") : claims.get("uid");
+        return sub == null ? null : String.valueOf(sub);
     }
 
     @GetMapping("/portfolios")
@@ -73,7 +97,7 @@ public class PortfolioController {
     @GetMapping("/{portfolioId}/summary")
     public ResponseEntity<Map<String, Object>> summary(@RequestHeader(value = "Authorization", required = false) String authorization,
                                                        @PathVariable String portfolioId) {
-        if (!isReadAuthorized(authorization)) {
+        if (!isReadAuthorized(authorization, portfolioId)) {
             return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build();
         }
         return ResponseEntity.ok(portfolioService.summaryContract(portfolioId));
@@ -82,7 +106,7 @@ public class PortfolioController {
     @GetMapping("/{portfolioId}/positions")
     public ResponseEntity<Map<String, Object>> positions(@RequestHeader(value = "Authorization", required = false) String authorization,
                                                          @PathVariable String portfolioId) {
-        if (!isReadAuthorized(authorization)) {
+        if (!isReadAuthorized(authorization, portfolioId)) {
             return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build();
         }
         return ResponseEntity.ok(portfolioService.positionsContract(portfolioId));

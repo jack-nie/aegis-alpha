@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from typing import Any, AsyncIterator
+from typing import Any
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field
 
 from ..config import Settings
 from .context_assembly import normalize_token_usage
+from .prompt_safety import build_user_content, with_untrusted_notice
 
 logger = logging.getLogger(__name__)
 
@@ -195,9 +196,8 @@ class LLMClient:
         if tools:
             client = client.bind_tools(tools)
 
-        user_content = prompt
-        if context:
-            user_content = f"{prompt}\n\nWorkflow context:\n{context}"
+        user_content = build_user_content(prompt, context)
+        system = with_untrusted_notice(system)
 
         messages = [
             SystemMessage(content=system),
@@ -283,9 +283,8 @@ class LLMClient:
         if bindable and not force_final:
             client = client.bind_tools(bindable)
 
-        user_content = prompt
-        if context:
-            user_content = f"{prompt}\n\nWorkflow context:\n{context}"
+        user_content = build_user_content(prompt, context)
+        system = with_untrusted_notice(system)
 
         prior = list(prior_messages or [])
         seed_human: HumanMessage | None = None
@@ -367,36 +366,6 @@ class LLMClient:
             llm_response=llm_response,
             seed_human=seed_human,
         )
-
-    async def invoke_stream(
-        self,
-        system: str,
-        prompt: str,
-        context: str = "",
-        model: str | None = None,
-        temperature: float = 0.2,
-        timeout_ms: int | None = None,
-    ) -> AsyncIterator[str]:
-        resolved_model = self._resolve_model(model)
-        effective_timeout = timeout_ms or self._config.timeout_ms
-        client = self._build_client(resolved_model, temperature, effective_timeout)
-
-        user_content = prompt
-        if context:
-            user_content = f"{prompt}\n\nWorkflow context:\n{context}"
-
-        messages = [
-            SystemMessage(content=system),
-            HumanMessage(content=user_content),
-        ]
-
-        try:
-            async for chunk in client.astream(messages):
-                if hasattr(chunk, "content") and chunk.content:
-                    yield chunk.content
-        except Exception as e:
-            logger.error(f"LLM streaming failed: {e}")
-            raise
 
     async def classify_intent(
         self, message: str, tools: list[dict[str, Any]]

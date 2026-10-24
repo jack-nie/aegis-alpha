@@ -80,6 +80,21 @@ class WorkflowServiceHumanInterruptTest {
         when(mapper.findLayout("daily")).thenReturn(null);
 
         doInsertAndUpdate();
+        /* P2-17: conditional run update honours the stored status and cancel flag. */
+        when(mapper.updateRunStatusIf(any(WorkflowRun.class), org.mockito.ArgumentMatchers.<String>anyList(), anyBoolean()))
+                .thenAnswer(invocation -> {
+                    WorkflowRun update = invocation.getArgument(0);
+                    java.util.List<String> expected = invocation.getArgument(1);
+                    boolean requireNoCancel = invocation.getArgument(2);
+                    WorkflowRun current = storedRun.get();
+                    if (current == null || !current.getRunId().equals(update.getRunId())
+                            || !expected.contains(current.getStatus())
+                            || (requireNoCancel && current.getCancelRequested() != null && current.getCancelRequested() == 1)) {
+                        return 0;
+                    }
+                    storedRun.set(copyRun(update));
+                    return 1;
+                });
         when(mapper.transitionControlStatus(anyString(), anyString(), anyString())).thenAnswer(invocation -> {
             WorkflowRun current = storedRun.get();
             if (current == null || !current.getRunId().equals(invocation.getArgument(0))
@@ -349,6 +364,98 @@ class WorkflowServiceHumanInterruptTest {
                 "u", "u", "t", java.util.Collections.singletonList("admin")))).isTrue();
         assertThat(service.isApprover(new com.aegis.alpha.security.AuthenticatedPrincipal(
                 "u", "u", "t", java.util.Collections.singletonList("research_user")))).isFalse();
+    }
+
+    /* ---------------- P2-13 / Phase-1 leftover (a): resume trace materialization ---------------- */
+
+    private static Map<String, Object> traceEntry(String nodeId, boolean ok) {
+        Map<String, Object> entry = new LinkedHashMap<>();
+        entry.put("nodeId", nodeId);
+        entry.put("nodeName", nodeId);
+        entry.put("ok", ok);
+        entry.put("status", ok ? "completed" : "failed");
+        return entry;
+    }
+
+    private Map<String, Object> resumeWithTrace(String... nodeIds) {
+        Map<String, Object> resume = new LinkedHashMap<>();
+        resume.put("ok", true);
+        resume.put("final_state", new LinkedHashMap<String, Object>());
+        java.util.List<Object> trace = new java.util.ArrayList<Object>();
+        Map<String, Object> outputs = new LinkedHashMap<>();
+        for (String id : nodeIds) {
+            trace.add(traceEntry(id, true));
+            Map<String, Object> out = new LinkedHashMap<>();
+            out.put("summary", "out-" + id);
+            outputs.put(id, out);
+        }
+        resume.put("trace", trace);
+        resume.put("node_outputs", outputs);
+        return resume;
+    }
+
+    private static com.aegis.alpha.domain.WorkflowNodeRun recordedNode(String nodeId, int sort) {
+        com.aegis.alpha.domain.WorkflowNodeRun nodeRun = new com.aegis.alpha.domain.WorkflowNodeRun();
+        nodeRun.setNodeId(nodeId);
+        nodeRun.setSortOrder(sort);
+        nodeRun.setStatus("COMPLETED");
+        return nodeRun;
+    }
+
+    @Test
+    void approvalMaterializesNodesThatRanAfterResume() {
+        WorkflowRun paused = pausedRun("run-mat");
+        paused.setWorkflowKey("daily");
+        paused.setNodeCount(2);
+        storedRun.set(paused);
+        /* Nodes before the gate were recorded (streaming or non-streaming start). */
+        when(mapper.findNodeRuns("run-mat")).thenReturn(java.util.Arrays.asList(
+                recordedNode("start", 100), recordedNode("market", 200)));
+        /* The orchestrator returns the cumulative trace, including pre-pause nodes. */
+        when(langChainGateway.resumeWorkflow("run-mat", true))
+                .thenReturn(resumeWithTrace("start", "market", "approval_gate", "aggregate", "aggregate"));
+
+        WorkflowRun completed = service.decideApproval("run-mat", true);
+
+        ArgumentCaptor<com.aegis.alpha.domain.WorkflowNodeRun> inserted =
+                ArgumentCaptor.forClass(com.aegis.alpha.domain.WorkflowNodeRun.class);
+        verify(mapper, times(2)).insertNodeRun(inserted.capture());
+        assertThat(inserted.getAllValues()).extracting("nodeId").containsExactly("approval_gate", "aggregate");
+        assertThat(inserted.getAllValues()).extracting("sortOrder").containsExactly(300, 400);
+        assertThat(inserted.getAllValues().get(1).getOutputJson()).contains("out-aggregate");
+        verify(mapper, times(2)).insertRunEvent(org.mockito.ArgumentMatchers.argThat(
+                event -> "NODE_COMPLETED".equals(event.getEventType())));
+        assertThat(completed.getStatus()).isEqualTo("COMPLETED");
+        assertThat(completed.getNodeCount()).isEqualTo(4);
+    }
+
+    @Test
+    void rejectionAlsoMaterializesResumedNodesWithoutDuplicates() {
+        storedRun.set(pausedRun("run-mat-r"));
+        when(mapper.findNodeRuns("run-mat-r")).thenReturn(java.util.Arrays.asList(recordedNode("start", 100)));
+        when(langChainGateway.resumeWorkflow("run-mat-r", false)).thenReturn(resumeWithTrace("start", "approval_gate"));
+
+        service.decideApproval("run-mat-r", false);
+
+        ArgumentCaptor<com.aegis.alpha.domain.WorkflowNodeRun> inserted =
+                ArgumentCaptor.forClass(com.aegis.alpha.domain.WorkflowNodeRun.class);
+        verify(mapper, times(1)).insertNodeRun(inserted.capture());
+        assertThat(inserted.getValue().getNodeId()).isEqualTo("approval_gate");
+    }
+
+    @Test
+    void resumeThatPausesAgainKeepsRunWaiting() {
+        storedRun.set(pausedRun("run-again"));
+        Map<String, Object> resume = resumeWithTrace("approval_gate");
+        Map<String, Object> finalState = new LinkedHashMap<>();
+        finalState.put("interrupted", true);
+        resume.put("final_state", finalState);
+        when(langChainGateway.resumeWorkflow("run-again", true)).thenReturn(resume);
+
+        WorkflowRun after = service.decideApproval("run-again", true);
+
+        assertThat(after.getStatus()).isEqualTo("PAUSED");
+        assertThat(after.getControlStatus()).isEqualTo("HUMAN_INTERRUPT");
     }
 
     private static WorkflowRun pausedRun(String runId) {

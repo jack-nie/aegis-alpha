@@ -91,13 +91,20 @@ public class WorkflowController {
         return ResponseEntity.noContent().build();
     }
 
+    public ResponseEntity<List<WorkflowRun>> runs(String authorization) {
+        return runs(authorization, null, null);
+    }
+
+    /** P2-23: optional {@code limit} (default 50, max 200) and {@code offset}; the response is still a plain list. */
     @GetMapping("/workflow/runs")
-    public ResponseEntity<List<WorkflowRun>> runs(@RequestHeader(value = "Authorization", required = false) String authorization) {
+    public ResponseEntity<List<WorkflowRun>> runs(@RequestHeader(value = "Authorization", required = false) String authorization,
+                                                  @RequestParam(value = "limit", required = false) Integer limit,
+                                                  @RequestParam(value = "offset", required = false) Integer offset) {
         AuthenticatedPrincipal principal = authService.principal(authorization);
         if (principal == null) {
             return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build();
         }
-        return ResponseEntity.ok(workflowService.runsForPrincipal(principal));
+        return ResponseEntity.ok(workflowService.runsForPrincipal(principal, limit, offset));
     }
 
     @GetMapping("/workflow/runs/{runId}")
