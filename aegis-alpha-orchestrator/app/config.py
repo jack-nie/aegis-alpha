@@ -93,6 +93,12 @@ class Settings(BaseSettings):
     workflow_cleanup_checkpoints: bool = Field(default=False, alias="AEGIS_ALPHA_WORKFLOW_CLEANUP_CHECKPOINTS")
     # Agent-loop message queue (steering / follow-up, modeled on pi-mono's dual loop).
     # Defaults are 待确认 (pending product confirmation); see 消息排队实现说明.md.
+    # P4-16: backend selection (docs/多副本设计.md). Only sqlite/memory and memory are installed;
+    # postgres/redis are recognised but fail at startup until their dependencies are approved (待确认).
+    checkpointer_backend: str = Field(default="sqlite", alias="AEGIS_ALPHA_CHECKPOINTER_BACKEND")
+    run_queue_backend: str = Field(default="memory", alias="AEGIS_ALPHA_RUN_QUEUE_BACKEND")
+    # Declared replica count; >1 with process-local backends logs a warning at startup.
+    replicas: int = Field(default=1, alias="AEGIS_ALPHA_REPLICAS")
     message_queue_enabled: bool = Field(default=True, alias="AEGIS_ALPHA_MESSAGE_QUEUE_ENABLED")
     message_queue_steering_mode: str = Field(
         default="one-at-a-time", alias="AEGIS_ALPHA_MESSAGE_QUEUE_STEERING_MODE"
