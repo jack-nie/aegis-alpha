@@ -87,6 +87,6 @@
 - [x] Run Java full tests: `mvn test`.
 - [x] Run LangGraph checks: `node --check server.mjs`, `node --check scripts/smoke.mjs`, `npm run smoke`.
 - [x] Run frontend tests/build: `npm run test:portfolio-list`, `node scripts/enterprise-console-foundation.test.mjs`, `npm run build`.
-- [x] Restart local stack with `.\stop-aegis-alpha.ps1` and `.\start-aegis-alpha.ps1 -NoBrowser -SkipInstall`.
+- [x] Restart local stack with `.\aegis.ps1 restart -NoBrowser -SkipInstall`（启动脚本合并后的等价命令）.
 - [x] Run `.\scripts\smoke-aegis-alpha.ps1`.
 - [x] Record a session-memory checkpoint with changed files and verification results.

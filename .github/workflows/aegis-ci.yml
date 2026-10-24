@@ -75,23 +75,14 @@ jobs:
         run: python -m pytest tests -q --tb=short
       - name: Check syntax
         run: python -m py_compile app/main.py
-      - name: Start orchestrator
+      - name: Start orchestrator (unified launcher)
         shell: bash
+        working-directory: .
         env:
           AEGIS_ALPHA_LANGCHAIN_MOCK: "true"
           AEGIS_ALPHA_NODE_EXECUTION_TOKEN: local-workflow-node-token
-        run: |
-          python -m uvicorn app.main:app --host 0.0.0.0 --port 8787 > orchestrator-ci.log 2>&1 &
-          for i in {1..30}; do
-            if curl -fsS http://127.0.0.1:8787/health >/dev/null 2>&1; then
-              echo "Orchestrator is healthy"
-              exit 0
-            fi
-            sleep 1
-          done
-          echo "Orchestrator failed to start:"
-          cat orchestrator-ci.log
-          exit 1
+        # aegis.sh waits for /health and prints the log tail on failure (logs/orchestrator.log).
+        run: ./aegis.sh up orchestrator --skip-install
       - name: Smoke test
         shell: bash
         env:
@@ -146,6 +137,24 @@ jobs:
             exit 1
           fi
           echo "Smoke test passed (health + service auth + mock execute-workflow)"
+
+  launcher-lint:
+    name: Launcher scripts lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Shellcheck aegis.sh
+        run: |
+          bash -n aegis.sh
+          shellcheck aegis.sh
+      - name: Parse aegis.ps1
+        shell: pwsh
+        run: |
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile("$PWD/aegis.ps1", [ref]$null, [ref]$errors) | Out-Null
+          if ($errors) { $errors | ForEach-Object { Write-Error $_.ToString() }; exit 1 }
+          Write-Host "aegis.ps1 parsed OK"
 
   deploy:
     name: Deploy to production

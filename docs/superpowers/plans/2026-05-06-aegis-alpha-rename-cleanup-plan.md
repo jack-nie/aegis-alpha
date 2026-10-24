@@ -30,11 +30,10 @@
 ### Task 3: Update Runtime References
 
 **Files:**
-- Modify: `start-aegis-alpha.ps1`
-- Modify: `stop-aegis-alpha.ps1`
+- Modify: `aegis.ps1` / `aegis.sh`（本地统一启动入口）
 - Modify: `docker-compose.aegis-alpha.yml`
 - Modify: `scripts/smoke-aegis-alpha.ps1`
-- Modify: root batch wrappers
+- Modify: `aegis.cmd`
 
 - [ ] Replace old module paths with renamed module paths.
 - [ ] Keep existing ports and environment variable names stable for compatibility.
@@ -81,7 +80,7 @@
 - `npm run smoke` in `aegis-alpha-orchestrator`
 - `npm run test:market-data` in `aegis-alpha-orchestrator`
 - `npm run build` in `aegis-alpha-web`
-- `.\start-aegis-alpha.ps1`
+- `.\aegis.ps1 up`
 - `.\scripts\smoke-aegis-alpha.ps1`
 
 - [ ] Run every command and fix path/branding regressions until all pass.

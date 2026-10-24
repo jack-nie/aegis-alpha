@@ -46,4 +46,4 @@ Claude 每次新任务开始前应读取此文件。
 - 根目录临时脚本已迁到 `logs/archive-root-scripts/`（gitignored）
 - 前端 `App.jsx` 已拆净为壳（~210 行）；页面在 `app/features/*`，共用壳在 `app/components/*`，工具在 `app/lib/*`；Portfolio 主文件仍约 1.1k 行（业务密集，可按 tab 再拆）
 - Golden-10 门禁：`aegis-alpha-orchestrator/tests/test_golden10.py` + `tests/fixtures/golden10/`
-- 运行时健康检查：`scripts/smoke-aegis-alpha.ps1` / `scripts/health-check.ps1`（Python orchestrator 鉴权）
+- 运行时健康检查：`./aegis.sh smoke` / `.\aegis.ps1 smoke`（后者调用 `scripts/smoke-aegis-alpha.ps1`；Python orchestrator 鉴权）

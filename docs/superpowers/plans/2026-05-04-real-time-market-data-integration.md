@@ -150,7 +150,7 @@ Expected: PASS.
 
 - [ ] **Step 4: Start services**
 
-Run existing `start-aegis-alpha.ps1` or project-specific start commands. Verify:
+Run `.\aegis.ps1 up` (Windows) or `./aegis.sh up` (Linux/macOS). Verify:
 - `http://127.0.0.1:5174` loads.
 - Backend health/data endpoints respond.
 - LangGraph health responds.
