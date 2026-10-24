@@ -44,8 +44,10 @@ aegis:
     # Roles allowed to approve/reject runs paused at the approval gate (待确认: seed users only have
     # portfolio_manager/research_user; add e.g. portfolio_manager here if they should approve).
     approver-roles: ${AEGIS_ALPHA_APPROVER_ROLES:desk,admin}
-    # User-authored layout limits (待确认): prompt/systemPrompt max length; modelName whitelist (empty = any).
+    # User-authored layout limits: prompt/systemPrompt max length (decided: 8000).
     max-prompt-chars: ${AEGIS_ALPHA_WORKFLOW_MAX_PROMPT_CHARS:8000}
+    # Decision D4: empty = use aegis.models.allowed-names (registry list); a value may only narrow it
+    # (names outside it fail startup).
     allowed-model-names: ${AEGIS_ALPHA_WORKFLOW_ALLOWED_MODEL_NAMES:}
     # 待确认: node retries allowed per run across all nodes (java-fallback node loop; the only retry layer).
     run-retry-budget: ${AEGIS_ALPHA_WORKFLOW_RUN_RETRY_BUDGET:4}
@@ -59,8 +61,9 @@ aegis:
       # finishes and is recorded (CLIENT_DISCONNECTED event); true = stop reading and cancel the run.
       cancel-on-disconnect: ${AEGIS_ALPHA_WORKFLOW_STREAM_CANCEL_ON_DISCONNECT:false}
   models:
-    # P4-6 (待确认): model names a client may request (chat body.modelName, agent modelName).
-    # Keep in sync with aegis-alpha-orchestrator app/core/models.yaml.
+    # Model names a client may request (chat body.modelName, agent modelName, workflow node modelName).
+    # Decision D4: must equal the model names in aegis-alpha-orchestrator app/core/models.yaml
+    # (ModelRegistryConsistencyTest / test_model_registry_consistency.py enforce it).
     allowed-names: ${AEGIS_ALPHA_ALLOWED_MODEL_NAMES:deepseek-v4-flash,deepseek-v4-pro}
   agent:
     # P3-16 (待确认): default model for agents / inline workflow agents without an explicit modelName.

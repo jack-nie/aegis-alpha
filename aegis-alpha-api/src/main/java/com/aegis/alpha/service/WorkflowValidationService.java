@@ -1,7 +1,10 @@
 package com.aegis.alpha.service;
 
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
+
+import javax.annotation.PostConstruct;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -20,9 +23,53 @@ public class WorkflowValidationService {
     @Value("${aegis.workflow.max-prompt-chars:8000}")
     private int maxPromptChars = 8000;
 
-    /** Comma-separated allowed data.modelName values; empty = no whitelist (待确认). */
+    /**
+     * Comma-separated allowed data.modelName values. Decision D4: empty (the default) means "use the
+     * model registry list" ({@link ModelAllowlist}, aegis.models.allowed-names, which mirrors the
+     * orchestrator models.yaml) instead of "no whitelist". A non-empty value may only narrow that list;
+     * a name outside it fails startup ({@link #checkConsistency()}).
+     */
     @Value("${aegis.workflow.allowed-model-names:}")
     private String allowedModelNames = "";
+
+    private ModelAllowlist modelAllowlist = ModelAllowlist.defaults();
+
+    @Autowired(required = false)
+    void setModelAllowlist(ModelAllowlist modelAllowlist) {
+        if (modelAllowlist != null) {
+            this.modelAllowlist = modelAllowlist;
+        }
+    }
+
+    /** D4: fail fast when the workflow list names a model the registry list does not allow. */
+    @PostConstruct
+    void checkConsistency() {
+        Set<String> configured = parseNames(allowedModelNames);
+        Set<String> unknown = new HashSet<>(configured);
+        unknown.removeAll(modelAllowlist.names());
+        if (!unknown.isEmpty()) {
+            throw new IllegalStateException("aegis.workflow.allowed-model-names contains models outside "
+                    + "aegis.models.allowed-names / models.yaml: " + unknown);
+        }
+    }
+
+    /** Effective layout modelName allow-list (never empty). */
+    Set<String> effectiveAllowedModels() {
+        Set<String> configured = parseNames(allowedModelNames);
+        return configured.isEmpty() ? new HashSet<>(modelAllowlist.names()) : configured;
+    }
+
+    private static Set<String> parseNames(String csv) {
+        Set<String> out = new HashSet<>();
+        if (csv != null) {
+            for (String name : Arrays.asList(csv.split(","))) {
+                if (!name.trim().isEmpty()) {
+                    out.add(name.trim());
+                }
+            }
+        }
+        return out;
+    }
 
     /** P4-8: node-level data.maxToolRounds bounds (orchestrator clamps to the same range; default 3). */
     static final int MIN_TOOL_ROUNDS = 1;
@@ -53,12 +100,7 @@ public class WorkflowValidationService {
      * Not applied to system seeding or run-time layout loads, so existing stored layouts keep running.
      */
     public void validateExecutableFields(Map<String, Object> layout) {
-        Set<String> allowedModels = new HashSet<>();
-        for (String name : Arrays.asList(allowedModelNames.split(","))) {
-            if (!name.trim().isEmpty()) {
-                allowedModels.add(name.trim());
-            }
-        }
+        Set<String> allowedModels = effectiveAllowedModels();
         for (Map<String, Object> node : castList(layout == null ? null : layout.get("nodes"))) {
             Object rawData = node.get("data");
             if (!(rawData instanceof Map)) {
@@ -82,7 +124,7 @@ public class WorkflowValidationService {
                         + " maxToolRounds must be an integer between " + MIN_TOOL_ROUNDS + " and " + MAX_TOOL_ROUNDS + ".");
             }
             Object model = data.get("modelName");
-            if (model != null && !text(model).isEmpty() && !allowedModels.isEmpty() && !allowedModels.contains(text(model))) {
+            if (model != null && !text(model).isEmpty() && !allowedModels.contains(text(model))) {
                 throw new WorkflowValidationException("Workflow validation failed: node " + id + " modelName is not allowed.");
             }
         }
