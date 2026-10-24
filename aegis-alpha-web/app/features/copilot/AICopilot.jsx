@@ -3,6 +3,7 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { Icon } from "../../components/ui";
 import {
   parseRunResultJson,
   summarizeWorkflowRunResult,
