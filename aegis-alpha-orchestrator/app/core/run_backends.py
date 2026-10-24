@@ -150,3 +150,28 @@ def replica_safety_warnings(settings: Any, factory: CheckpointerFactory) -> list
         warnings.append("run queue / cancel flags are in-process: route /message-queue and /cancel-run "
                         "with sticky sessions on runId")
     return warnings
+
+
+class ReplicaConfigError(RuntimeError):
+    """Decision D9: >1 replica declared on process-local backends without an explicit override."""
+
+
+def enforce_replica_safety(settings: Any, factory: CheckpointerFactory) -> list[str]:
+    """Fail fast (D9) when replicas>1 run on process-local backends.
+
+    Returns the warnings to log when the operator set the explicit override
+    ``AEGIS_ALPHA_ALLOW_LOCAL_BACKENDS_MULTI_REPLICA=true`` (they guarantee every request of a run —
+    stream, resume, message-queue, cancel — reaches the replica that owns it, e.g. sticky routing on
+    runId/threadId). Without the override a misrouted resume/cancel would silently act on nothing, so
+    startup is refused instead of only warning.
+    """
+    warnings = replica_safety_warnings(settings, factory)
+    if not warnings:
+        return []
+    if bool(getattr(settings, "allow_local_backends_multi_replica", False)):
+        return [f"{w} (allowed by AEGIS_ALPHA_ALLOW_LOCAL_BACKENDS_MULTI_REPLICA)" for w in warnings]
+    raise ReplicaConfigError(
+        "AEGIS_ALPHA_REPLICAS>1 with process-local backends: " + "; ".join(warnings)
+        + ". Use one replica, or set AEGIS_ALPHA_ALLOW_LOCAL_BACKENDS_MULTI_REPLICA=true only if every "
+        "request of a run is routed to the same replica (docs/多副本设计.md)."
+    )
