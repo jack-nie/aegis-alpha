@@ -2,6 +2,7 @@ package com.aegis.alpha.controller;
 
 import com.aegis.alpha.service.AuthService;
 import com.aegis.alpha.service.MarketDataService;
+import com.aegis.alpha.service.TokenService;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -18,12 +19,15 @@ import java.util.Map;
 public class MarketDataController {
     private final AuthService authService;
     private final MarketDataService marketDataService;
+    private final TokenService tokenService;
     private final String nodeExecutionToken;
 
     public MarketDataController(AuthService authService, MarketDataService marketDataService,
+                                TokenService tokenService,
                                 @Value("${aegis.dify.node-execution-token:}") String nodeExecutionToken) {
         this.authService = authService;
         this.marketDataService = marketDataService;
+        this.tokenService = tokenService;
         this.nodeExecutionToken = nodeExecutionToken;
     }
 
@@ -35,6 +39,10 @@ public class MarketDataController {
         String token = authorization.startsWith("Bearer ") ? authorization.substring(7) : authorization;
         /* An unset service token must never match an empty bearer. */
         if (nodeExecutionToken != null && !nodeExecutionToken.trim().isEmpty() && nodeExecutionToken.equals(token)) {
+            return true;
+        }
+        // Run-scoped delegation from the orchestrator (all endpoints here are read-only).
+        if (tokenService.hasDelegationScope(token, PortfolioController.SCOPE_PORTFOLIO_READ)) {
             return true;
         }
         // Fall back to user token authentication
