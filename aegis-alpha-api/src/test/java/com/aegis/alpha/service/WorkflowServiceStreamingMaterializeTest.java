@@ -80,6 +80,12 @@ class WorkflowServiceStreamingMaterializeTest {
         definition.setEngine("langgraph");
         when(mapper.findDefinition("daily")).thenReturn(definition);
         when(mapper.findLayout("daily")).thenReturn(null);
+        // P3-16: "daily" is a digest workflow now; recommendation/backtest materialization is exercised on stock_analysis.
+        WorkflowDefinition stock = new WorkflowDefinition();
+        stock.setWorkflowKey("stock_analysis");
+        stock.setName("Stock Analysis");
+        stock.setEngine("langgraph");
+        when(mapper.findDefinition("stock_analysis")).thenReturn(stock);
 
         doAnswer(invocation -> {
             WorkflowRun run = invocation.getArgument(0);
@@ -150,7 +156,7 @@ class WorkflowServiceStreamingMaterializeTest {
         inputs.put("ticker", "AAPL");
         SseEmitter emitter = new SseEmitter(30_000L);
 
-        WorkflowRun result = service.startWithStreaming("daily", "AAPL analysis", inputs, emitter);
+        WorkflowRun result = service.startWithStreaming("stock_analysis", "AAPL analysis", inputs, emitter);
 
         assertThat(result).isNotNull();
         assertThat(result.getStatus()).isEqualTo("COMPLETED");
@@ -187,7 +193,7 @@ class WorkflowServiceStreamingMaterializeTest {
         when(langChainGateway.serviceAuthorizationHeader()).thenReturn(null);
 
         SseEmitter emitter = new SseEmitter(30_000L);
-        WorkflowRun result = service.startWithStreaming("daily", "degraded run", new HashMap<>(), emitter);
+        WorkflowRun result = service.startWithStreaming("stock_analysis", "degraded run", new HashMap<>(), emitter);
 
         assertThat(result.getStatus()).isEqualTo("COMPLETED");
         assertThat(result.getErrorMessage()).isEqualTo("DEGRADED");
@@ -218,11 +224,34 @@ class WorkflowServiceStreamingMaterializeTest {
                 .thenThrow(new RuntimeException("materialize boom"));
 
         SseEmitter emitter = new SseEmitter(30_000L);
-        WorkflowRun result = service.startWithStreaming("daily", "boom", new HashMap<>(), emitter);
+        WorkflowRun result = service.startWithStreaming("stock_analysis", "boom", new HashMap<>(), emitter);
 
         assertThat(result.getStatus()).isEqualTo("COMPLETED");
         verify(mapper, atLeastOnce()).insertRunEvent(argThat(event ->
                 event != null && "MATERIALIZE_FAILED".equals(event.getEventType())));
+    }
+
+    @Test
+    void startWithStreamingDigestRunMaterializesTraceOnly() throws Exception {
+        server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        byte[] responseBytes = "event: workflow_complete\ndata: {\"ok\":true}\n\n".getBytes(StandardCharsets.UTF_8);
+        server.createContext("/stream", exchange -> {
+            exchange.getResponseHeaders().set("Content-Type", "text/event-stream");
+            exchange.sendResponseHeaders(200, responseBytes.length);
+            try (OutputStream os = exchange.getResponseBody()) {
+                os.write(responseBytes);
+            }
+        });
+        server.start();
+        when(langChainGateway.streamWorkflowUrl()).thenReturn("http://127.0.0.1:" + server.getAddress().getPort() + "/stream");
+        when(langChainGateway.buildStreamBody(any(), any(), any(), nullable(String.class), nullable(String.class), anyBoolean(), any())).thenReturn("{}");
+        when(langChainGateway.serviceAuthorizationHeader()).thenReturn(null);
+
+        WorkflowRun result = service.startWithStreaming("daily", "market digest", new HashMap<>(), new SseEmitter(30_000L));
+
+        assertThat(result.getStatus()).isEqualTo("COMPLETED");
+        verify(backtestService, times(1)).materializeRunTrace(any(WorkflowRun.class));
+        verify(backtestService, never()).createFromWorkflowRun(any(), any());
     }
 
     @Test

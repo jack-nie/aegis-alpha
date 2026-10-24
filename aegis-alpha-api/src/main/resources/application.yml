@@ -38,7 +38,7 @@ aegis:
   seed-enabled: ${AEGIS_ALPHA_SEED_ENABLED:true}
   token-secret: ${AEGIS_ALPHA_TOKEN_SECRET:local-aegis-demo-secret}
   workflow:
-    # When true, stale research layouts (layoutVersion < 2) are async-written back to DB after read-path refresh.
+    # When true, stale versioned layouts (research + digest keys, layoutVersion < 4) are async-written back to DB after read-path refresh.
     # Read-path version check always applies for research keys regardless of this flag.
     refresh-default-layouts: ${AEGIS_ALPHA_REFRESH_DEFAULT_LAYOUTS:false}
     # Roles allowed to approve/reject runs paused at the approval gate (待确认: seed users only have
@@ -58,6 +58,10 @@ aegis:
       # 待确认: when the browser disconnects, false = keep consuming the orchestrator stream so the run
       # finishes and is recorded (CLIENT_DISCONNECTED event); true = stop reading and cancel the run.
       cancel-on-disconnect: ${AEGIS_ALPHA_WORKFLOW_STREAM_CANCEL_ON_DISCONNECT:false}
+  agent:
+    # P3-16 (待确认): default model for agents / inline workflow agents without an explicit modelName.
+    # Defaults to the orchestrator gateway model so one env var changes both.
+    default-model: ${AEGIS_AGENT_DEFAULT_MODEL:${AEGIS_ALPHA_LANGCHAIN_MODEL:deepseek-v4-flash}}
   langchain:
     enabled: ${AEGIS_ALPHA_LANGCHAIN_ENABLED:true}
     engine-url: ${AEGIS_ALPHA_LANGCHAIN_ENGINE_URL:http://127.0.0.1:8787}

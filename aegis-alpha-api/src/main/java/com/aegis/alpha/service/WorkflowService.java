@@ -45,7 +45,12 @@ public class WorkflowService {
 
     /** Bump when research default graphs change so stale DB layouts are skipped on read. */
     /** 3 = parallel specialist fan-out → fan-in (P2-14); older un-customised defaults are refreshed. */
-    static final int CURRENT_RESEARCH_LAYOUT_VERSION = 3;
+    /** P3-16: 4 = non-single-ticker closers moved to {@link #DIGEST_AGGREGATE_HANDLER}. */
+    static final int CURRENT_RESEARCH_LAYOUT_VERSION = 4;
+    static final String RECOMMENDATION_AGGREGATE_HANDLER = "finance.stock_recommendation_aggregate";
+    /** P3-16: closer for daily / portfolio / position / exit / sector workflows (no BUY/SELL policy, no backtest). */
+    static final String DIGEST_AGGREGATE_HANDLER = "finance.digest_aggregate";
+    static final String DIGEST_LAYOUT_PATTERN = "digest";
     /** Short-lived portfolio:read delegation for orchestrator tool calls (15 minutes). */
     static final long DELEGATED_PORTFOLIO_READ_TTL_MS = 15L * 60L * 1000L;
     static final String SCOPE_PORTFOLIO_READ = "portfolio:read";
@@ -55,6 +60,24 @@ public class WorkflowService {
             "earnings_reaction",
             "watchlist_digest"
     )));
+    /** P3-16: system workflows whose closing node is the digest handler; versioned like research keys. */
+    private static final Set<String> DIGEST_LAYOUT_KEYS = Collections.unmodifiableSet(new HashSet<String>(Arrays.asList(
+            "daily",
+            "exit_workflow",
+            "portfolio_workflow",
+            "position_workflow",
+            "sector-analyst-workflow"
+    )));
+
+    /** P3-16: default model for inline agents without data.modelName (待确认: falls back to aegis.langchain.model). */
+    @Value("${aegis.agent.default-model:deepseek-v4-flash}")
+    private String defaultModelName = "deepseek-v4-flash";
+
+    void setDefaultModelName(String defaultModelName) {
+        if (defaultModelName != null && !defaultModelName.trim().isEmpty()) {
+            this.defaultModelName = defaultModelName.trim();
+        }
+    }
 
     private final WorkflowMapper mapper;
     private final AgentMapper agentMapper;
@@ -510,7 +533,7 @@ public class WorkflowService {
             runLayout = layoutForRun(key, run.getWorkflowVersionId());
         } catch (Exception ex) {
             markRunFailed(run, ex);
-            backtestService.createFromWorkflowRun(mapper.findRun(run.getRunId()), inputs);
+            materializeRunOutcome(mapper.findRun(run.getRunId()), inputs, null);
             return;
         }
         executeAndFinish(run, inputs, runLayout, inputs);
@@ -589,16 +612,46 @@ public class WorkflowService {
         try {
             runWorkflow(run, executionInputs, runLayout);
             WorkflowRun completed = mapper.findRun(run.getRunId());
-            backtestService.createFromWorkflowRun(completed, backtestInputs);
+            materializeRunOutcome(completed, backtestInputs, runLayout);
             return completed;
         } catch (WorkflowStoppedException stopped) {
             return mapper.findRun(run.getRunId());
         } catch (Exception ex) {
             markRunFailed(run, ex);
             WorkflowRun failed = mapper.findRun(run.getRunId());
-            backtestService.createFromWorkflowRun(failed, backtestInputs);
+            materializeRunOutcome(failed, backtestInputs, runLayout);
             return failed;
         }
+    }
+
+    /**
+     * P3-16: single-ticker workflows get a backtest + recommendation record; digest layouts
+     * (closer = {@link #DIGEST_AGGREGATE_HANDLER}, no recommendation aggregate) only get their
+     * model-call / evidence trace materialized, never a BUY/SELL recommendation or backtest row.
+     */
+    private void materializeRunOutcome(WorkflowRun run, Map<String, Object> inputs, Map<String, Object> layout) {
+        if (run == null) {
+            return;
+        }
+        if (isDigestLayout(layout)) {
+            backtestService.materializeRunTrace(run);
+            return;
+        }
+        backtestService.createFromWorkflowRun(run, inputs);
+    }
+
+    boolean isDigestLayout(Map<String, Object> layout) {
+        boolean digest = false;
+        for (Map<String, Object> node : castList(layout == null ? null : layout.get("nodes"))) {
+            String handler = handler(node);
+            if (RECOMMENDATION_AGGREGATE_HANDLER.equals(handler)) {
+                return false;
+            }
+            if (DIGEST_AGGREGATE_HANDLER.equals(handler)) {
+                digest = true;
+            }
+        }
+        return digest;
     }
 
     /** P3-13: single FAILED write for the non-streaming paths (the seam for a conditional/CAS write later). */
@@ -800,7 +853,7 @@ public class WorkflowService {
                         recordRunEvent(run, "RUN_COMPLETED", null, null, "COMPLETED",
                                 degraded ? "Workflow run completed degraded (streaming)." : "Workflow run completed (streaming).",
                                 payload, 1000000);
-                        materializeStreamingCompletedRun(runId, safeInputs);
+                        materializeStreamingCompletedRun(runId, safeInputs, runLayout);
                         String completeData = data == null || data.trim().isEmpty()
                                 ? (degraded ? "{\"ok\":true,\"degraded\":true}" : "{\"ok\":true}")
                                 : data;
@@ -862,7 +915,7 @@ public class WorkflowService {
                     if (mapper.updateRunStatusIf(latest, RUNNING_ONLY, true) > 0) {
                         recordRunEvent(latest, "RUN_COMPLETED", null, null, "COMPLETED",
                                 "Workflow run completed (streaming stream end).", null, 1000000);
-                        materializeStreamingCompletedRun(runId, safeInputs);
+                        materializeStreamingCompletedRun(runId, safeInputs, runLayout);
                     }
                 }
                 closeEmitter();
@@ -983,13 +1036,13 @@ public class WorkflowService {
         }
     }
 
-    private void materializeStreamingCompletedRun(String runId, Map<String, Object> inputs) {
+    private void materializeStreamingCompletedRun(String runId, Map<String, Object> inputs, Map<String, Object> layout) {
         try {
             WorkflowRun completed = mapper.findRun(runId);
             if (completed == null || !"COMPLETED".equals(completed.getStatus())) {
                 return;
             }
-            backtestService.createFromWorkflowRun(completed, inputs);
+            materializeRunOutcome(completed, inputs, layout);
         } catch (Exception ex) {
             try {
                 WorkflowRun latest = mapper.findRun(runId);
@@ -2101,7 +2154,7 @@ public class WorkflowService {
         inline.setCategory("inline");
         inline.setTags("inline,workflow");
         inline.setPrompt(text(data(node), "prompt", text(data(node), "systemPrompt", "Execute this workflow agent node.")));
-        inline.setModelName(text(data(node), "modelName", "deepseek-v4-flash"));
+        inline.setModelName(text(data(node), "modelName", defaultModelName));
         inline.setToolsJson(text(data(node), "toolsJson", "[]"));
         return inline;
     }
@@ -2209,6 +2262,7 @@ public class WorkflowService {
         if ("daily".equals(definition.getWorkflowKey())) {
             layout.put("nodes", dailyNodes());
             layout.put("edges", dailyEdges());
+            attachResearchLayoutMetadata(layout, DIGEST_LAYOUT_PATTERN);
             return layout;
         }
         if ("deep_dive".equals(definition.getWorkflowKey())) {
@@ -2219,21 +2273,25 @@ public class WorkflowService {
         if ("exit_workflow".equals(definition.getWorkflowKey())) {
             layout.put("nodes", exitWorkflowNodes());
             layout.put("edges", exitWorkflowEdges());
+            attachResearchLayoutMetadata(layout, DIGEST_LAYOUT_PATTERN);
             return layout;
         }
         if ("portfolio_workflow".equals(definition.getWorkflowKey())) {
             layout.put("nodes", portfolioWorkflowNodes());
             layout.put("edges", portfolioWorkflowEdges());
+            attachResearchLayoutMetadata(layout, DIGEST_LAYOUT_PATTERN);
             return layout;
         }
         if ("position_workflow".equals(definition.getWorkflowKey())) {
             layout.put("nodes", positionWorkflowNodes());
             layout.put("edges", positionWorkflowEdges());
+            attachResearchLayoutMetadata(layout, DIGEST_LAYOUT_PATTERN);
             return layout;
         }
         if ("sector-analyst-workflow".equals(definition.getWorkflowKey())) {
             layout.put("nodes", sectorAnalystNodes());
             layout.put("edges", sectorAnalystEdges());
+            attachResearchLayoutMetadata(layout, DIGEST_LAYOUT_PATTERN);
             return layout;
         }
         if ("telegram_hourly_news_digest".equals(definition.getWorkflowKey())) {
@@ -2275,8 +2333,10 @@ public class WorkflowService {
         layout.put("metadata", metadata);
     }
 
+    /** Keys whose code-default layout is versioned and refreshed on read (research + P3-16 digest keys). */
     private boolean isResearchLayoutKey(String workflowKey) {
-        return workflowKey != null && RESEARCH_LAYOUT_KEYS.contains(workflowKey.trim());
+        return workflowKey != null && (RESEARCH_LAYOUT_KEYS.contains(workflowKey.trim())
+                || DIGEST_LAYOUT_KEYS.contains(workflowKey.trim()));
     }
 
     /**
@@ -2347,6 +2407,9 @@ public class WorkflowService {
         }
         if ("watchlist_digest".equals(workflowKey)) {
             return "watchlist_digest";
+        }
+        if (workflowKey != null && DIGEST_LAYOUT_KEYS.contains(workflowKey)) {
+            return DIGEST_LAYOUT_PATTERN;
         }
         return workflowKey;
     }
@@ -2434,7 +2497,7 @@ public class WorkflowService {
         nodes.add(flowNode("sector_rotation", "Sector Rotation", "agent", 320, 400, "finance.industry_share", null));
         nodes.add(flowNode("sentiment_pulse", "Sentiment Pulse", "agent", 600, 120, "finance.sentiment_monitor", null));
         nodes.add(flowNode("key_indicators", "Key Indicators", "agent", 600, 400, "finance.financial_interpretation", null));
-        nodes.add(flowNode("daily_summary", "Daily Briefing", "agent", 880, 260, "finance.stock_recommendation_aggregate", null));
+        nodes.add(flowNode("daily_summary", "Daily Briefing", "agent", 880, 260, DIGEST_AGGREGATE_HANDLER, null));
         nodes.add(flowNode("end", "End", "end", 1140, 260, "workflow.end", null));
         return nodes;
     }
@@ -2505,7 +2568,7 @@ public class WorkflowService {
         nodes.add(flowNode("take_profit", "Take Profit Review", "agent", 540, 380, "general.agent", null));
         nodes.add(flowNode("signal_decay", "Signal Decay", "agent", 780, 140, "finance.risk_assessment", null));
         nodes.add(flowNode("news_risk", "News Risk Scan", "agent", 780, 380, "finance.industry_news", null));
-        nodes.add(flowNode("exit_decision", "Exit Decision", "agent", 1020, 260, "finance.stock_recommendation_aggregate", null));
+        nodes.add(flowNode("exit_decision", "Exit Decision", "agent", 1020, 260, DIGEST_AGGREGATE_HANDLER, null));
         nodes.add(flowNode("end", "End", "end", 1260, 260, "workflow.end", null));
         return nodes;
     }
@@ -2531,7 +2594,7 @@ public class WorkflowService {
         nodes.add(flowNode("market_scan", "Market Scan", "agent", 320, 380, "finance.market_analysis", null));
         nodes.add(flowNode("sector_exposure", "Sector Exposure", "agent", 580, 140, "finance.industry_share", null));
         nodes.add(flowNode("risk_metrics", "Risk Metrics", "agent", 580, 380, "finance.risk_assessment", null));
-        nodes.add(flowNode("rebalance", "Rebalancing Plan", "agent", 840, 260, "finance.stock_recommendation_aggregate", null));
+        nodes.add(flowNode("rebalance", "Rebalancing Plan", "agent", 840, 260, DIGEST_AGGREGATE_HANDLER, null));
         nodes.add(flowNode("end", "End", "end", 1100, 260, "workflow.end", null));
         return nodes;
     }
@@ -2563,7 +2626,7 @@ public class WorkflowService {
         nodes.add(flowNode("tax_impact", "Tax Impact", "agent", 840, 540, "general.agent", null));
         nodes.add(flowNode("hedge", "Hedge Ideas", "agent", 1040, 140, "general.agent", null));
         nodes.add(flowNode("action_items", "Action Items", "agent", 1040, 440, "general.agent", null));
-        nodes.add(flowNode("aggregate", "Portfolio Summary", "agent", 1260, 340, "finance.stock_recommendation_aggregate", null));
+        nodes.add(flowNode("aggregate", "Portfolio Summary", "agent", 1260, 340, DIGEST_AGGREGATE_HANDLER, null));
         nodes.add(flowNode("end", "End", "end", 1480, 340, "workflow.end", null));
         return nodes;
     }
@@ -2604,7 +2667,7 @@ public class WorkflowService {
         nodes.add(flowNode("risk", "Sector Risk", "agent", 1000, 100, "finance.risk_assessment", null));
         nodes.add(flowNode("catalysts", "Catalyst Calendar", "agent", 1000, 340, "general.agent", null));
         nodes.add(flowNode("rotation", "Rotation Signal", "agent", 1000, 580, "finance.market_analysis", null));
-        nodes.add(flowNode("recommendation", "Sector Call", "agent", 1240, 340, "finance.stock_recommendation_aggregate", null));
+        nodes.add(flowNode("recommendation", "Sector Call", "agent", 1240, 340, DIGEST_AGGREGATE_HANDLER, null));
         nodes.add(flowNode("end", "End", "end", 1480, 340, "workflow.end", null));
         return nodes;
     }

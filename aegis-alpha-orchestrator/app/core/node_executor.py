@@ -37,6 +37,19 @@ def _assemble_context(state: dict[str, Any], *, aggregate: bool = False) -> str:
 
 
 AGGREGATE_HANDLER = "finance.stock_recommendation_aggregate"
+# P3-16: closer for non-single-ticker workflows (daily / portfolio / exit / sector). Large context
+# budget like the aggregate, but no recommendation policy, critique or BUY/SELL label.
+DIGEST_HANDLER = "finance.digest_aggregate"
+
+
+def digest_system_prompt(agent_name: str) -> str:
+    return (
+        f"You are {agent_name}. Summarize the upstream workflow outputs into a digest. "
+        "Use only facts present in the context and state missing data explicitly. "
+        "Do not output a BUY/SELL/HOLD rating or target price. "
+        "Return only JSON. Do not use markdown. "
+        'The JSON shape is {"summary":"string","signals":[...],"sources":[...],"confidence":0.5,"data":{}}.'
+    )
 
 
 def render_prompt(template: str | None, *, subject: str, agent_name: str) -> str:
@@ -129,6 +142,7 @@ HANDLERS = {
     "general.web_search",
     "finance.financial_interpretation",
     "finance.stock_recommendation_aggregate",
+    "finance.digest_aggregate",
     "finance.fundamental_analysis",
     "finance.technical_analysis",
     "finance.valuation_analysis",
@@ -331,11 +345,14 @@ class NodeExecutor:
 
         # Build context (budgeted assembly, not a JSON prefix cut).
         is_aggregate = handler == "finance.stock_recommendation_aggregate"
-        context = _assemble_context(state, aggregate=is_aggregate)
+        is_digest = handler == DIGEST_HANDLER
+        context = _assemble_context(state, aggregate=is_aggregate or is_digest)
 
         # Build system prompt
         if is_aggregate:
             system = aggregate_system_prompt(agent_name)
+        elif is_digest:
+            system = digest_system_prompt(agent_name)
         else:
             system = (
                 f"You are {agent_name}. "
@@ -344,7 +361,7 @@ class NodeExecutor:
             )
 
         # Invoke LLM
-        timeout_ms = max(self._config.timeout_ms, 60000) if is_aggregate else self._config.timeout_ms
+        timeout_ms = max(self._config.timeout_ms, 60000) if (is_aggregate or is_digest) else self._config.timeout_ms
         response = await self._llm_client.invoke(
             system=system,
             prompt=prompt,
@@ -379,6 +396,10 @@ class NodeExecutor:
             ]
 
         result_data = _with_token_usage(response.data or {}, response)
+        if is_digest:
+            # A digest never carries an actionable label into stream summaries / Java materialization.
+            result_data.pop("recommendation", None)
+            result_data["digest"] = True
         if is_aggregate:
             trailer = parse_aggregate_trailer(response.content)
             for key in ("recommendation", "claims", "missingData", "conflicts"):

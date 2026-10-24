@@ -129,7 +129,7 @@ class WorkflowServiceDefaultLayoutTest {
 
         assertThat(nodeIds(layout)).containsExactly(
                 "start", "fundamentals", "news", "valuation", "risk", "aggregate", "end");
-        assertThat(layoutVersion(layout)).isEqualTo(3);
+        assertThat(layoutVersion(layout)).isEqualTo(WorkflowService.CURRENT_RESEARCH_LAYOUT_VERSION);
         assertThat(layout.get("updatedAt")).isEqualTo("2026-01-01 00:00:00");
     }
 
@@ -151,7 +151,7 @@ class WorkflowServiceDefaultLayoutTest {
         edges.add(edge);
         stored.put("edges", edges);
         Map<String, Object> metadata = new LinkedHashMap<String, Object>();
-        metadata.put("layoutVersion", 3);
+        metadata.put("layoutVersion", WorkflowService.CURRENT_RESEARCH_LAYOUT_VERSION);
         metadata.put("pattern", "fan_in_aggregate");
         stored.put("metadata", metadata);
 
@@ -164,7 +164,7 @@ class WorkflowServiceDefaultLayoutTest {
         Map<String, Object> layout = service.layout("stock_analysis");
 
         assertThat(nodeIds(layout)).containsExactly("start", "end");
-        assertThat(layoutVersion(layout)).isEqualTo(3);
+        assertThat(layoutVersion(layout)).isEqualTo(WorkflowService.CURRENT_RESEARCH_LAYOUT_VERSION);
     }
 
     // P2-14: a stored, non-custom version-2 (sequential) default is refreshed to the parallel layout.
@@ -189,7 +189,7 @@ class WorkflowServiceDefaultLayoutTest {
 
         Map<String, Object> layout = service.layout("stock_analysis");
 
-        assertThat(layoutVersion(layout)).isEqualTo(3);
+        assertThat(layoutVersion(layout)).isEqualTo(WorkflowService.CURRENT_RESEARCH_LAYOUT_VERSION);
         List<String> fromStart = new ArrayList<String>();
         List<String> intoAggregate = new ArrayList<String>();
         for (Map<String, Object> edge : (List<Map<String, Object>>) layout.get("edges")) {
@@ -228,6 +228,89 @@ class WorkflowServiceDefaultLayoutTest {
         Map<String, Object> layout = service.layout("earnings_reaction");
 
         assertThat(nodeIds(layout)).containsExactly("start", "custom_only", "end");
+    }
+
+    /* ---------------- P3-16: digest closer for non-single-ticker workflows ---------------- */
+
+    @Test
+    void nonSingleTickerDefaultsCloseWithDigestHandler() {
+        Map<String, String> closers = new LinkedHashMap<String, String>();
+        closers.put("daily", "daily_summary");
+        closers.put("exit_workflow", "exit_decision");
+        closers.put("portfolio_workflow", "rebalance");
+        closers.put("position_workflow", "aggregate");
+        closers.put("sector-analyst-workflow", "recommendation");
+        for (Map.Entry<String, String> entry : closers.entrySet()) {
+            stubDefinition(entry.getKey(), entry.getKey());
+            Map<String, Object> layout = service.layout(entry.getKey());
+            assertThat(handlerOf(layout, entry.getValue())).as(entry.getKey())
+                    .isEqualTo(WorkflowService.DIGEST_AGGREGATE_HANDLER);
+            assertThat(handlers(layout)).as(entry.getKey()).doesNotContain("finance.stock_recommendation_aggregate");
+            assertResearchMetadata(layout, WorkflowService.DIGEST_LAYOUT_PATTERN);
+            assertThat(service.isDigestLayout(layout)).isTrue();
+        }
+        stubDefinition("stock_analysis", "Stock Analysis");
+        assertThat(service.isDigestLayout(service.layout("stock_analysis"))).isFalse();
+    }
+
+    @Test
+    void staleStoredDailyLayoutWithStockAggregateIsRefreshedToDigest() throws Exception {
+        stubDefinition("daily", "Daily Graph");
+        Map<String, Object> stored = new LinkedHashMap<String, Object>();
+        stored.put("workflowKey", "daily");
+        List<Map<String, Object>> nodes = new ArrayList<Map<String, Object>>();
+        nodes.add(simpleNode("start", "scheduler.manual", "Start", "start"));
+        nodes.add(simpleNode("daily_summary", "finance.stock_recommendation_aggregate", "Daily Briefing", "agent"));
+        nodes.add(simpleNode("end", "workflow.end", "End", "end"));
+        stored.put("nodes", nodes);
+        stored.put("edges", Collections.emptyList());
+        Map<String, Object> metadata = new LinkedHashMap<String, Object>();
+        metadata.put("layoutVersion", 3);
+        stored.put("metadata", metadata);
+        WorkflowLayout record = new WorkflowLayout();
+        record.setWorkflowKey("daily");
+        record.setLayoutJson(objectMapper.writeValueAsString(stored));
+        when(mapper.findLayout("daily")).thenReturn(record);
+
+        Map<String, Object> layout = service.layout("daily");
+
+        assertThat(handlerOf(layout, "daily_summary")).isEqualTo(WorkflowService.DIGEST_AGGREGATE_HANDLER);
+        assertThat(layoutVersion(layout)).isEqualTo(WorkflowService.CURRENT_RESEARCH_LAYOUT_VERSION);
+    }
+
+    @Test
+    void customDailyLayoutIsNotRefreshed() throws Exception {
+        stubDefinition("daily", "Daily Graph");
+        Map<String, Object> stored = new LinkedHashMap<String, Object>();
+        stored.put("workflowKey", "daily");
+        List<Map<String, Object>> nodes = new ArrayList<Map<String, Object>>();
+        nodes.add(simpleNode("start", "scheduler.manual", "Start", "start"));
+        nodes.add(simpleNode("mine", "finance.stock_recommendation_aggregate", "Mine", "agent"));
+        nodes.add(simpleNode("end", "workflow.end", "End", "end"));
+        stored.put("nodes", nodes);
+        stored.put("edges", Collections.emptyList());
+        Map<String, Object> metadata = new LinkedHashMap<String, Object>();
+        metadata.put("custom", true);
+        metadata.put("layoutVersion", 1);
+        stored.put("metadata", metadata);
+        WorkflowLayout record = new WorkflowLayout();
+        record.setWorkflowKey("daily");
+        record.setLayoutJson(objectMapper.writeValueAsString(stored));
+        when(mapper.findLayout("daily")).thenReturn(record);
+
+        Map<String, Object> layout = service.layout("daily");
+
+        assertThat(nodeIds(layout)).containsExactly("start", "mine", "end");
+    }
+
+    @SuppressWarnings("unchecked")
+    private static String handlerOf(Map<String, Object> layout, String nodeId) {
+        for (Map<String, Object> node : (List<Map<String, Object>>) layout.get("nodes")) {
+            if (nodeId.equals(node.get("id"))) {
+                return String.valueOf(((Map<String, Object>) node.get("data")).get("handler"));
+            }
+        }
+        return null;
     }
 
     private static Map<String, Object> simpleNode(String id, String handler, String label, String nodeType) {
