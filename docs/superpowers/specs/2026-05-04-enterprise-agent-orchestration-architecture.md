@@ -558,8 +558,7 @@ Scope:
 - Docker, compose, CI/CD, migration tooling, test pyramid, fault injection, secret hygiene.
 
 Primary files:
-- `start-aegis-alpha.ps1`
-- `stop-aegis-alpha.ps1`
+- `aegis.sh` / `aegis.ps1`（本地统一启动入口，原分散的启动/停止脚本已合并）
 - `aegis-alpha-api/pom.xml`
 - `aegis-alpha-web/package.json`
 - `aegis-alpha-orchestrator/package.json`

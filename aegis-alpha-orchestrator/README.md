@@ -31,17 +31,19 @@ app/
 
 ### 1. Setup Virtual Environment
 
-```powershell
-cd aegis-alpha-orchestrator
-.\setup-venv.ps1
+```bash
+# 在仓库根目录：创建 aegis-alpha-orchestrator/.venv 并按 constraints.txt 安装依赖
+./aegis.sh setup orchestrator        # Windows: .\aegis.ps1 setup orchestrator
 ```
 
 ### 2. Start Services
 
-```powershell
-# From project root
-.\restart-local.ps1
+```bash
+# 在仓库根目录：只启动 orchestrator，或去掉服务名一次启动全部
+./aegis.sh up orchestrator           # Windows: .\aegis.ps1 up orchestrator
 ```
+
+完整说明见 [docs/本地启动说明.md](../docs/本地启动说明.md)。
 
 ### 3. Verify
 
