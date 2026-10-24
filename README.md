@@ -6,9 +6,9 @@ Aegis Alpha is an investment research and AI agent workflow orchestration platfo
 
 | Module | Stack | Role |
 |--------|--------|------|
-| `aegis-alpha-api` | Spring Boot / Java 17 / MyBatis / MySQL | REST API, auth, portfolio/backtest/governance, workflow runtime glue |
+| `aegis-alpha-api` | Spring Boot 2.7 / Java 8 source level (built with JDK 17 in CI) / MyBatis / MySQL | REST API, auth, portfolio/backtest/governance, workflow runtime glue |
 | `aegis-alpha-web` | Next.js 15 / React 19 / JSX / Tailwind | Web console (App Router) |
-| `aegis-alpha-orchestrator` | Python 3.11 / FastAPI / LangGraph | Agent execution, intent routing, streaming workflow engine |
+| `aegis-alpha-orchestrator` | Python 3.11+ / FastAPI / LangGraph 1.2 (tested pins: `constraints.txt`) | Agent execution, intent routing, streaming workflow engine |
 
 Runtime still accepts existing `AEGIS_ALPHA_*` environment variables for local compatibility.
 
