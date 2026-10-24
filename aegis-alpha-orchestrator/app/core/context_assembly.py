@@ -34,6 +34,7 @@ _SKIP_NODE_KEYS = frozenset(
         "usage_turns",
         "usage_by_node",
         "usageTotals",
+        "copilotChat",
     }
 )
 

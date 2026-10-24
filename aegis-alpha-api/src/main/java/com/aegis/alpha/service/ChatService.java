@@ -846,6 +846,9 @@ public class ChatService {
 
         Map<String, Object> state = trustedState(body, principal);
         state.put("message", message);
+        // P4-12: server-built multi-turn context (overwrites any client-supplied copilotChat). The
+        // orchestrator renders it inside <chat_history>/<user_input> fences.
+        state.put(COPILOT_CHAT_STATE_KEY, copilotChat(threadId, message));
         String ticker = tickerFrom(body, state, message);
         if (!ticker.isEmpty()) {
             state.put("ticker", ticker);
@@ -945,6 +948,93 @@ public class ChatService {
             return new LinkedHashMap<String, Object>((Map<String, Object>) value);
         }
         return new LinkedHashMap<String, Object>();
+    }
+
+    static final String COPILOT_CHAT_STATE_KEY = "copilotChat";
+    /** P4-12 (待确认): recent turns replayed verbatim; older ones are folded into a summary. */
+    static final int COPILOT_HISTORY_TURNS = 12;
+    static final int COPILOT_HISTORY_SUMMARY_SCAN = 24;
+    static final int COPILOT_HISTORY_TURN_MAX_CHARS = 1500;
+    static final int COPILOT_HISTORY_SUMMARY_MAX_CHARS = 1200;
+    private static final int COPILOT_SUMMARY_LINE_CHARS = 100;
+
+    /**
+     * P4-12: {@code {message, history:[{role,content}], historySummary}} for the copilot. The current
+     * user message (already persisted at the start of the chat turn) is excluded from history. Older messages
+     * become a deterministic extractive summary (no extra LLM call; an LLM summary is 待确认).
+     */
+    Map<String, Object> copilotChat(String threadId, String message) {
+        Map<String, Object> chat = new LinkedHashMap<String, Object>();
+        chat.put("message", message == null ? "" : message);
+        List<Map<String, Object>> rows = null;
+        try {
+            rows = threadId == null ? null
+                    : mapper.findRecentMessages(threadId, COPILOT_HISTORY_TURNS + 1 + COPILOT_HISTORY_SUMMARY_SCAN);
+        } catch (RuntimeException ex) {
+            log.warn("[Chat] history unavailable for copilot, errorType={}", ex.getClass().getSimpleName());
+        }
+        List<Map<String, Object>> newestFirst = new ArrayList<Map<String, Object>>();
+        if (rows != null) {
+            for (Map<String, Object> row : rows) {
+                if (row != null) {
+                    newestFirst.add(row);
+                }
+            }
+        }
+        if (!newestFirst.isEmpty()) {
+            Map<String, Object> newest = newestFirst.get(0);
+            if ("user".equals(ownerText(newest, "role"))
+                    && String.valueOf(newest.get("content")).trim().equals(message == null ? "" : message.trim())) {
+                newestFirst.remove(0);
+            }
+        }
+        int recentCount = Math.min(COPILOT_HISTORY_TURNS, newestFirst.size());
+        List<Map<String, Object>> history = new ArrayList<Map<String, Object>>();
+        for (int i = recentCount - 1; i >= 0; i--) {
+            Map<String, Object> turn = historyTurn(newestFirst.get(i), COPILOT_HISTORY_TURN_MAX_CHARS);
+            if (turn != null) {
+                history.add(turn);
+            }
+        }
+        chat.put("history", history);
+        List<String> summaryLines = new ArrayList<String>();
+        for (int i = newestFirst.size() - 1; i >= recentCount; i--) {
+            Map<String, Object> turn = historyTurn(newestFirst.get(i), COPILOT_SUMMARY_LINE_CHARS);
+            if (turn != null) {
+                summaryLines.add(("user".equals(turn.get("role")) ? "用户: " : "助手: ") + turn.get("content"));
+            }
+        }
+        if (!summaryLines.isEmpty()) {
+            StringBuilder summary = new StringBuilder();
+            // keep the most recent of the older lines when over budget
+            for (int i = summaryLines.size() - 1; i >= 0; i--) {
+                String line = summaryLines.get(i);
+                if (summary.length() + line.length() + 1 > COPILOT_HISTORY_SUMMARY_MAX_CHARS) {
+                    break;
+                }
+                summary.insert(0, line + "\n");
+            }
+            chat.put("historySummary", summary.toString().trim());
+        }
+        return chat;
+    }
+
+    private Map<String, Object> historyTurn(Map<String, Object> row, int maxChars) {
+        String role = ownerText(row, "role");
+        if (!"user".equals(role) && !"assistant".equals(role)) {
+            return null;
+        }
+        String content = row.get("content") == null ? "" : String.valueOf(row.get("content")).trim();
+        if (content.isEmpty()) {
+            return null;
+        }
+        if (content.length() > maxChars) {
+            content = content.substring(0, maxChars) + "…";
+        }
+        Map<String, Object> turn = new LinkedHashMap<String, Object>();
+        turn.put("role", role);
+        turn.put("content", content);
+        return turn;
     }
 
     static final String COPILOT_HANDLER = "general.agent";

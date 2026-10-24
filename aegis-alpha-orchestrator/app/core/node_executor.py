@@ -22,7 +22,7 @@ from .context_assembly import (
     assemble_model_context,
     with_estimated_cost,
 )
-from .prompt_safety import USER_INPUT_TAG, fence
+from .prompt_safety import USER_INPUT_TAG, append_chat_turn, fence
 from .critique import critique_recommendation_draft
 from .log_safety import text_len
 from .llm_client import AgentToolResult, LLMClient, LLMResponse
@@ -437,6 +437,8 @@ class NodeExecutor:
             subject=subject,
             agent_name=agent_name,
         )
+        # P4-12: copilot history + current message, fenced (no-op for workflow nodes).
+        prompt = append_chat_turn(prompt, state)
 
         # Build context (budgeted assembly, not a JSON prefix cut).
         is_aggregate = handler == "finance.stock_recommendation_aggregate"
@@ -783,6 +785,8 @@ class NodeExecutor:
             subject=subject,
             agent_name=agent_name,
         )
+        # P4-12: copilot history + current message, fenced (no-op for workflow nodes).
+        prompt = append_chat_turn(prompt, state)
 
         context = _assemble_context(state, aggregate=False)
 
