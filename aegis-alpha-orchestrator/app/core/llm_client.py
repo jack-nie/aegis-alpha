@@ -16,6 +16,7 @@ from .agent_context import ContextPolicy, compact, is_context_overflow, transfor
 from .context_assembly import normalize_token_usage
 from .message_queue import is_queued_human_message
 from .model_registry import ModelResolution, get_model_registry
+from .agent_envelope import convert_to_llm
 from .prompt_safety import build_user_content, with_untrusted_notice
 
 logger = logging.getLogger(__name__)
@@ -318,7 +319,8 @@ class LLMClient:
         user_content = build_user_content(prompt, context)
         system = with_untrusted_notice(system)
 
-        prior = list(prior_messages or [])
+        # P4-15: the single LLM boundary — envelopes/legacy messages → provider messages.
+        prior = convert_to_llm(prior_messages or [])
         seed_human: HumanMessage | None = None
         chat: list[BaseMessage] = [SystemMessage(content=system)]
 
@@ -339,7 +341,7 @@ class LLMClient:
             seed_human = HumanMessage(content=user_content)
             chat.append(seed_human)
             # P4-11: steering queued before the first call reaches that first request.
-            chat.extend(list(leading_messages or []))
+            chat.extend(convert_to_llm(leading_messages or []))
 
         # P4-8: transformContext — elide old tool results / compact over budget (graph state untouched).
         policy = self._context_policy(resolved_model)

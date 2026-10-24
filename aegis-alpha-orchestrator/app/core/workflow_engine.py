@@ -58,6 +58,7 @@ from .message_queue import (
 )
 from .node_executor import NodeExecutor, aggregate_gate_passed
 from .run_registry import RunCancelled, RunHandle, RunRegistry, await_or_cancel
+from .agent_envelope import conversation_kinds
 from .tool_pipeline import (
     ToolPolicy,
     build_tool_node,
@@ -1698,6 +1699,8 @@ class WorkflowEngine:
                 "completedAt": datetime.now(timezone.utc).isoformat(),
                 "durationMs": result.duration_ms,
                 **({"turns": turns} if turns else {}),
+                # P4-15: conversation audit by envelope kind (no message bodies).
+                **({"conversation": conversation_kinds(prior_for_tools)} if mid_tool_loop else {}),
                 **({"contextStats": agent_result.context_stats} if getattr(agent_result, "context_stats", None) else {}),
             },
             result.data,
