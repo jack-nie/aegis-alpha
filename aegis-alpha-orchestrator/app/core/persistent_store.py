@@ -29,6 +29,27 @@ def _expiry_timestamp(now: float, ttl_seconds: int | None, default_ttl_seconds: 
     return now + ttl_seconds
 
 
+def _encode_namespace(namespace: tuple[str, ...]) -> str:
+    """P3-6: JSON-encode namespaces so labels containing "/" round-trip unambiguously."""
+    return json.dumps(list(namespace), ensure_ascii=False, separators=(",", ":"))
+
+
+def _legacy_namespace(namespace: tuple[str, ...]) -> str:
+    """Pre-P3-6 encoding ("/"-joined); still read and cleaned up on write/delete."""
+    return "/".join(namespace)
+
+
+def _decode_namespace(raw: str) -> tuple[str, ...]:
+    if raw.startswith("["):
+        try:
+            decoded = json.loads(raw)
+        except ValueError:
+            decoded = None
+        if isinstance(decoded, list) and all(isinstance(part, str) for part in decoded):
+            return tuple(decoded)
+    return tuple(raw.split("/"))
+
+
 def _is_expired(value: dict[str, Any] | None, now: float) -> bool:
     """True when _expires_at is a positive timestamp strictly before now.
 
@@ -60,6 +81,8 @@ class PersistentStore(BaseStore):
         self._db_path = db_path
         self._default_ttl = default_ttl_seconds
         self._memory = InMemoryStore()
+        # P3-6: own key index for prefix scans instead of reading InMemoryStore private state.
+        self._keys: dict[tuple[str, ...], set[str]] = {}
         self._db: aiosqlite.Connection | None = None
         self._initialized = False
 
@@ -89,6 +112,7 @@ class PersistentStore(BaseStore):
         # Drop the previous cache first. Otherwise cleanup deletes SQLite rows
         # and the in-memory copy keeps serving them.
         self._memory = InMemoryStore()
+        self._keys = {}
         now = time.time()
         cursor = await self._db.execute(
             "SELECT namespace, key, value, expires_at FROM store "
@@ -99,7 +123,7 @@ class PersistentStore(BaseStore):
         loaded = 0
         for row in rows:
             namespace_str, key, value_json, expires_at = row
-            namespace = tuple(namespace_str.split("/"))
+            namespace = _decode_namespace(namespace_str)
             value = json.loads(value_json)
             if not isinstance(value, dict):
                 value = {"value": value}
@@ -115,7 +139,7 @@ class PersistentStore(BaseStore):
                 value.pop("_expires_at", None)
             else:
                 value["_expires_at"] = column_expiry
-            await self._memory.aput(namespace, key, value)
+            await self._cache_put(namespace, key, value)
             loaded += 1
         logger.info(f"Loaded {loaded} entries from persistent store")
 
@@ -140,7 +164,7 @@ class PersistentStore(BaseStore):
         if expires_at is not None:
             value_with_meta["_expires_at"] = expires_at
 
-        namespace_str = "/".join(namespace)
+        namespace_str = _encode_namespace(namespace)
         value_json = json.dumps(value_with_meta, ensure_ascii=False, default=str)
 
         await self._db.execute(
@@ -148,8 +172,9 @@ class PersistentStore(BaseStore):
             "VALUES (?, ?, ?, ?, ?)",
             (namespace_str, key, value_json, expires_at, now),
         )
+        await self._delete_legacy_row(namespace, key)
         await self._db.commit()
-        await self._memory.aput(namespace, key, value_with_meta)
+        await self._cache_put(namespace, key, value_with_meta)
 
     async def aget(self, namespace: tuple[str, ...], key: str) -> Item | None:
         await self._ensure_db()
@@ -163,20 +188,40 @@ class PersistentStore(BaseStore):
 
     async def adelete(self, namespace: tuple[str, ...], key: str) -> None:
         await self._ensure_db()
-        namespace_str = "/".join(namespace)
         await self._db.execute(
             "DELETE FROM store WHERE namespace = ? AND key = ?",
-            (namespace_str, key),
+            (_encode_namespace(namespace), key),
         )
+        await self._delete_legacy_row(namespace, key)
         await self._db.commit()
         await self._memory.adelete(namespace, key)
+        keys = self._keys.get(namespace)
+        if keys is not None:
+            keys.discard(key)
+            if not keys:
+                self._keys.pop(namespace, None)
 
-    def _items_in_namespace(self, namespace: tuple[str, ...]) -> list[Item]:
-        """Prefix scan of the cache. InMemoryStore applies limit before TTL filtering."""
+    async def _delete_legacy_row(self, namespace: tuple[str, ...], key: str) -> None:
+        legacy = _legacy_namespace(namespace)
+        if legacy != _encode_namespace(namespace):
+            await self._db.execute(
+                "DELETE FROM store WHERE namespace = ? AND key = ?",
+                (legacy, key),
+            )
+
+    async def _cache_put(self, namespace: tuple[str, ...], key: str, value: dict[str, Any]) -> None:
+        await self._memory.aput(namespace, key, value)
+        self._keys.setdefault(namespace, set()).add(key)
+
+    async def _items_in_namespace(self, namespace: tuple[str, ...]) -> list[Item]:
+        """Prefix scan over the key index (InMemoryStore.asearch applies limit before TTL filtering)."""
         matched: list[Item] = []
-        for item_namespace, keys in list(self._memory._data.items()):
+        for item_namespace, keys in list(self._keys.items()):
             if len(item_namespace) >= len(namespace) and item_namespace[: len(namespace)] == namespace:
-                matched.extend(list(keys.values()))
+                for key in sorted(keys):
+                    item = await self._memory.aget(item_namespace, key)
+                    if item is not None:
+                        matched.append(item)
         return matched
 
     async def asearch(
@@ -190,7 +235,7 @@ class PersistentStore(BaseStore):
         now = time.time()
         valid: list[Item] = []
         expired: list[Item] = []
-        for item in self._items_in_namespace(namespace):
+        for item in await self._items_in_namespace(namespace):
             if _is_expired(item.value, now):
                 expired.append(item)
             else:

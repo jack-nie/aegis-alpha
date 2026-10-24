@@ -126,3 +126,57 @@ async def test_upsert(store):
     await store.aput(("test", "upsert"), "key1", {"value": "v2"})
     item = await store.aget(("test", "upsert"), "key1")
     assert item.value["value"] == "v2"
+
+# ---------------- P3-6: namespace encoding and no private InMemoryStore access ----------------
+
+
+@pytest.mark.asyncio
+async def test_namespace_with_slash_round_trips_and_does_not_collide():
+    from app.core.persistent_store import PersistentStore
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_path = os.path.join(tmpdir, "slash.db")
+        s1 = PersistentStore(db_path, default_ttl_seconds=0)
+        await s1.aput(("user", "a/b"), "k", {"v": "slash"})
+        await s1.aput(("user", "a", "b"), "k", {"v": "nested"})
+        await s1.close()
+
+        s2 = PersistentStore(db_path, default_ttl_seconds=0)
+        assert (await s2.aget(("user", "a/b"), "k")).value["v"] == "slash"
+        assert (await s2.aget(("user", "a", "b"), "k")).value["v"] == "nested"
+        found = await s2.asearch(("user", "a/b"), limit=10)
+        assert [item.value["v"] for item in found] == ["slash"]
+        assert {tuple(i.namespace) for i in await s2.asearch(("user",), limit=10)} == {
+            ("user", "a/b"),
+            ("user", "a", "b"),
+        }
+        await s2.close()
+
+
+@pytest.mark.asyncio
+async def test_legacy_slash_joined_rows_are_read_and_replaced():
+    from app.core.persistent_store import PersistentStore
+    import aiosqlite
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_path = os.path.join(tmpdir, "legacy.db")
+        s1 = PersistentStore(db_path, default_ttl_seconds=0)
+        await s1._ensure_db()
+        await s1._db.execute(
+            "INSERT INTO store (namespace, key, value, expires_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+            ("memory/user1", "pref", '{"v": "legacy"}', None, time.time()),
+        )
+        await s1._db.commit()
+        await s1.close()
+
+        s2 = PersistentStore(db_path, default_ttl_seconds=0)
+        assert (await s2.aget(("memory", "user1"), "pref")).value["v"] == "legacy"
+        await s2.aput(("memory", "user1"), "pref", {"v": "new"})
+        await s2.close()
+        async with aiosqlite.connect(db_path) as db:
+            rows = await (await db.execute("SELECT namespace FROM store WHERE key = 'pref'")).fetchall()
+        assert rows == [('["memory","user1"]',)]
+
+
+def test_store_does_not_touch_inmemorystore_private_data():
+    from pathlib import Path
+    source = (Path(__file__).resolve().parents[1] / "app" / "core" / "persistent_store.py").read_text()
+    assert "_memory._data" not in source and "._data." not in source
