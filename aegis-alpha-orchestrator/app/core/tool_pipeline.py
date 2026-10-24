@@ -297,3 +297,26 @@ def count_tool_errors(messages: list[Any]) -> int:
         for m in messages or []
         if type(m).__name__ == "ToolMessage" and getattr(m, "status", "success") == "error"
     )
+
+
+TRUNCATED_CALL_TEXT = (
+    "Tool call not executed: the model output was cut off (finish_reason=length) while writing "
+    "the tool arguments. Retry with fewer or shorter tool calls."
+)
+
+
+def is_truncated_tool_call_message(message: Any) -> bool:
+    from .llm_client import TRUNCATED_TOOL_CALLS_FLAG
+
+    extra = getattr(message, "additional_kwargs", None) or {}
+    meta = getattr(message, "response_metadata", None) or {}
+    return bool(extra.get(TRUNCATED_TOOL_CALLS_FLAG)) or str(meta.get("finish_reason") or "") == "length"
+
+
+def refuse_tool_calls(message: Any, text: str = TRUNCATED_CALL_TEXT) -> list[ToolMessage]:
+    """One error ToolMessage per tool call on ``message`` (none executed)."""
+    out: list[ToolMessage] = []
+    for call in getattr(message, "tool_calls", None) or []:
+        out.append(_error_message(dict(call), text, {"durationMs": 0, "truncated": False, "isError": True,
+                                                     "evidenceIds": [], "refused": "finish_reason_length"}))
+    return out

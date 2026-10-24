@@ -49,7 +49,13 @@ from .message_queue import (
     to_human_messages,
 )
 from .node_executor import NodeExecutor
-from .tool_pipeline import ToolPolicy, build_tool_node, count_tool_errors
+from .tool_pipeline import (
+    ToolPolicy,
+    build_tool_node,
+    count_tool_errors,
+    is_truncated_tool_call_message,
+    refuse_tool_calls,
+)
 from .tool_registry import TOOL_SPECS, resolve_agent_roles, tools_for_roles
 
 logger = logging.getLogger(__name__)
@@ -515,6 +521,9 @@ class WorkflowEngine:
 
         async def _run_calls(msgs: list[Any], config: RunnableConfig, queue, agent_id: str) -> list[Any]:
             last = msgs[-1]
+            if is_truncated_tool_call_message(last):
+                # P4-2: arguments cut by max_tokens are never executed.
+                return refuse_tool_calls(last)
             calls = list(getattr(last, "tool_calls", None) or [])
             if queue is None or not skip_remaining or len(calls) <= 1:
                 out = await tool_node.ainvoke({"messages": msgs}, config)
@@ -1264,26 +1273,32 @@ class WorkflowEngine:
                 except GraphInterrupt:
                     raise
                 except Exception as e:
+                    # P4-2: no silent fallback to a tool-less execute() (which would re-run the node
+                    # without the data it asked for and look like a normal answer). The node is
+                    # reported as an explicit degraded failure and never cached.
                     logger.error(
-                        f"[THINKING] Agent tool-loop failed, falling back to execute: "
-                        f"id={node.id} error={e}"
+                        f"[THINKING] Agent tool-loop failed (no fallback): id={node.id} "
+                        f"error={type(e).__name__}: {e}"
                     )
-
-            try:
-                result = await self._node_executor.execute(
-                    node=node,
-                    state=exec_state,
-                    subject=subject,
-                )
-            except GraphInterrupt:
-                raise
-            except Exception as e:
-                logger.error(f"[THINKING] Workflow node exception: id={node.id} handler={handler} label={node_label} error={e}")
-                result = NodeResult(
-                    ok=False, status="error", handler="logic",
-                    node_id=node.id, node_name=node_label,
-                    subject=subject, summary=str(e), duration_ms=0,
-                )
+                    result = self._node_executor.agent_failure_result(
+                        node=node, subject=subject, started_at=started_at, error=e,
+                    )
+            else:
+                try:
+                    result = await self._node_executor.execute(
+                        node=node,
+                        state=exec_state,
+                        subject=subject,
+                    )
+                except GraphInterrupt:
+                    raise
+                except Exception as e:
+                    logger.error(f"[THINKING] Workflow node exception: id={node.id} handler={handler} label={node_label} error={e}")
+                    result = NodeResult(
+                        ok=False, status="error", handler="logic",
+                        node_id=node.id, node_name=node_label,
+                        subject=subject, summary=str(e), duration_ms=0,
+                    )
 
             trace_entry = self._annotate_trace(
                 {
@@ -1306,7 +1321,7 @@ class WorkflowEngine:
                 try:
                     ticker = state.get("final_state", {}).get("ticker", "") or state.get("final_state", {}).get("symbol", "")
                     cache_key = self._node_result_cache_key(node, handler)
-                    if ticker and result.ok:
+                    if ticker and result.ok and result.status != "agent_failed":
                         await store.aput(
                             ticker_namespace(ticker), cache_key,
                             result.model_dump(),

@@ -182,6 +182,15 @@ def _normalize_label(raw: str) -> str:
         return "SELL"
     return label
 
+class AgentTurnError(RuntimeError):
+    """An agent tool-loop LLM turn failed after the retry budget (P4-2)."""
+
+    def __init__(self, node_id: str, cause: Exception | None):
+        super().__init__(f"agent turn failed for {node_id}: {type(cause).__name__ if cause else 'unknown'}")
+        self.node_id = node_id
+        self.cause = cause
+
+
 class NodeExecutor:
     """Executes individual workflow nodes."""
 
@@ -721,16 +730,69 @@ class NodeExecutor:
             f"prior_messages={len(prior_messages or [])}"
         )
 
-        return await self._llm_client.invoke_agent_with_tools(
-            system=system,
-            prompt=prompt,
-            context=context,
-            tools=tools if not force_final else None,
-            prior_messages=prior_messages,
-            model=model,
-            temperature=0.2,
-            timeout_ms=self._config.timeout_ms,
-            force_final=force_final,
+        # P4-2: same bounded retry budget as execute() (attempts + total deadline, jittered
+        # backoff, non-retryable auth errors fail fast). Exhaustion raises AgentTurnError and the
+        # engine records an explicit degraded result instead of silently re-running execute().
+        max_attempts, deadline_s = self._retry_budget()
+        retry_started = self._clock()
+        last_error: Exception | None = None
+        for attempt in range(max_attempts):
+            try:
+                return await self._llm_client.invoke_agent_with_tools(
+                    system=system,
+                    prompt=prompt,
+                    context=context,
+                    tools=tools if not force_final else None,
+                    prior_messages=prior_messages,
+                    model=model,
+                    temperature=0.2,
+                    timeout_ms=self._config.timeout_ms,
+                    force_final=force_final,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                last_error = e
+                if not self._is_retryable(e) or attempt + 1 >= max_attempts:
+                    break
+                delay = self._backoff_delay(attempt)
+                if self._clock() - retry_started + delay >= deadline_s:
+                    break
+                logger.warning(
+                    f"[THINKING] Agent turn {node.id} failed (attempt {attempt + 1}/{max_attempts}), "
+                    f"retrying in {delay:.2f}s: {type(e).__name__}"
+                )
+                await self._sleep(delay)
+        raise AgentTurnError(node.id, last_error)
+
+    def agent_failure_result(
+        self,
+        node: Node,
+        subject: str,
+        started_at: str,
+        error: BaseException,
+    ) -> NodeResult:
+        """P4-2: explicit degraded result for an agent whose tool loop failed (no fake signals)."""
+        cause = error.cause if isinstance(error, AgentTurnError) else error
+        message = f"{type(cause).__name__}: {cause}" if cause is not None else str(error)
+        data = node.data
+        duration_ms = int((datetime.now(timezone.utc) - datetime.fromisoformat(started_at)).total_seconds() * 1000)
+        return NodeResult(
+            ok=True,
+            status="agent_failed",
+            handler=self._resolve_handler(node),
+            node_id=node.id,
+            node_name=data.label or data.title or node.id,
+            subject=subject,
+            summary=f"Agent {data.label or node.id} failed: {message}"[:500],
+            signals=[],
+            sources=[],
+            confidence=0.0,
+            data={"error": message[:1000], "fallback_policy": "no_fallback"},
+            duration_ms=duration_ms,
+            degraded=True,
+            provider=self._config.provider,
+            model=self._config.model,
         )
 
     def agent_tool_result_to_node_result(

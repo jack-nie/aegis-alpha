@@ -41,6 +41,10 @@ INTENT_CLASSIFIER_SYSTEM_PROMPT = (
 )
 
 
+# P4-2: set on an AIMessage whose tool calls were cut by ``finish_reason == "length"``.
+TRUNCATED_TOOL_CALLS_FLAG = "aegis_truncated_tool_calls"
+
+
 class AgentToolResult:
     """Result of a single agent turn that may request tools."""
 
@@ -330,6 +334,29 @@ class LLMClient:
             raw_calls = extra.get("tool_calls") or []
             if raw_calls:
                 tool_calls = raw_calls
+
+        # P4-2: output cut at max_tokens while emitting tool calls → the arguments are unreliable
+        # (LangChain moves unparsable ones to invalid_tool_calls). Keep every call on the message,
+        # flagged, so the tools node answers each with an error ToolMessage and executes none.
+        finish_reason = str((getattr(response, "response_metadata", None) or {}).get("finish_reason") or "")
+        invalid_calls = list(getattr(response, "invalid_tool_calls", None) or [])
+        if finish_reason == "length" and (tool_calls or invalid_calls) and not force_final:
+            merged = [dict(tc) for tc in tool_calls if isinstance(tc, dict) and tc.get("name") is not None]
+            for index, bad in enumerate(invalid_calls):
+                merged.append({
+                    "name": str(bad.get("name") or "unknown_tool"),
+                    "args": {},
+                    "id": str(bad.get("id") or f"truncated-{index}"),
+                })
+            response = AIMessage(
+                content=response.content or "",
+                tool_calls=merged,
+                response_metadata={**(getattr(response, "response_metadata", None) or {}), "finish_reason": "length"},
+                usage_metadata=getattr(response, "usage_metadata", None),
+                additional_kwargs={TRUNCATED_TOOL_CALLS_FLAG: True},
+            )
+            logger.warning("Agent tool calls truncated by finish_reason=length; %d call(s) refused", len(merged))
+            return AgentToolResult(response, has_tool_calls=True, seed_human=seed_human)
 
         if tool_calls and not force_final:
             # Normalize tool_calls onto the message for route_to_tools / ToolNode.
