@@ -198,6 +198,26 @@ class AgentTurnError(RuntimeError):
         self.cause = cause
 
 
+
+GATED_CONTENT_NOTE = (
+    "The detailed analysis was withheld because the recommendation did not pass the evidence/policy gate."
+)
+
+
+def aggregate_gate_passed(data: dict[str, Any] | None) -> bool:
+    """P4-9: True only when the aggregate's policy did not force INSUFFICIENT_DATA and critique passed.
+
+    Fail closed: a result without policy/critique blocks counts as not passed.
+    """
+    if not isinstance(data, dict):
+        return False
+    policy = data.get("policy")
+    critique = data.get("critique")
+    if not isinstance(policy, dict) or not isinstance(critique, dict):
+        return False
+    return not policy.get("forcedInsufficient") and critique.get("ok") is True
+
+
 class NodeExecutor:
     """Executes individual workflow nodes."""
 
@@ -563,6 +583,11 @@ class NodeExecutor:
             ]
             # Surface machine-readable label in summary prefix for Java materializer
             summary = f"[{policy['recommendation']}] {summary or ''}".strip()
+            if not aggregate_gate_passed(result_data):
+                # P4-9: raw model prose never outlives a failed policy/critique gate (it may argue
+                # for the label the gate just removed); every path sees the gated summary instead.
+                result_data = {**result_data, "contentWithheld": True}
+                content = f"{summary}\n\n{GATED_CONTENT_NOTE}"
 
         return NodeResult(
             ok=True,
@@ -696,8 +721,12 @@ class NodeExecutor:
         force_final: bool = False,
         agent: AgentTemplate | None = None,
         model: str | None = None,
+        on_delta: Any = None,
     ) -> AgentToolResult:
         """One general.agent turn with bound tools (true tool-calling loop).
+
+        P4-9: ``on_delta(text, attempt)`` receives streamed text deltas (attempt is 1-based, so a
+        listener can discard the partial text of a failed attempt).
 
         Does not run finance.* hydrate paths beyond optional market context for
         general.agent. Returns AgentToolResult with either tool_calls or a final
@@ -785,6 +814,9 @@ class NodeExecutor:
         last_error: Exception | None = None
         for attempt in range(max_attempts):
             try:
+                stream_kwargs: dict[str, Any] = {}
+                if on_delta is not None:
+                    stream_kwargs["on_delta"] = (lambda text, _a=attempt + 1: on_delta(text, _a))
                 agent_result = await self._llm_client.invoke_agent_with_tools(
                     system=system,
                     prompt=prompt,
@@ -795,6 +827,7 @@ class NodeExecutor:
                     temperature=0.2,
                     timeout_ms=self._config.timeout_ms,
                     force_final=force_final,
+                    **stream_kwargs,
                 )
                 try:
                     agent_result.model_resolution = resolution

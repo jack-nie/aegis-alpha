@@ -56,12 +56,13 @@ from .message_queue import (
     queue_from_config,
     to_human_messages,
 )
-from .node_executor import NodeExecutor
+from .node_executor import NodeExecutor, aggregate_gate_passed
 from .run_registry import RunCancelled, RunHandle, RunRegistry, await_or_cancel
 from .tool_pipeline import (
     ToolPolicy,
     build_tool_node,
     count_tool_errors,
+    emit_tool_event,
     is_truncated_tool_call_message,
     refuse_tool_calls,
 )
@@ -70,6 +71,37 @@ from .tool_registry import TOOL_SPECS, resolve_agent_roles, tools_for_roles
 logger = logging.getLogger(__name__)
 
 _GRAPH_CACHE_MAX = 100
+AGGREGATE_HANDLER = "finance.stock_recommendation_aggregate"
+
+# P4-9 event protocol v2: events nodes emit through LangGraph's custom stream. They are forwarded
+# 1:1 as SSE events by the streaming endpoints (``stream_mode=["updates", "custom"]``).
+STREAM_V2_EVENTS = frozenset(
+    {"node_start", "message_delta", "tool_execution_start", "tool_execution_end", "usage"}
+)
+CONFIG_STREAM_KEY = "__aegis_stream_v2"
+
+
+class _StreamV2Marker:
+    """Non-primitive configurable value, so it is never persisted into checkpoint metadata."""
+
+    __slots__ = ()
+
+
+_STREAM_V2_ON = _StreamV2Marker()
+
+
+def _streaming_active() -> bool:
+    """True inside a node of a streaming run (sync ``ainvoke`` runs never stream deltas)."""
+    try:
+        from langgraph.config import get_config
+
+        return isinstance((get_config().get("configurable") or {}).get(CONFIG_STREAM_KEY), _StreamV2Marker)
+    except Exception:  # noqa: BLE001 - outside a runnable context
+        return False
+
+
+def _with_stream_v2(config: dict[str, Any]) -> dict[str, Any]:
+    return {**config, "configurable": {**(config.get("configurable") or {}), CONFIG_STREAM_KEY: _STREAM_V2_ON}}
 # Max agent→tools→agent iterations per specialist node (avoids infinite tool loops).
 MAX_TOOL_ROUNDS = 3
 # P4-8: node-level data.maxToolRounds bounds (Java WorkflowValidationService rejects values outside).
@@ -429,6 +461,60 @@ def _interrupt_event() -> SSEEvent:
         event="human_interrupt",
         data={"message": "Workflow paused for approval", "ok": True, "interrupted": True},
     )
+
+
+
+def _custom_sse(chunk: Any) -> SSEEvent | None:
+    """Map one custom-stream payload ``{"event": name, ...}`` to a v2 SSE event."""
+    if not isinstance(chunk, dict):
+        return None
+    name = chunk.get("event")
+    if name not in STREAM_V2_EVENTS:
+        return None
+    return SSEEvent(event=str(name), data={k: v for k, v in chunk.items() if k != "event"})
+
+
+def _usage_sse(node_id: str, trace_entry: dict[str, Any]) -> SSEEvent | None:
+    usage = trace_entry.get("tokenUsage") or trace_entry.get("turnUsage")
+    if not isinstance(usage, dict) or not usage:
+        return None
+    return SSEEvent(
+        event="usage",
+        data={
+            "nodeId": node_id,
+            "scope": "node" if trace_entry.get("tokenUsage") else "turn",
+            "usage": usage,
+        },
+    )
+
+
+def _aggregate_final_events(
+    node_name: str, node_outputs: dict[str, Any], token_node_id: str | None
+) -> list[SSEEvent]:
+    payload = node_outputs.get(node_name)
+    if not isinstance(payload, dict) or payload.get("handler") != AGGREGATE_HANDLER:
+        return []
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    passed = bool(payload.get("ok")) and aggregate_gate_passed(data) and not data.get("contentWithheld")
+    text = (payload.get("content") if passed else None) or payload.get("summary") or ""
+    if not text:
+        return []
+    events = [
+        SSEEvent(
+            event="message_delta",
+            data={
+                "nodeId": node_name,
+                "delta": text,
+                "final": True,
+                "gatePassed": passed,
+                **({} if passed else {"withheld": True}),
+            },
+        )
+    ]
+    if token_node_id and node_name == token_node_id:
+        # Deprecated alias for older clients of /stream-workflow-tokens: one chunk, same text.
+        events.append(SSEEvent(event="token", data={"nodeId": node_name, "content": text}))
+    return events
 
 
 class WorkflowEngine:
@@ -1297,6 +1383,17 @@ class WorkflowEngine:
                 workflow_state=state,
                 store=store,
             )
+            if handler not in ("start", "end"):
+                rounds = (exec_state.get("tool_rounds") if isinstance(exec_state, dict) else None) or {}
+                emit_tool_event(
+                    "node_start",
+                    {
+                        "nodeId": node.id,
+                        "nodeName": node_label,
+                        "handler": handler,
+                        "turn": int((rounds.get(node.id, 0) if isinstance(rounds, dict) else 0) or 0) + 1,
+                    },
+                )
 
             # Portfolio-reading agents are user-specific: never served from / written to the ticker cache.
             cacheable = handler != "start" and handler != "end" and not self._node_reads_portfolio(node)
@@ -1460,6 +1557,17 @@ class WorkflowEngine:
         max_rounds = max_tool_rounds_for(node)
         force_final = current_round >= max_rounds
 
+        delta_kwargs: dict[str, Any] = {}
+        if _streaming_active():
+            turn = current_round + 1
+
+            def _on_delta(text: str, attempt: int) -> None:
+                emit_tool_event(
+                    "message_delta",
+                    {"nodeId": node.id, "turn": turn, "attempt": attempt, "delta": text, "final": False},
+                )
+
+            delta_kwargs["on_delta"] = _on_delta
         agent_result = await self._node_executor.invoke_agent_with_tools(
             node=node,
             state=final_state,
@@ -1467,6 +1575,7 @@ class WorkflowEngine:
             tools=agent_tools,
             prior_messages=prior_for_tools if mid_tool_loop else None,
             force_final=force_final,
+            **delta_kwargs,
         )
 
         if agent_result.has_tool_calls and not force_final:
@@ -1726,7 +1835,7 @@ class WorkflowEngine:
     ) -> AsyncIterator[SSEEvent]:
         """Shared ``astream`` → SSE translation for both streaming endpoints (P2-12).
 
-        ``token_node_id`` re-emits that node's content as ``token`` chunks; ``report_degraded``
+        ``token_node_id`` also emits the gated aggregate answer as one deprecated ``token`` alias event; ``report_degraded``
         collects degraded reasons and emits a ``degraded`` event before completion. The whole run
         is bounded by the configured timeout; on expiry an ``error`` event with code
         ``WORKFLOW_TIMEOUT`` is emitted.
@@ -1748,8 +1857,8 @@ class WorkflowEngine:
         stream = _merge_queue_events(
             graph.astream(
                 graph_input,
-                config=config,
-                stream_mode="updates",
+                config=_with_stream_v2(config),
+                stream_mode=["updates", "custom"],
                 **self._graph_run_kwargs(),
             ),
             queue,
@@ -1794,6 +1903,14 @@ class WorkflowEngine:
                 if kind == "queue":
                     yield self._queue_sse(chunk)
                     continue
+                mode = "updates"
+                if isinstance(chunk, tuple) and len(chunk) == 2 and chunk[0] in ("updates", "custom"):
+                    mode, chunk = chunk
+                if mode == "custom":
+                    event = _custom_sse(chunk)
+                    if event is not None:
+                        yield event
+                    continue
                 if not isinstance(chunk, dict):
                     continue
                 for node_name, update in chunk.items():
@@ -1811,31 +1928,16 @@ class WorkflowEngine:
                         continue
                     trace_entry = (update.get("trace") or [{}])[0]
 
-                    if token_node_id and node_name == token_node_id:
-                        node_result = (update.get("node_outputs") or {}).get(token_node_id)
-                        if node_result and node_result.get("content"):
-                            content = node_result["content"]
-                            chunk_size = 50
-                            for i in range(0, len(content), chunk_size):
-                                yield SSEEvent(
-                                    event="token",
-                                    data={"nodeId": token_node_id, "content": content[i:i + chunk_size]},
-                                )
-                            continue
-
                     if _is_tools_node_name(str(node_name)):
-                        yield SSEEvent(
-                            event="tool_call",
-                            data={
-                                "nodeId": node_name,
-                                "nodeName": "Tool Execution",
-                                "handler": "tool",
-                                "status": "completed",
-                                "ok": True,
-                                "results": update.get("node_outputs", {}),
-                            },
-                        )
+                        # v2: per-call tool_execution_start/end arrive on the custom stream.
                         continue
+
+                    # P4-9: the aggregate answer is released once, after the policy/critique gate
+                    # ran (node finished); a failed gate releases only the gated summary.
+                    for final_event in _aggregate_final_events(
+                        str(node_name), update.get("node_outputs") or {}, token_node_id
+                    ):
+                        yield final_event
                     node_id = trace_entry.get("nodeId", node_name)
                     node_status = trace_entry.get("status", "")
                     node_ok = trace_entry.get("ok", False)
@@ -1867,6 +1969,9 @@ class WorkflowEngine:
                             **({"turnUsage": trace_entry["turnUsage"]} if trace_entry.get("turnUsage") else {}),
                         },
                     )
+                    usage_event = _usage_sse(node_id, trace_entry)
+                    if usage_event is not None:
+                        yield usage_event
                 if saw_interrupt:
                     break
 

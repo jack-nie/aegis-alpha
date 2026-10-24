@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from typing import Any
+from typing import Any, Callable
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
@@ -179,6 +179,8 @@ class LLMClient:
             "temperature": temperature,
             "timeout": timeout_ms / 1000,
             "max_retries": 0,
+            # P4-9: usage is also reported on streamed agent turns.
+            "stream_usage": True,
         }
         base_url = self._config.effective_base_url
         if base_url:
@@ -289,8 +291,13 @@ class LLMClient:
         temperature: float = 0.2,
         timeout_ms: int | None = None,
         force_final: bool = False,
+        on_delta: Callable[[str], None] | None = None,
     ) -> AgentToolResult:
         """One agent turn with optional tool binding.
+
+        P4-9: with ``on_delta`` the turn is streamed (``astream``) and each text delta is reported;
+        chunks are aggregated back into one AIMessage (tool calls, usage, finish_reason) so the rest
+        of the loop is unchanged. Tool-call argument deltas are aggregated, never emitted.
 
         Builds [System, Human?, *prior] and invokes the chat model. When tools are
         bound and the model returns tool_calls, the raw AIMessage is returned so the
@@ -336,7 +343,7 @@ class LLMClient:
             sent_prior, context_stats = transform_context(prior, policy)
             chat = head + sent_prior
         try:
-            response = await client.ainvoke(chat)
+            response = await self._call_agent_model(client, chat, on_delta)
         except Exception as e:
             if not (prior and is_context_overflow(e)):
                 logger.error(f"Agent tool-loop invocation failed: {e}")
@@ -345,7 +352,7 @@ class LLMClient:
             logger.warning("Agent context overflow; compacting once and retrying: %s", type(e).__name__)
             chat = head + compact(prior, policy)
             context_stats = {**(context_stats or {}), "compacted": True, "overflowRetry": True}
-            response = await client.ainvoke(chat)
+            response = await self._call_agent_model(client, chat, on_delta)
 
         # Ensure we always work with an AIMessage-like object for ToolNode routing.
         if not isinstance(response, AIMessage):
@@ -428,6 +435,34 @@ class LLMClient:
             llm_response=llm_response,
             seed_human=seed_human,
         ))
+
+    @staticmethod
+    async def _call_agent_model(client: Any, chat: list[BaseMessage], on_delta: Callable[[str], None] | None) -> Any:
+        if on_delta is None or not hasattr(client, "astream"):
+            return await client.ainvoke(chat)
+        aggregated: Any = None
+        async for chunk in client.astream(chat):
+            text = chunk.content if isinstance(getattr(chunk, "content", None), str) else ""
+            if text:
+                try:
+                    on_delta(text)
+                except Exception:  # noqa: BLE001 - a broken listener never fails the turn
+                    logger.debug("message_delta listener failed", exc_info=True)
+            aggregated = chunk if aggregated is None else aggregated + chunk
+        if aggregated is None:
+            return AIMessage(content="")
+        kwargs: dict[str, Any] = {
+            "content": aggregated.content if aggregated.content is not None else "",
+            "tool_calls": list(getattr(aggregated, "tool_calls", None) or []),
+            "invalid_tool_calls": list(getattr(aggregated, "invalid_tool_calls", None) or []),
+            "response_metadata": dict(getattr(aggregated, "response_metadata", None) or {}),
+            "additional_kwargs": dict(getattr(aggregated, "additional_kwargs", None) or {}),
+        }
+        if getattr(aggregated, "usage_metadata", None):
+            kwargs["usage_metadata"] = aggregated.usage_metadata
+        if getattr(aggregated, "id", None):
+            kwargs["id"] = aggregated.id
+        return AIMessage(**kwargs)
 
     @staticmethod
     def _with_context_stats(stats: dict[str, Any] | None, result: AgentToolResult) -> AgentToolResult:
