@@ -60,6 +60,9 @@ class Settings(BaseSettings):
     # example value is only accepted in explicit dev/mock mode.
     node_execution_token: str = Field(default="", alias="AEGIS_ALPHA_NODE_EXECUTION_TOKEN")
     dev_mode: bool = Field(default=False, alias="AEGIS_ALPHA_DEV_MODE")
+    # Decision D6: deployment marker; "prod"/"production" (or SPRING_PROFILES_ACTIVE containing
+    # prod/production) makes startup fail with DEV_MODE or the sample service token.
+    deployment_env: str = Field(default="", alias="AEGIS_ALPHA_ENV")
     # Comma-separated CORS allow-list (no wildcard). Defaults to local web/API origins only.
     cors_allowed_origins: str = Field(
         default="http://127.0.0.1:5174,http://localhost:5174,http://127.0.0.1:5178,http://localhost:5178",
@@ -145,9 +148,30 @@ class Settings(BaseSettings):
         return self.node_callback_base_url or self.backend_url
 
     @property
+    def is_production(self) -> bool:
+        """D6: production marker from AEGIS_ALPHA_ENV or SPRING_PROFILES_ACTIVE (shared deploy env)."""
+        markers = {"prod", "production"}
+        if (self.deployment_env or "").strip().lower() in markers:
+            return True
+        profiles = os.environ.get("SPRING_PROFILES_ACTIVE", "")
+        return any(p.strip().lower() in markers for p in profiles.split(","))
+
+    @property
+    def production_safety_problems(self) -> list[str]:
+        """D6: reasons that must stop a production start (empty outside production)."""
+        if not self.is_production:
+            return []
+        problems = []
+        if self.dev_mode:
+            problems.append("dev_mode_in_production")
+        if (self.node_execution_token or "").strip() == EXAMPLE_SERVICE_TOKEN:
+            problems.append("example_service_token_in_production")
+        return problems
+
+    @property
     def allows_example_service_token(self) -> bool:
-        """The example token is only tolerated when dev or mock mode is set explicitly."""
-        return bool(self.dev_mode or self.mock_mode)
+        """The example token is only tolerated when dev or mock mode is set explicitly, never in production."""
+        return bool(self.dev_mode or self.mock_mode) and not self.is_production
 
     @property
     def service_token_problem(self) -> str | None:

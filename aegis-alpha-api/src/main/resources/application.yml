@@ -35,6 +35,10 @@ mybatis:
     map-underscore-to-camel-case: true
 
 aegis:
+  # Decision D6: deployment marker. "prod"/"production" (or an active Spring profile prod/production)
+  # makes startup fail when AEGIS_ALPHA_DEV_MODE=true or the documented sample service token is used.
+  env: ${AEGIS_ALPHA_ENV:}
+  dev-mode: ${AEGIS_ALPHA_DEV_MODE:false}
   seed-enabled: ${AEGIS_ALPHA_SEED_ENABLED:true}
   token-secret: ${AEGIS_ALPHA_TOKEN_SECRET:local-aegis-demo-secret}
   workflow:

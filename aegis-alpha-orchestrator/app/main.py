@@ -38,6 +38,11 @@ async def lifespan(app: FastAPI):
     logger.info(f"Starting Aegis Alpha Orchestrator on port {settings.port}")
     logger.info(f"Provider: {settings.provider}, Model: {settings.model}")
     logger.info(f"Mock mode: {settings.is_mock_mode}")
+    # Decision D6: dev conveniences never start in production (fatal, the process exits).
+    fatal = settings.production_safety_problems
+    if fatal:
+        logger.critical("Refusing to start in production: %s", ", ".join(fatal))
+        raise RuntimeError(f"production safety check failed: {fatal}")
     problem = settings.service_token_problem
     if problem:
         logger.warning(
