@@ -2140,7 +2140,7 @@ public class WorkflowService {
             }
         }
         if (!invalid.isEmpty()) {
-            throw new IllegalArgumentException("Workflow validation failed: nodes without handler: " + invalid);
+            throw new WorkflowValidationException("Workflow validation failed: nodes without handler: " + invalid);
         }
     }
 
@@ -2260,7 +2260,7 @@ public class WorkflowService {
         }
         if (ordered.size() != nodes.size()) {
             /* P3-15: previously fell back to declaration order silently. */
-            throw new IllegalArgumentException("Workflow validation failed: graph contains a cycle.");
+            throw new WorkflowValidationException("Workflow validation failed: graph contains a cycle.");
         }
         return ordered;
     }

@@ -69,21 +69,21 @@ public class WorkflowValidationService {
             for (String key : new String[] {"prompt", "systemPrompt"}) {
                 Object value = data.get(key);
                 if (value != null && !(value instanceof String)) {
-                    throw new IllegalArgumentException("Workflow validation failed: node " + id + " " + key + " must be a string.");
+                    throw new WorkflowValidationException("Workflow validation failed: node " + id + " " + key + " must be a string.");
                 }
                 if (value != null && ((String) value).length() > maxPromptChars) {
-                    throw new IllegalArgumentException("Workflow validation failed: node " + id + " " + key
+                    throw new WorkflowValidationException("Workflow validation failed: node " + id + " " + key
                             + " exceeds " + maxPromptChars + " characters.");
                 }
             }
             Object rounds = data.get("maxToolRounds");
             if (rounds != null && !isToolRoundsInRange(rounds)) {
-                throw new IllegalArgumentException("Workflow validation failed: node " + id
+                throw new WorkflowValidationException("Workflow validation failed: node " + id
                         + " maxToolRounds must be an integer between " + MIN_TOOL_ROUNDS + " and " + MAX_TOOL_ROUNDS + ".");
             }
             Object model = data.get("modelName");
             if (model != null && !text(model).isEmpty() && !allowedModels.isEmpty() && !allowedModels.contains(text(model))) {
-                throw new IllegalArgumentException("Workflow validation failed: node " + id + " modelName is not allowed.");
+                throw new WorkflowValidationException("Workflow validation failed: node " + id + " modelName is not allowed.");
             }
         }
     }
@@ -92,7 +92,7 @@ public class WorkflowValidationService {
         List<Map<String, Object>> nodes = castList(layout == null ? null : layout.get("nodes"));
         List<Map<String, Object>> edges = castList(layout == null ? null : layout.get("edges"));
         if (nodes.isEmpty()) {
-            throw new IllegalArgumentException("Workflow validation failed: at least one start node is required.");
+            throw new WorkflowValidationException("Workflow validation failed: at least one start node is required.");
         }
 
         Map<String, Map<String, Object>> byId = new LinkedHashMap<>();
@@ -100,10 +100,10 @@ public class WorkflowValidationService {
         for (Map<String, Object> node : nodes) {
             String id = text(node.get("id"));
             if (id.isEmpty()) {
-                throw new IllegalArgumentException("Workflow validation failed: node id cannot be empty.");
+                throw new WorkflowValidationException("Workflow validation failed: node id cannot be empty.");
             }
             if (byId.containsKey(id)) {
-                throw new IllegalArgumentException("Workflow validation failed: duplicate node id " + id + ".");
+                throw new WorkflowValidationException("Workflow validation failed: duplicate node id " + id + ".");
             }
             byId.put(id, node);
             if ("start".equals(nodeType(node))) {
@@ -111,7 +111,7 @@ public class WorkflowValidationService {
             }
         }
         if (startCount == 0) {
-            throw new IllegalArgumentException("Workflow validation failed: at least one start node is required.");
+            throw new WorkflowValidationException("Workflow validation failed: at least one start node is required.");
         }
 
         Map<String, Integer> indegree = new HashMap<>();
@@ -124,10 +124,10 @@ public class WorkflowValidationService {
             String source = text(edge.get("source"));
             String target = text(edge.get("target"));
             if (!byId.containsKey(source)) {
-                throw new IllegalArgumentException("Workflow validation failed: edge references unknown source " + source + ".");
+                throw new WorkflowValidationException("Workflow validation failed: edge references unknown source " + source + ".");
             }
             if (!byId.containsKey(target)) {
-                throw new IllegalArgumentException("Workflow validation failed: edge references unknown target " + target + ".");
+                throw new WorkflowValidationException("Workflow validation failed: edge references unknown target " + target + ".");
             }
             outgoing.get(source).add(target);
             indegree.put(target, indegree.get(target) + 1);
@@ -141,11 +141,11 @@ public class WorkflowValidationService {
             }
         }
         if (!hasTerminal) {
-            throw new IllegalArgumentException("Workflow validation failed: at least one terminal node is required.");
+            throw new WorkflowValidationException("Workflow validation failed: at least one terminal node is required.");
         }
 
         if (hasCycle(indegree, outgoing, byId.keySet())) {
-            throw new IllegalArgumentException("Workflow validation failed: graph contains a cycle.");
+            throw new WorkflowValidationException("Workflow validation failed: graph contains a cycle.");
         }
     }
 
