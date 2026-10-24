@@ -1,0 +1,14 @@
+name: single_tool_then_answer
+description: one quote call, then a final JSON answer; tool output reaches the 2nd request fenced.
+tools:
+  get_quote: {args: {symbol: str}, returns: {symbol: AAPL, price: 187.2}}
+script:
+  - tool_calls: [{name: get_quote, args: {symbol: AAPL}}]
+  - content: '{"summary": "AAPL trades at 187.2", "confidence": 0.7}'
+expect:
+  status: workflow_complete
+  tool_sequence: [get_quote]
+  tool_errors: []
+  llm_calls: 2
+  request_contains: [{call: 2, text: "187.2"}, {call: 2, text: "<tool_result>"}]
+  summary_contains: {agent: "187.2"}

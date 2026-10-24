@@ -1,0 +1,12 @@
+name: large_output_truncated
+description: an oversized tool result is truncated before it reaches the model.
+tools:
+  get_filing: {args: {symbol: str}, size: 200000}
+script:
+  - tool_calls: [{name: get_filing, args: {symbol: AAPL}}]
+  - content: '{"summary": "filing too long; used excerpt", "confidence": 0.4}'
+expect:
+  status: workflow_complete
+  truncated: [get_filing]
+  tool_errors: []
+  llm_calls: 2

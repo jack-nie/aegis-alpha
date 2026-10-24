@@ -1,0 +1,12 @@
+name: cancel_mid_loop
+description: a cancel during the first model call stops the run; no second model call.
+tools:
+  get_quote: {args: {symbol: str}, returns: {price: 1}, sleep: 0.2}
+script:
+  - tool_calls: [{name: get_quote, args: {symbol: AAPL}}]
+    actions: {cancel: true}
+  - content: '{"summary": "should never be produced", "confidence": 0.5}'
+expect:
+  status: cancelled
+  max_llm_calls: 1
+  events_exclude: [workflow_complete]

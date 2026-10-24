@@ -277,7 +277,20 @@ def build_tool_node(tools: list, policy: ToolPolicy | None = None) -> Any:
     """``ToolNode`` with error handling and the guarded wrapper (P4-1)."""
     from langgraph.prebuilt import ToolNode
 
-    return ToolNode(tools, handle_tool_errors=True, awrap_tool_call=make_guarded_tool_call(policy))
+    return ToolNode(tools, handle_tool_errors=tool_error_text, awrap_tool_call=make_guarded_tool_call(policy))
+
+
+def tool_error_text(error: Exception) -> str:
+    """P4-13: text for an exception raised inside a tool (``ToolNode.handle_tool_errors``).
+
+    Argument-validation errors keep their message (it describes the model's own arguments, which
+    lets it fix the call). Any other exception is reduced to its type: ``True`` used to put
+    ``repr(exc)`` (backend hosts, SQL, paths) into the model's context.
+    """
+    if type(error).__name__ == "ToolInvocationError":
+        return f"Invalid arguments: {getattr(error, 'message', None) or error}"
+    logger.warning("[TOOL] tool raised %s", type(error).__name__)
+    return f"Tool failed: {type(error).__name__}"
 
 
 _FENCE_RE = re.compile(r"^\s*<" + TOOL_RESULT_TAG + r">\n?(.*?)\n?</" + TOOL_RESULT_TAG + r">\s*$", re.DOTALL)
