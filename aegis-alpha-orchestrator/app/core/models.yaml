@@ -1,12 +1,23 @@
 # P4-6 model registry (orchestrator side). Operators edit this file or point
 # AEGIS_ALPHA_MODELS_FILE at their own copy.
 #
-# 待确认 (to confirm with the owner):
-#   - the model list: only the models already referenced by the code base are listed;
-#   - pricing: every price is intentionally null (unknown). Cost is reported only when all
-#     prices needed for a call are configured (USD per 1M tokens); otherwise costUsd is null;
-#   - contextWindow / maxOutputTokens: null = unknown (context budgets keep their own defaults);
+# Decisions (待确认项决策, D4/D7):
+#   - the model list is the single source of truth for model names; the Java defaults
+#     (aegis.models.allowed-names, workflow layout allow-list) must equal it (consistency tests);
 #   - allowUnlisted: false = a requested model that is not listed falls back to the default model
+#     (warning + trace), true = unlisted names pass through unchanged. Kept false (secure default);
+#   - contextWindow / maxOutputTokens: null = unknown (context budgets keep their own defaults).
+#
+# Pricing (USD per 1M tokens) — source: official DeepSeek "Models & Pricing" page
+#   https://api-docs.deepseek.com/quick_start/pricing   (accessed 2026-10-24; zh-cn page agrees in CNY)
+#   - deepseek-v4-pro is listed by that exact name.
+#   - deepseek-v4-flash is listed as a legacy name of `deepseek-flash`: "still accepted ... served by
+#     DeepSeek-V4.1-Flash-1017 and billed at the Flash price", so the Flash prices apply.
+#   - The page has PEAK and OFF-PEAK rates (off-peak = half; peak = 01:00-04:00 and 06:00-10:00 UTC,
+#     Mon-Fri excluding Chinese public holidays). The values below are the PEAK rates, so costUsd is a
+#     conservative upper-bound estimate (costEstimated=true). Re-check the page when prices change.
+#   - inputPerMTok = cache-miss input, cacheReadPerMTok = cache-hit input.
+allowUnlisted: false = a requested model that is not listed falls back to the default model
 #     (warning + trace), true = unlisted names pass through unchanged.
 allowUnlisted: false
 
@@ -24,17 +35,17 @@ models:
     supportsTools: true
     contextWindow: null
     maxOutputTokens: null
-    pricing:
-      inputPerMTok: null
-      outputPerMTok: null
-      cacheReadPerMTok: null
+    pricing:  # Flash price (legacy name), peak rates; off-peak 0.15 / 0.6 / 0.003
+      inputPerMTok: 0.3
+      outputPerMTok: 1.2
+      cacheReadPerMTok: 0.006
   deepseek-v4-pro:
     provider: openai-compatible
     endpoint: deepseek
     supportsTools: true
     contextWindow: null
     maxOutputTokens: null
-    pricing:
-      inputPerMTok: null
-      outputPerMTok: null
-      cacheReadPerMTok: null
+    pricing:  # peak rates; off-peak 0.66 / 1.98 / 0.022
+      inputPerMTok: 1.32
+      outputPerMTok: 3.96
+      cacheReadPerMTok: 0.044

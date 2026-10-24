@@ -325,4 +325,83 @@ class WorkflowStreamV2Test {
                 .onRunEvent(org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.eq("NODE_COMPLETED"),
                         org.mockito.ArgumentMatchers.any());
     }
+
+    private void cancelStoredRun() {
+        WorkflowRun cancelled = WorkflowServiceStreamingControlTest.copy(storedRun.get());
+        cancelled.setStatus("CANCELLED");
+        cancelled.setControlStatus("CANCELLED");
+        cancelled.setCancelRequested(1);
+        storedRun.set(cancelled);
+    }
+
+    @Test
+    void streamingApprovalStopsWhenRunIsCancelledDuringResume() throws Exception {
+        /* D10a: a cancel during the approval resume stream wins and is never overwritten. */
+        paused("run-c");
+        when(gateway.buildResumeStreamBody(eq("run-c"), eq(true), any(), nullable(String.class))).thenReturn("{}");
+        server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/", exchange -> {
+            exchange.getResponseHeaders().set("Content-Type", "text/event-stream");
+            exchange.sendResponseHeaders(200, 0);
+            try (OutputStream os = exchange.getResponseBody()) {
+                os.write(sse("node_start", "{\"nodeId\":\"aggregate\",\"turn\":1}").getBytes(StandardCharsets.UTF_8));
+                os.flush();
+                cancelStoredRun();
+                os.write((sse("message_delta", "{\"nodeId\":\"aggregate\",\"delta\":\"x\",\"final\":true}")
+                        + sse("workflow_complete", "{\"ok\":true,\"final_state\":{}}")).getBytes(StandardCharsets.UTF_8));
+            } catch (IOException ignored) {
+                // reader closed the connection after the cancel
+            }
+        });
+        server.start();
+        when(gateway.resumeWorkflowStreamUrl()).thenReturn("http://127.0.0.1:" + server.getAddress().getPort() + "/r");
+        service.setStreamCancelCheckIntervalMs(0L);
+        WorkflowServiceStreamingControlTest.RecordingEmitter emitter = new WorkflowServiceStreamingControlTest.RecordingEmitter();
+
+        service.decideApprovalStreaming("run-c", true, null, null, emitter);
+
+        assertThat(emitter.names).contains("workflow_cancelled", "run_state")
+                .doesNotContain("message_delta", "workflow_complete");
+        assertThat(emitter.completed).isTrue();
+        assertThat(storedRun.get().getStatus()).isEqualTo("CANCELLED");
+        assertThat(eventTypes()).doesNotContain("RUN_APPROVED");
+        verify(gateway).cancelRun(eq("run-c"), any(), any());
+    }
+
+    @Test
+    void syncApprovalOutcomeNeverOverwritesACancel() {
+        /* D10a: same rule for the non-streaming approval path. */
+        paused("run-y");
+        when(gateway.resumeWorkflow(eq("run-y"), eq(true), any(), nullable(String.class))).thenAnswer(inv -> {
+            cancelStoredRun();
+            Map<String, Object> ok = new HashMap<>();
+            ok.put("ok", true);
+            ok.put("final_state", new HashMap<String, Object>());
+            return ok;
+        });
+
+        WorkflowRun result = service.decideApproval("run-y", true, null, null);
+
+        assertThat(result.getStatus()).isEqualTo("CANCELLED");
+        assertThat(eventTypes()).contains("RUN_RESUME_DISCARDED").doesNotContain("RUN_APPROVED");
+    }
+
+    @Test
+    void streamingApprovalMaterializesPerNodeOutputsNotTrimmedSummaries() throws Exception {
+        /* D10b: node_outputs from workflow_complete feed the materialized node run output. */
+        paused("run-o");
+        when(mapper.findNodeRuns("run-o")).thenReturn(java.util.Collections.<WorkflowNodeRun>emptyList());
+        when(gateway.buildResumeStreamBody(eq("run-o"), eq(true), any(), nullable(String.class))).thenReturn("{}");
+        serve(sse("node_update", "{\"nodeId\":\"aggregate\",\"nodeName\":\"Report\",\"status\":\"completed\",\"ok\":true}")
+                + sse("workflow_complete", "{\"ok\":true,\"final_state\":{\"nodes\":{\"aggregate\":{\"summary\":\"short\"}}},"
+                + "\"node_outputs\":{\"aggregate\":{\"summary\":\"short\",\"content\":\"Full report body\"}}}"));
+        WorkflowServiceStreamingControlTest.RecordingEmitter emitter = new WorkflowServiceStreamingControlTest.RecordingEmitter();
+
+        service.decideApprovalStreaming("run-o", true, null, null, emitter);
+
+        ArgumentCaptor<WorkflowNodeRun> inserted = ArgumentCaptor.forClass(WorkflowNodeRun.class);
+        verify(mapper, times(1)).insertNodeRun(inserted.capture());
+        assertThat(inserted.getValue().getOutputJson()).contains("Full report body");
+        assertThat(storedRun.get().getStatus()).isEqualTo("COMPLETED");
+    }
 }

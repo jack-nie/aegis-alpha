@@ -51,7 +51,7 @@
       <groupId>org.yaml</groupId>
       <artifactId>snakeyaml</artifactId>
     </dependency>
-    <!-- P3-3 (待确认): compile-time only; first Lombok use is HelpIntent. Version managed by Boot. -->
+    <!-- P3-3 (decision D1: kept): compile-time only; first Lombok use is HelpIntent. Version managed by Boot. -->
     <dependency>
       <groupId>org.projectlombok</groupId>
       <artifactId>lombok</artifactId>

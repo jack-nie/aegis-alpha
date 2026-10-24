@@ -13,7 +13,7 @@ WHERE idempotency_key IS NOT NULL
 GROUP BY workflow_key, subject, idempotency_key
 HAVING COUNT(*) > 1;
 
--- 2) Optional cleanup (待确认 before running): keep the earliest run per key, null out the key on later ones
+-- 2) Optional cleanup (decide per database after step 1; review before running): keep the earliest run per key, null out the key on later ones
 --    so their history is preserved but they no longer collide.
 -- UPDATE workflow_run r
 -- JOIN (

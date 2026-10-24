@@ -17,7 +17,7 @@ import java.util.UUID;
 public class AgentService {
     private final AgentMapper mapper;
     private final LangChainGateway langChainGateway;
-    /** P3-16: default model for new agents without modelName (待确认: falls back to aegis.langchain.model). */
+    /** P3-16: default model for new agents without modelName (decision D1, kept: falls back to aegis.langchain.model). */
     @Value("${aegis.agent.default-model:deepseek-v4-flash}")
     private String defaultModelName = "deepseek-v4-flash";
 

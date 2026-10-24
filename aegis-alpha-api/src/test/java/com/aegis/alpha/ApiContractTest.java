@@ -411,7 +411,9 @@ class ApiContractTest {
                                 "{\"id\":\"start\",\"type\":\"workflowNode\",\"data\":{\"nodeType\":\"start\"}}," +
                                 "{\"id\":\"end\",\"type\":\"workflowNode\",\"data\":{\"nodeType\":\"end\"}}" +
                                 "],\"edges\":[{\"source\":\"start\",\"target\":\"missing\"}]}"))
-                .andExpect(status().isUnauthorized())
+                /* Decision D3: layout validation errors are 400 (were 401). */
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.code").value("WORKFLOW_VALIDATION"))
                 .andExpect(jsonPath("$.message", containsString("unknown target")));
 
         String validLayout = "{\"nodes\":[" +

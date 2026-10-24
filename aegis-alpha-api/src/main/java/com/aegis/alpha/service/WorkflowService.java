@@ -53,7 +53,7 @@ public class WorkflowService {
     static final long DELEGATED_PORTFOLIO_READ_TTL_MS = 15L * 60L * 1000L;
     static final String SCOPE_PORTFOLIO_READ = "portfolio:read";
 
-    /** P3-16: default model for inline agents without data.modelName (待确认: falls back to aegis.langchain.model). */
+    /** P3-16: default model for inline agents without data.modelName (decision D1, kept: falls back to aegis.langchain.model). */
     @Value("${aegis.agent.default-model:deepseek-v4-flash}")
     private String defaultModelName = "deepseek-v4-flash";
 
@@ -566,7 +566,7 @@ public class WorkflowService {
      * P3-14: inserts an idempotent run. When a concurrent request with the same
      * (workflow_key, subject, idempotency_key) won the unique index, returns that run instead
      * (null means this run was inserted). A key already used by a run the caller cannot access is
-     * rejected (待确认: previously a second run was created).
+     * rejected (decision D1, kept: previously a second run was created).
      */
     WorkflowRun insertRunOrExisting(WorkflowRun run, AuthenticatedPrincipal principal) {
         try {
@@ -1318,7 +1318,7 @@ public class WorkflowService {
         return mapper.findRun(runId);
     }
 
-    /** P4-10 (待确认): minimum interval between cancel-flag DB reads while streaming (terminal events always check). */
+    /** P4-10 (decision D1: kept): minimum interval between cancel-flag DB reads while streaming (terminal events always check). */
     @Value("${aegis.workflow.stream.cancel-check-interval-ms:500}")
     private long streamCancelCheckIntervalMs = 500L;
 
@@ -1330,6 +1330,20 @@ public class WorkflowService {
 
     void setCancelCheckClock(java.util.function.LongSupplier clock) {
         this.cancelCheckClock = clock == null ? System::currentTimeMillis : clock;
+    }
+
+    /* D10a: the streaming approval endpoint shares the cancel-check interval and clock. */
+    long streamCancelCheckIntervalMs() {
+        return streamCancelCheckIntervalMs;
+    }
+
+    long cancelCheckNow() {
+        return cancelCheckClock.getAsLong();
+    }
+
+    /** D10a: fresh read of the run's cancel flag (cancel requested, CANCEL_REQUESTED or CANCELLED). */
+    boolean isCancelRequestedNow(String runId) {
+        return isCancelRequested(mapper.findRun(runId));
     }
 
     /** P4-10: orchestrator event protocol v2 events forwarded to the client (P4-9). */
@@ -1360,7 +1374,7 @@ public class WorkflowService {
         return (Boolean.TRUE.equals(audit.get("isError")) ? "Tool failed: " : "Tool completed: ") + name;
     }
 
-    /** P2-19 (待确认): stop reading and cancel the run when the SSE client goes away. */
+    /** P2-19 (decision D1: kept): stop reading and cancel the run when the SSE client goes away. */
     @Value("${aegis.workflow.stream.cancel-on-disconnect:false}")
     private boolean cancelStreamOnDisconnect = false;
 
@@ -1415,6 +1429,10 @@ public class WorkflowService {
             if (pausedAtApproval) {
                 clearQueuedRunMessages(run);
             }
+            if (WorkflowApprovalService.APPROVAL_IN_PROGRESS.equals(run.getControlStatus())) {
+                /* D10a: an approval is resuming the graph right now; stop it on the orchestrator too. */
+                requestOrchestratorCancel(run);
+            }
         } else if ("RUNNING".equals(run.getStatus())) {
             run.setCancelRequested(1);
             run.setControlStatus("CANCEL_REQUESTED");
@@ -1432,7 +1450,7 @@ public class WorkflowService {
      * P4-4: ask the orchestrator to stop the graph of a RUNNING run (best effort). The orchestrator answers
      * the in-flight execute/stream call with a cancelled outcome; Java records CANCELLED via its CAS writes.
      */
-    private void requestOrchestratorCancel(WorkflowRun run) {
+    void requestOrchestratorCancel(WorkflowRun run) {
         if (langChainGateway == null || !langChainGateway.isEnabled()) {
             return;
         }
@@ -1866,7 +1884,7 @@ public class WorkflowService {
     static final int MAX_NODE_INPUT_JSON_CHARS = 32000;
     private static final String[] UPSTREAM_SUMMARY_KEYS = {"ok", "summary", "signals", "label", "confidence", "degraded"};
 
-    /** P2-20 (待确认): node retries allowed per run across all nodes (the only retry layer). */
+    /** P2-20 (decision D1: kept): node retries allowed per run across all nodes (the only retry layer). */
     @Value("${aegis.workflow.run-retry-budget:4}")
     private int runRetryBudget = 4;
 
@@ -2140,7 +2158,7 @@ public class WorkflowService {
             }
         }
         if (!invalid.isEmpty()) {
-            throw new IllegalArgumentException("Workflow validation failed: nodes without handler: " + invalid);
+            throw new WorkflowValidationException("Workflow validation failed: nodes without handler: " + invalid);
         }
     }
 
@@ -2260,7 +2278,7 @@ public class WorkflowService {
         }
         if (ordered.size() != nodes.size()) {
             /* P3-15: previously fell back to declaration order silently. */
-            throw new IllegalArgumentException("Workflow validation failed: graph contains a cycle.");
+            throw new WorkflowValidationException("Workflow validation failed: graph contains a cycle.");
         }
         return ordered;
     }

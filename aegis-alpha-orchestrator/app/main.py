@@ -11,7 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from .config import settings
-from .core.run_backends import checkpointer_factory_from_settings, replica_safety_warnings
+from .core.run_backends import checkpointer_factory_from_settings, enforce_replica_safety
 from .dependencies import CHECKPOINT_DB_PATH, market_data, memory_store_manager, workflow_engine
 from .core.tools import get_backend_client
 from .routers import health, workflow, intent, help as help_router, message_queue
@@ -38,6 +38,11 @@ async def lifespan(app: FastAPI):
     logger.info(f"Starting Aegis Alpha Orchestrator on port {settings.port}")
     logger.info(f"Provider: {settings.provider}, Model: {settings.model}")
     logger.info(f"Mock mode: {settings.is_mock_mode}")
+    # Decision D6: dev conveniences never start in production (fatal, the process exits).
+    fatal = settings.production_safety_problems
+    if fatal:
+        logger.critical("Refusing to start in production: %s", ", ".join(fatal))
+        raise RuntimeError(f"production safety check failed: {fatal}")
     problem = settings.service_token_problem
     if problem:
         logger.warning(
@@ -46,12 +51,13 @@ async def lifespan(app: FastAPI):
             "or AEGIS_ALPHA_LANGCHAIN_MOCK=true).",
             problem,
         )
-    await market_data.start()
-    await memory_store_manager.initialize()
     # P4-16: checkpointer behind CheckpointerFactory (sqlite default; memory for demos).
     checkpointer_factory = checkpointer_factory_from_settings(settings, CHECKPOINT_DB_PATH)
-    for warning in replica_safety_warnings(settings, checkpointer_factory):
+    # Decision D9: fail fast (before any startup side effects) on unsafe multi-replica config.
+    for warning in enforce_replica_safety(settings, checkpointer_factory):
         logger.warning("[REPLICAS] %s", warning)
+    await market_data.start()
+    await memory_store_manager.initialize()
     try:
         workflow_engine.attach_checkpointer(await checkpointer_factory.open())
         logger.info("Checkpointer attached: backend=%s durable=%s", checkpointer_factory.name,

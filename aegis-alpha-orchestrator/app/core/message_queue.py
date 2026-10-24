@@ -140,7 +140,7 @@ class MessageQueueSettings:
     max_pending_per_kind: int = 8
     max_message_chars: int = 4000
     max_deliveries_per_run: int = 16
-    skip_remaining_tools: bool = False  # P4-11: pi HEAD batch semantics (待确认)
+    skip_remaining_tools: bool = False  # P4-11: pi HEAD batch semantics (decision D1: kept)
     max_threads: int = 1000
 
     def __post_init__(self) -> None:

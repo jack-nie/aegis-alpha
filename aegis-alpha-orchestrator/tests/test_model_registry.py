@@ -1,4 +1,5 @@
 """P4-6: model registry — node/agent model takes effect, fallbacks are explicit and traced."""
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -32,12 +33,18 @@ def _registry(**prices):
     )
 
 
-def test_packaged_registry_lists_known_models_without_invented_prices():
+def test_packaged_registry_prices_come_from_documented_source():
+    """D7: peak prices from https://api-docs.deepseek.com/quick_start/pricing (accessed 2026-10-24)."""
     registry = get_model_registry()
     assert registry.loaded
     assert {"deepseek-v4-flash", "deepseek-v4-pro"} <= set(registry.names())
     usage = {"inputTokens": 1000, "outputTokens": 100}
-    assert registry.estimate_cost("deepseek-v4-flash", usage) is None  # prices are 待确认
+    assert registry.estimate_cost("deepseek-v4-flash", usage) == pytest.approx(1000 * 0.3e-6 + 100 * 1.2e-6)
+    cached = {"inputTokens": 1_000_000, "outputTokens": 0, "cacheReadTokens": 1_000_000}
+    assert registry.estimate_cost("deepseek-v4-pro", cached) == pytest.approx(0.044)
+    source = (Path(__file__).resolve().parents[1] / "app" / "core" / "models.yaml").read_text(encoding="utf-8")
+    assert "https://api-docs.deepseek.com/quick_start/pricing" in source
+    assert "accessed 2026-10-24" in source
 
 
 def test_resolve_rules():

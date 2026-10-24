@@ -124,7 +124,58 @@ public class ChatService {
         if (principal == null) {
             return mapper.threads();
         }
-        return mapper.threadsForPrincipal(principal.getUserId(), principal.getTenantId());
+        List<Map<String, Object>> own = mapper.threadsForPrincipal(principal.getUserId(), principal.getTenantId());
+        if (!principal.hasRole("admin")) {
+            return own;
+        }
+        /* Admins also see unassigned legacy threads (flagged) so they can assign them. */
+        List<Map<String, Object>> out = new ArrayList<Map<String, Object>>();
+        if (own != null) {
+            out.addAll(own);
+        }
+        List<Map<String, Object>> legacy = mapper.unownedThreads();
+        if (legacy != null) {
+            for (Map<String, Object> row : legacy) {
+                Map<String, Object> item = new LinkedHashMap<String, Object>(row);
+                item.put("legacyUnassigned", Boolean.TRUE);
+                out.add(item);
+            }
+        }
+        return out;
+    }
+
+    /** Error text for a non-admin touching an unassigned legacy thread (decision D2). */
+    public static final String LEGACY_THREAD_UNASSIGNED = "legacy thread is unassigned; ask an admin to assign it";
+
+    /** Outcome of {@link #assignLegacyThread}. */
+    public enum AssignOutcome { ASSIGNED, NOT_FOUND, ALREADY_OWNED }
+
+    /**
+     * Decision D2: an admin assigns an unowned legacy thread to a user + tenant. The update is
+     * conditional, so an already-owned thread is never re-assigned (ownership transfer is not offered).
+     *
+     * @throws SecurityException when the caller is not an admin
+     * @throws IllegalArgumentException when userId / tenantId is blank
+     */
+    public AssignOutcome assignLegacyThread(String threadId, String userId, String tenantId,
+                                            AuthenticatedPrincipal principal) {
+        if (principal == null || !principal.hasRole("admin")) {
+            throw new SecurityException("only admins can assign legacy threads");
+        }
+        String user = userId == null ? "" : userId.trim();
+        String tenant = tenantId == null ? "" : tenantId.trim();
+        if (user.isEmpty() || tenant.isEmpty()) {
+            throw new IllegalArgumentException("userId and tenantId are required");
+        }
+        Map<String, Object> owner = mapper.findThreadOwner(threadId);
+        if (owner == null) {
+            return AssignOutcome.NOT_FOUND;
+        }
+        if (mapper.updateThreadOwner(threadId, user, tenant) > 0) {
+            log.info("[CHAT] legacy thread assigned by admin: thread={} admin={}", threadId, principal.getUserId());
+            return AssignOutcome.ASSIGNED;
+        }
+        return AssignOutcome.ALREADY_OWNED;
     }
 
     /** Max messages returned by {@link #threadMessages}. */
@@ -132,7 +183,7 @@ public class ChatService {
 
     /**
      * P4-11: a thread's recent messages in chronological order (e.g. queued-message answers written
-     * back after the run). Only the owner may read; legacy unowned threads are not readable here.
+     * back after the run). Only the owner may read; legacy unowned threads are readable by admins only (D2).
      *
      * @return null when the thread does not exist
      * @throws SecurityException when the caller does not own the thread
@@ -142,13 +193,16 @@ public class ChatService {
         if (owner == null) {
             return null;
         }
-        if (principal == null
+        boolean legacy = ownerText(owner, "user_id", "userId").isEmpty()
+                && ownerText(owner, "tenant_id", "tenantId").isEmpty();
+        boolean adminOnLegacy = legacy && principal != null && principal.hasRole("admin");
+        if (!adminOnLegacy && (principal == null
                 || !sameOwner(ownerText(owner, "user_id", "userId"), principal.getUserId())
-                || !sameOwner(ownerText(owner, "tenant_id", "tenantId"), principal.getTenantId())) {
+                || !sameOwner(ownerText(owner, "tenant_id", "tenantId"), principal.getTenantId()))) {
             throw new SecurityException("thread belongs to another user");
         }
         int bounded = Math.max(1, Math.min(limit, THREAD_MESSAGES_MAX));
-        List<Map<String, Object>> rows = mapper.findRecentMessages(threadId, bounded);
+        List<Map<String, Object>> rows = newestFirst(mapper.findRecentMessages(threadId, bounded));
         List<Map<String, Object>> out = new ArrayList<Map<String, Object>>();
         if (rows != null) {
             for (int i = rows.size() - 1; i >= 0; i--) {
@@ -163,6 +217,21 @@ public class ChatService {
             }
         }
         return out;
+    }
+
+    /** D10c: re-apply the deterministic newest-first order (independent of the DB's tie order). */
+    private static List<Map<String, Object>> newestFirst(List<Map<String, Object>> rows) {
+        if (rows == null) {
+            return null;
+        }
+        List<Map<String, Object>> sorted = new ArrayList<Map<String, Object>>();
+        for (Map<String, Object> row : rows) {
+            if (row != null) {
+                sorted.add(row);
+            }
+        }
+        ChatMessageIds.sortNewestFirst(sorted);
+        return sorted;
     }
 
     /** Backward-compatible entry point for tests / internal callers without a principal. */
@@ -527,7 +596,7 @@ public class ChatService {
      * <ul>
      *   <li>new thread: created with the caller as owner;</li>
      *   <li>existing thread with a matching owner: reused;</li>
-     *   <li>legacy thread with no owner rows: claimed by the caller;</li>
+     *   <li>legacy thread with no owner rows: admins only (never claimed implicitly);</li>
      *   <li>existing thread owned by somebody else: rejected.</li>
      * </ul>
      *
@@ -559,14 +628,13 @@ public class ChatService {
         String ownerUserId = ownerText(owner, "user_id", "userId");
         String ownerTenantId = ownerText(owner, "tenant_id", "tenantId");
         if (ownerUserId.isEmpty() && ownerTenantId.isEmpty()) {
-            /* Legacy thread created before ownership tracking: claim it (待确认: first caller wins).
-             * The claim is conditional, so a concurrent claimer cannot overwrite the winner. */
-            if (mapper.updateThreadOwner(existing, principal.getUserId(), principal.getTenantId()) > 0) {
+            /* Decision D2 (secure default): legacy threads created before ownership tracking are no
+             * longer claimed by the first caller. Admins may continue them (without taking
+             * ownership) and assign them via assignLegacyThread; everybody else is refused. */
+            if (principal.hasRole("admin")) {
                 return existing;
             }
-            owner = mapper.findThreadOwner(existing);
-            ownerUserId = ownerText(owner, "user_id", "userId");
-            ownerTenantId = ownerText(owner, "tenant_id", "tenantId");
+            throw new IllegalArgumentException(LEGACY_THREAD_UNASSIGNED);
         }
         if (!sameOwner(ownerUserId, principal.getUserId()) || !sameOwner(ownerTenantId, principal.getTenantId())) {
             throw new IllegalArgumentException("thread belongs to another user");
@@ -651,7 +719,7 @@ public class ChatService {
      * Active-run message queue (steer / follow_up)
      * ================================================================ */
 
-    /** Default delivery for chat messages sent while the thread's run is RUNNING (待确认 with product). */
+    /** Default delivery for chat messages sent while the thread's run is RUNNING (decision D1: kept). */
     static final String DEFAULT_ACTIVE_RUN_DELIVERY = WorkflowService.QUEUE_KIND_FOLLOW_UP;
 
     private static final Set<String> QUEUE_FALLBACK_CODES = new HashSet<String>(Arrays.asList(
@@ -951,7 +1019,7 @@ public class ChatService {
     }
 
     static final String COPILOT_CHAT_STATE_KEY = "copilotChat";
-    /** P4-12 (待确认): recent turns replayed verbatim; older ones are folded into a summary. */
+    /** P4-12 (decision D1: kept): recent turns replayed verbatim; older ones are folded into a summary. */
     static final int COPILOT_HISTORY_TURNS = 12;
     static final int COPILOT_HISTORY_SUMMARY_SCAN = 24;
     static final int COPILOT_HISTORY_TURN_MAX_CHARS = 1500;
@@ -961,7 +1029,7 @@ public class ChatService {
     /**
      * P4-12: {@code {message, history:[{role,content}], historySummary}} for the copilot. The current
      * user message (already persisted at the start of the chat turn) is excluded from history. Older messages
-     * become a deterministic extractive summary (no extra LLM call; an LLM summary is 待确认).
+     * become a deterministic extractive summary (no extra LLM call; no LLM summary, decision D1).
      */
     Map<String, Object> copilotChat(String threadId, String message) {
         Map<String, Object> chat = new LinkedHashMap<String, Object>();
@@ -981,6 +1049,7 @@ public class ChatService {
                 }
             }
         }
+        ChatMessageIds.sortNewestFirst(newestFirst);  // D10c: deterministic same-second order
         if (!newestFirst.isEmpty()) {
             Map<String, Object> newest = newestFirst.get(0);
             if ("user".equals(ownerText(newest, "role"))

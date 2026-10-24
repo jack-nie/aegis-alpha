@@ -9,7 +9,9 @@ from app.core.run_backends import (
     MemoryCheckpointerFactory,
     RunQueueBackend,
     SqliteCheckpointerFactory,
+    ReplicaConfigError,
     checkpointer_factory_from_settings,
+    enforce_replica_safety,
     replica_safety_warnings,
     run_queue_backend_from_settings,
 )
@@ -65,6 +67,45 @@ def test_multi_replica_on_local_backends_warns():
     s = _settings(AEGIS_ALPHA_REPLICAS=3)
     warnings = replica_safety_warnings(s, checkpointer_factory_from_settings(s, "x.db"))
     assert len(warnings) == 2 and any("sticky" in w for w in warnings)
+
+
+def test_multi_replica_on_local_backends_fails_fast_without_override():
+    s = _settings(AEGIS_ALPHA_REPLICAS=2)
+    with pytest.raises(ReplicaConfigError, match="AEGIS_ALPHA_ALLOW_LOCAL_BACKENDS_MULTI_REPLICA"):
+        enforce_replica_safety(s, checkpointer_factory_from_settings(s, "x.db"))
+
+
+def test_multi_replica_override_downgrades_to_warnings():
+    s = _settings(AEGIS_ALPHA_REPLICAS=2, AEGIS_ALPHA_ALLOW_LOCAL_BACKENDS_MULTI_REPLICA="true")
+    warnings = enforce_replica_safety(s, checkpointer_factory_from_settings(s, "x.db"))
+    assert len(warnings) == 2 and all("allowed by" in w for w in warnings)
+
+
+def test_single_replica_needs_no_override():
+    s = _settings()
+    assert enforce_replica_safety(s, checkpointer_factory_from_settings(s, "x.db")) == []
+
+
+def test_lifespan_refuses_unsafe_multi_replica():
+    from unittest.mock import AsyncMock, patch
+
+    from fastapi.testclient import TestClient
+
+    from app.config import settings
+    from app.main import app
+
+    with (
+        patch("app.main.market_data") as market_data,
+        patch("app.main.memory_store_manager"),
+        patch("app.main.get_backend_client"),
+        patch.object(settings, "node_execution_token", "test-service-token"),
+        patch.object(settings, "replicas", 2),
+    ):
+        market_data.start = AsyncMock()
+        with pytest.raises(ReplicaConfigError):
+            with TestClient(app):
+                pass
+        market_data.start.assert_not_called()
 
 
 @pytest.mark.asyncio

@@ -50,7 +50,7 @@ public class HelpToolsController {
         Map<String, Object> body = new LinkedHashMap<String, Object>();
         body.put("tools", tools);
         /* The audit tail names other users and their errors: admins see all of it, everyone else
-         * only their own entries (field kept for compatibility; 待确认). */
+         * only their own entries (field kept for compatibility; decision D1: kept). */
         body.put("audit", principal.hasRole("admin")
                 ? gateway.audit(AUDIT_LIMIT)
                 : gateway.audit(AUDIT_LIMIT, principal.getUserId() == null ? "" : principal.getUserId()));

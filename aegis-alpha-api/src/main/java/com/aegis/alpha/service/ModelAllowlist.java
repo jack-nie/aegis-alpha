@@ -11,7 +11,8 @@ import java.util.Set;
  * P4-6 (R5): server-side control of user-supplied model names (chat body.modelName, agent modelName).
  * The orchestrator registry (app/core/models.yaml) is the second gate; it falls back visibly
  * (modelFallbackReason) instead of the old silent DeepSeek rewrite.
- * 待确认: default list mirrors the orchestrator registry (deepseek-v4-flash, deepseek-v4-pro).
+ * Decision D4: the default list equals the orchestrator registry names (models.yaml); both are checked
+ * by ModelRegistryConsistencyTest. It is also the default workflow-layout modelName allow-list.
  */
 @Component
 public class ModelAllowlist {

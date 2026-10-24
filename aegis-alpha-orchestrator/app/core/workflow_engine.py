@@ -328,6 +328,43 @@ _STREAM_RECOMMENDATION_KEYS = (
 )
 
 
+# D10b: per-node results attached to a resume stream's workflow_complete (Java materializes them
+# like the sync /resume-workflow node_outputs). Bounded per node and in total (JSON characters).
+RESUME_NODE_OUTPUT_MAX_CHARS = 32000
+RESUME_NODE_OUTPUTS_TOTAL_MAX_CHARS = 128000
+
+
+def bounded_node_outputs(
+    node_outputs: dict[str, Any] | None,
+    *,
+    per_node_max: int = RESUME_NODE_OUTPUT_MAX_CHARS,
+    total_max: int = RESUME_NODE_OUTPUTS_TOTAL_MAX_CHARS,
+) -> dict[str, Any]:
+    """Per-node results (JSON-safe) for nodes that ran in this stream; oversize entries are replaced by
+    the trimmed summary entry flagged ``truncated`` (never dropped silently)."""
+    out: dict[str, Any] = {}
+    used = 0
+    for node_id, payload in (node_outputs if isinstance(node_outputs, dict) else {}).items():
+        if not isinstance(payload, dict):
+            continue
+        safe = json.loads(json.dumps(payload, ensure_ascii=False, default=str))
+        size = len(json.dumps(safe, ensure_ascii=False))
+        if size > per_node_max or used + size > total_max:
+            summary = safe.get("summary")
+            safe = {
+                "handler": safe.get("handler", ""),
+                "ok": safe.get("ok", True),
+                "status": safe.get("status", ""),
+                "degraded": bool(safe.get("degraded", False)),
+                "summary": (str(summary) if summary is not None else "")[:_STREAM_SUMMARY_CHARS],
+                "truncated": True,
+            }
+            size = len(json.dumps(safe, ensure_ascii=False))
+        out[str(node_id)] = safe
+        used += size
+    return out
+
+
 def build_stream_final_state(
     final_state: dict[str, Any] | None,
     node_outputs: dict[str, Any] | None,
@@ -393,6 +430,9 @@ def is_explicit_approval(value: Any) -> bool:
     """Only ``{"approved": True}`` approves; anything else (missing, None, truthy strings) rejects."""
     return is_valid_resume_value(value) and value.get("approved") is True
 
+CLEANUP_OUTCOMES_DEFAULT = frozenset({"completed", "cancelled", "failed"})
+
+
 @dataclass(frozen=True)
 class GraphGuardrails:
     """P2-12: bounds for one graph run (all configurable via Settings)."""
@@ -400,7 +440,9 @@ class GraphGuardrails:
     recursion_limit: int = 100
     timeout_seconds: float = 900.0
     thread_meta_max: int = 1000
-    cleanup_checkpoints: bool = False
+    # Decision D5: checkpoints of runs that reached a terminal state are deleted by default.
+    cleanup_checkpoints: bool = True
+    cleanup_outcomes: frozenset = CLEANUP_OUTCOMES_DEFAULT
 
     @classmethod
     def from_settings(cls, settings: Any) -> "GraphGuardrails":
@@ -408,8 +450,46 @@ class GraphGuardrails:
             recursion_limit=int(getattr(settings, "workflow_recursion_limit", 100)),
             timeout_seconds=float(getattr(settings, "workflow_timeout_seconds", 900.0)),
             thread_meta_max=int(getattr(settings, "workflow_thread_meta_max", 1000)),
-            cleanup_checkpoints=bool(getattr(settings, "workflow_cleanup_checkpoints", False)),
+            cleanup_checkpoints=bool(getattr(settings, "workflow_cleanup_checkpoints", True)),
+            cleanup_outcomes=parse_cleanup_outcomes(getattr(settings, "workflow_cleanup_outcomes", None)),
         )
+
+
+def parse_cleanup_outcomes(value: Any) -> frozenset:
+    """CSV of terminal outcome kinds whose checkpoints are deleted (subset of completed/cancelled/failed).
+
+    Unknown names (including ``paused`` / ``running``) are rejected: an interrupted run's checkpoint
+    is what an approval resumes, so it is never cleanable.
+    """
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return CLEANUP_OUTCOMES_DEFAULT
+    items = value.split(",") if isinstance(value, str) else list(value)
+    parsed = frozenset(str(item).strip().lower() for item in items if str(item).strip())
+    unknown = parsed - CLEANUP_OUTCOMES_DEFAULT
+    if unknown:
+        raise ValueError(f"workflow_cleanup_outcomes: unsupported {sorted(unknown)}; "
+                         f"allowed {sorted(CLEANUP_OUTCOMES_DEFAULT)}")
+    return parsed
+
+
+def cleanup_kind(outcome: str, *, resumed: bool) -> str | None:
+    """Map an engine outcome to a cleanup kind, or ``None`` when the checkpoint must be kept.
+
+    - ``paused`` (HUMAN_INTERRUPT) and ``aborted`` (client gone / shutdown, Java state unknown): keep.
+    - completed (approved or rejected resume, finished run) -> ``completed``.
+    - cancelled -> ``cancelled``; error / timeout -> ``failed``.
+    - A *resume* that fails or is cancelled keeps the checkpoint: Java puts a failed resume back to
+      HUMAN_INTERRUPT so the approval can be retried, which needs the checkpoint.
+    """
+    if outcome == "completed":
+        return "completed"
+    if resumed:
+        return None
+    if outcome == "cancelled":
+        return "cancelled"
+    if outcome in ("error", "timeout"):
+        return "failed"
+    return None
 
 
 class WorkflowTimeout(Exception):
@@ -883,9 +963,17 @@ class WorkflowEngine:
             logger.warning("[THINKING] approved_conclusion write failed thread_id=%s error=%s",
                            thread_id, type(exc).__name__)
 
-    async def _cleanup_thread(self, thread_id: str) -> None:
-        """Drop checkpoint + layout of a thread that reached a terminal state (opt-in)."""
+    async def _cleanup_thread(self, thread_id: str, outcome: str = "completed", *, resumed: bool = False) -> None:
+        """Drop checkpoint + layout of a thread that reached a terminal state (decision D5).
+
+        Never for paused (HUMAN_INTERRUPT) / aborted runs, nor for a failed or cancelled resume
+        (see :func:`cleanup_kind`). Configurable: ``AEGIS_ALPHA_WORKFLOW_CLEANUP_CHECKPOINTS`` and
+        ``AEGIS_ALPHA_WORKFLOW_CLEANUP_OUTCOMES``.
+        """
         if not self._guardrails.cleanup_checkpoints:
+            return
+        kind = cleanup_kind(outcome, resumed=resumed)
+        if kind is None or kind not in self._guardrails.cleanup_outcomes:
             return
         self._thread_meta.pop(thread_id, None)
         delete = getattr(self._checkpointer, "adelete_thread", None)
@@ -1828,11 +1916,13 @@ class WorkflowEngine:
             logger.error("[THINKING] Workflow execution timed out: thread_id=%s", tid)
             outcome = "timeout"
             self._finish_message_queue(queue, outcome)
+            await self._cleanup_thread(tid, outcome)
             return self._attach_queue_summary(WorkflowResult(ok=False, error=str(e), final_state=state), queue)
         except RunCancelled as e:
             logger.info("[THINKING] Workflow execution cancelled: thread_id=%s", tid)
             outcome = "cancelled"
             self._finish_message_queue(queue, outcome)
+            await self._cleanup_thread(tid, outcome)
             return self._attach_queue_summary(
                 WorkflowResult(ok=False, error=str(e), final_state={**(state or {}), "cancelled": True}), queue
             )
@@ -1840,6 +1930,7 @@ class WorkflowEngine:
             logger.error(f"[THINKING] Workflow execution failed: subject_len={text_len(subject)} error={e}")
             outcome = "error"
             self._finish_message_queue(queue, outcome)
+            await self._cleanup_thread(tid, outcome)
             return self._attach_queue_summary(WorkflowResult(ok=False, error=str(e), final_state=state), queue)
         finally:
             self._runs.close(run)
@@ -1860,8 +1951,12 @@ class WorkflowEngine:
         queue: ThreadMessageQueue | None = None,
         owner: Any = None,
         on_complete: Callable[[], Awaitable[None]] | None = None,
+        include_node_outputs: bool = False,
     ) -> AsyncIterator[SSEEvent]:
         """Shared ``astream`` → SSE translation for both streaming endpoints (P2-12).
+
+        ``include_node_outputs`` (D10b, resume stream) adds the bounded per-node results of the nodes
+        that ran in this stream to ``workflow_complete`` as ``node_outputs``.
 
         ``on_complete`` (P4-10, resume stream) runs after a completed graph, before thread cleanup.
 
@@ -2018,6 +2113,8 @@ class WorkflowEngine:
                     )
                 complete["degraded"] = bool(degraded_reasons)
             complete["final_state"] = build_stream_final_state(streamed_state, streamed_outputs)
+            if include_node_outputs:
+                complete["node_outputs"] = bounded_node_outputs(streamed_outputs)
             if on_complete is not None:
                 try:
                     await on_complete()
@@ -2040,6 +2137,7 @@ class WorkflowEngine:
             logger.error("[THINKING] Workflow %s timed out: thread_id=%s", label, tid)
             outcome = "timeout"
             closed = self._close_queue_event(queue, outcome)
+            await self._cleanup_thread(tid, outcome, resumed=label == "resume")
             if closed is not None:
                 yield closed
             yield SSEEvent(event="error", data={"ok": False, "error": str(e), "code": "WORKFLOW_TIMEOUT"})
@@ -2047,6 +2145,7 @@ class WorkflowEngine:
             logger.info("[THINKING] Workflow %s cancelled: thread_id=%s", label, tid)
             outcome = "cancelled"
             closed = self._close_queue_event(queue, outcome)
+            await self._cleanup_thread(tid, outcome, resumed=label == "resume")
             if closed is not None:
                 yield closed
             yield SSEEvent(
@@ -2057,6 +2156,7 @@ class WorkflowEngine:
             logger.error(f"[THINKING] Workflow {label} failed: thread_id={tid} error={e}")
             outcome = "error"
             closed = self._close_queue_event(queue, outcome)
+            await self._cleanup_thread(tid, outcome, resumed=label == "resume")
             if closed is not None:
                 yield closed
             yield SSEEvent(event="error", data={"ok": False, "error": str(e), "code": "WORKFLOW_ERROR"})
@@ -2236,6 +2336,7 @@ class WorkflowEngine:
                 queue=queue,
                 owner=owner,
                 on_complete=_after_complete,
+                include_node_outputs=True,
             )
         ) as events:
             async for event in events:
@@ -2290,16 +2391,19 @@ class WorkflowEngine:
             logger.error("[THINKING] Workflow resume timed out: thread_id=%s", thread_id)
             outcome = "timeout"
             self._finish_message_queue(queue, outcome)
+            await self._cleanup_thread(thread_id, outcome, resumed=True)
             return WorkflowResult(ok=False, error=str(e), final_state={})
         except RunCancelled as e:
             logger.info("[THINKING] Workflow resume cancelled: thread_id=%s", thread_id)
             outcome = "cancelled"
             self._finish_message_queue(queue, outcome)
+            await self._cleanup_thread(thread_id, outcome, resumed=True)
             return WorkflowResult(ok=False, error=str(e), final_state={"cancelled": True})
         except Exception as e:
             logger.error(f"[THINKING] Workflow resume failed: thread_id={thread_id} error={e}")
             outcome = "error"
             self._finish_message_queue(queue, outcome)
+            await self._cleanup_thread(thread_id, outcome, resumed=True)
             return WorkflowResult(ok=False, error=str(e), final_state={})
         finally:
             self._runs.close(run)
