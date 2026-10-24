@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field
 
 from ..config import Settings
 from .context_assembly import normalize_token_usage
+from .message_queue import is_queued_human_message
 from .prompt_safety import build_user_content, with_untrusted_notice
 
 logger = logging.getLogger(__name__)
@@ -292,9 +293,11 @@ class LLMClient:
 
         if prior:
             # Continue mid-loop conversation (Human + AI(tool_calls) + ToolMessages).
+            # Queued steering / follow-up messages are extra user turns, not the task itself:
+            # without a seed HumanMessage the task prompt is restated first.
             has_human = any(
-                type(m).__name__ == "HumanMessage"
-                or getattr(m, "type", None) in ("human", "user")
+                (type(m).__name__ == "HumanMessage" or getattr(m, "type", None) in ("human", "user"))
+                and not is_queued_human_message(m)
                 for m in prior
             )
             if not has_human:

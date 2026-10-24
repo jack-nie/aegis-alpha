@@ -9,6 +9,7 @@ from .core.memory_store import MemoryStoreManager
 from .core.node_executor import NodeExecutor
 from .core.tool_registry import create_tool_registry
 from .core.workflow_engine import WorkflowEngine, GraphGuardrails
+from .core.message_queue import MessageQueueRegistry, MessageQueueSettings
 from .core.intent_classifier import IntentClassifier
 
 os.makedirs(settings.data_dir, exist_ok=True)
@@ -29,6 +30,8 @@ from langgraph.checkpoint.memory import MemorySaver
 CHECKPOINT_DB_PATH = f"{settings.data_dir}/checkpoints.db"
 _checkpointer = MemorySaver()
 
+message_queues = MessageQueueRegistry(MessageQueueSettings.from_app_settings(settings))
+
 workflow_engine = WorkflowEngine(
     node_executor,
     tools=tools,
@@ -36,5 +39,6 @@ workflow_engine = WorkflowEngine(
     store=memory_store_manager.store,
     checkpointer=_checkpointer,
     guardrails=GraphGuardrails.from_settings(settings),
+    message_queues=message_queues,
 )
 intent_classifier = IntentClassifier(llm_client)

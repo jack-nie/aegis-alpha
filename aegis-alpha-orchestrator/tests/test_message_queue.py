@@ -226,3 +226,65 @@ def test_human_message_marker():
     assert msg.content == "focus on risk"
     assert is_queued_human_message(msg)
     assert msg.additional_kwargs["aegis_queue"]["kind"] == "steer"
+
+
+# ── per-agent targeting (phase-2 parallel fan-out) ──────────────────────
+
+def test_targeted_messages_are_only_drained_by_their_agent():
+    q = _open(_registry())
+    o = QueueOwner.from_any(OWNER)
+    q.set_receivers(["fund", "val"])
+    q.enqueue("follow_up", "for val", o, target="val")
+    q.enqueue("follow_up", "anyone", o)
+    assert q.has_follow_up("fund") and q.has_follow_up("val")
+    # one-at-a-time: fund skips val's message and takes the untargeted one
+    assert [m.content for m in q.drain("follow_up", node_id="fund")] == ["anyone"]
+    assert not q.has_follow_up("fund")
+    assert q.has_pending("val")
+    assert [m.content for m in q.drain("follow_up", node_id="val")] == ["for val"]
+    assert q.drain("follow_up", node_id="val") == []
+
+
+def test_all_mode_drains_every_eligible_message_and_keeps_others_in_order():
+    q = _open(_registry(follow_up_mode="all"))
+    o = QueueOwner.from_any(OWNER)
+    q.set_receivers(["fund", "val"])
+    for text, target in (("a", None), ("b", "val"), ("c", "fund"), ("d", None)):
+        q.enqueue("follow_up", text, o, target=target)
+    assert [m.content for m in q.drain("follow_up", node_id="fund")] == ["a", "c", "d"]
+    assert [m["content"] for m in q.peek()["follow_up"]] == ["b"]
+    assert q.peek()["follow_up"][0]["target"] == "val"
+
+
+def test_receiver_validation_codes():
+    q = _open(_registry())
+    o = QueueOwner.from_any(OWNER)
+    q.set_receivers(["fund", "val"])
+    with pytest.raises(MessageQueueError) as exc:
+        q.enqueue("steer", "x", o, target="ghost")
+    assert exc.value.code == "INVALID_TARGET"
+    q.mark_agent_done("fund")
+    with pytest.raises(MessageQueueError) as exc:
+        q.enqueue("steer", "x", o, target="fund")
+    assert exc.value.code == "TARGET_FINISHED"
+    q.enqueue("steer", "still ok", o)  # val can take it
+    q.mark_agent_done("val")
+    with pytest.raises(MessageQueueError) as exc:
+        q.enqueue("follow_up", "x", o)
+    assert exc.value.code == "NO_RECEIVER"
+    assert q.summary()["receivers"] == []
+
+
+def test_workflow_without_tool_agents_rejects_queueing():
+    q = _open(_registry())
+    q.set_receivers([])
+    with pytest.raises(MessageQueueError) as exc:
+        q.enqueue("follow_up", "x", QueueOwner.from_any(OWNER))
+    assert exc.value.code == "NO_RECEIVER"
+
+
+def test_unknown_receivers_accept_any_target():
+    q = _open(_registry())
+    res = q.enqueue("steer", "x", QueueOwner.from_any(OWNER), target="whatever")
+    assert res["message"]["target"] == "whatever"
+    assert q.summary()["receivers"] is None

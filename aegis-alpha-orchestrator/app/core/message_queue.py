@@ -30,6 +30,17 @@ Abort / lifecycle policy (documented in 消息排队实现说明.md):
 * When the run completes, errors, or the client aborts the stream, the queue is
   closed and undelivered messages are discarded and reported
   (``message_queue_closed`` event / ``final_state.messageQueue``).
+
+Parallel fan-out (phase 2 runs several tool agents in the same superstep, each on
+its own ``agent_messages`` channel):
+
+* An untargeted message is delivered to exactly one agent: whichever reaches a
+  delivery point first (drain is atomic under the lock).
+* ``target`` pins a message to one agent node id; other agents never drain it.
+* The engine registers the run's receiver agents (``set_receivers``) and marks an
+  agent done once it leaves its loop (``mark_agent_done``). Enqueueing to an unknown
+  target -> ``INVALID_TARGET``; to a finished target -> ``TARGET_FINISHED``; when no
+  receiver can still take a message -> ``NO_RECEIVER`` (Java starts a new turn instead).
 """
 
 from __future__ import annotations
@@ -105,6 +116,8 @@ class QueuedMessage:
     kind: str
     content: str
     enqueued_at: float = field(default_factory=time.time)
+    # Agent node id this message is pinned to (None = first agent to reach a delivery point).
+    target: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -112,7 +125,11 @@ class QueuedMessage:
             "kind": self.kind,
             "content": self.content,
             "enqueuedAt": self.enqueued_at,
+            "target": self.target,
         }
+
+    def deliverable_to(self, node_id: str | None) -> bool:
+        return self.target is None or node_id is None or self.target == node_id
 
 
 @dataclass(frozen=True)
@@ -170,6 +187,9 @@ class ThreadMessageQueue:
         self.skipped_tool_calls = 0
         self.undelivered: list[QueuedMessage] = []
         self.close_reason: str | None = None
+        # Agent node ids that can drain this run's messages (None = unknown, accept any).
+        self._receivers: frozenset[str] | None = None
+        self._done_agents: set[str] = set()
 
     # ── listeners ──────────────────────────────────────────────────────
     def subscribe(self, listener: Listener) -> Callable[[], None]:
@@ -202,7 +222,8 @@ class ThreadMessageQueue:
             raise MessageQueueError("OWNER_MISMATCH", "caller does not own this run")
 
     def enqueue(self, kind: str, content: str, owner: QueueOwner | None,
-                message_id: str | None = None) -> dict[str, Any]:
+                message_id: str | None = None, target: str | None = None) -> dict[str, Any]:
+        target = (str(target).strip() or None) if target is not None else None
         if kind not in QUEUE_KINDS:
             raise MessageQueueError("INVALID_KIND", f"kind must be one of {QUEUE_KINDS}")
         text = (content or "").strip()
@@ -220,6 +241,7 @@ class ThreadMessageQueue:
                 raise MessageQueueError(
                     "RUN_PAUSED", "run is paused for approval; approve or reject first"
                 )
+            self._check_receiver_locked(target)
             q = self._queues[kind]
             if len(q) >= self.settings.max_pending_per_kind:
                 raise MessageQueueError(
@@ -231,7 +253,9 @@ class ThreadMessageQueue:
                     "DELIVERY_LIMIT",
                     f"run accepts at most {self.settings.max_deliveries_per_run} queued messages",
                 )
-            msg = QueuedMessage(id=message_id or f"q_{uuid.uuid4().hex[:12]}", kind=kind, content=text)
+            msg = QueuedMessage(
+                id=message_id or f"q_{uuid.uuid4().hex[:12]}", kind=kind, content=text, target=target
+            )
             q.append(msg)
             position = len(q)
             snapshot = self._pending_counts_locked()
@@ -254,16 +278,46 @@ class ThreadMessageQueue:
                                                 "dropped": [m.to_dict() for m in dropped]})
         return dropped
 
-    # ── consumer side (graph nodes) ────────────────────────────────────
-    def has(self, kind: str) -> bool:
+    def _check_receiver_locked(self, target: str | None) -> None:
+        if self._receivers is None:
+            return
+        if target is not None:
+            if target not in self._receivers:
+                raise MessageQueueError("INVALID_TARGET", f"no agent {target!r} in this run")
+            if target in self._done_agents:
+                raise MessageQueueError("TARGET_FINISHED", f"agent {target!r} already finished")
+            return
+        if not (self._receivers - self._done_agents):
+            raise MessageQueueError("NO_RECEIVER", "no agent in this run can still take a message")
+
+    # ── receivers (engine side) ────────────────────────────────────────
+    def set_receivers(self, agent_ids: Any) -> None:
         with self._lock:
-            return bool(self._queues[kind])
+            self._receivers = frozenset(str(a) for a in agent_ids)
 
-    def has_steering(self) -> bool:
-        return self.has("steer")
+    def mark_agent_done(self, agent_id: str) -> None:
+        with self._lock:
+            self._done_agents.add(str(agent_id))
 
-    def has_follow_up(self) -> bool:
-        return self.has("follow_up")
+    def active_receivers(self) -> list[str] | None:
+        with self._lock:
+            if self._receivers is None:
+                return None
+            return sorted(self._receivers - self._done_agents)
+
+    # ── consumer side (graph nodes) ────────────────────────────────────
+    def has(self, kind: str, node_id: str | None = None) -> bool:
+        with self._lock:
+            return any(m.deliverable_to(node_id) for m in self._queues[kind])
+
+    def has_steering(self, node_id: str | None = None) -> bool:
+        return self.has("steer", node_id)
+
+    def has_follow_up(self, node_id: str | None = None) -> bool:
+        return self.has("follow_up", node_id)
+
+    def has_pending(self, node_id: str | None = None) -> bool:
+        return self.has_steering(node_id) or self.has_follow_up(node_id)
 
     def peek(self) -> dict[str, list[dict[str, Any]]]:
         with self._lock:
@@ -273,13 +327,14 @@ class ThreadMessageQueue:
         """pi ``PendingMessageQueue.drain``: oldest only or everything, per mode."""
         with self._lock:
             q = self._queues[kind]
-            if not q:
+            eligible = [m for m in q if m.deliverable_to(node_id)]
+            if not eligible:
                 return []
-            if self._modes[kind] == "all":
-                out = list(q)
-                q.clear()
-            else:
-                out = [q.popleft()]
+            out = eligible if self._modes[kind] == "all" else eligible[:1]
+            taken = {id(m) for m in out}
+            kept = [m for m in q if id(m) not in taken]
+            q.clear()
+            q.extend(kept)
             self.delivered += len(out)
             remaining = self._pending_counts_locked()
         self.emit(
@@ -337,6 +392,8 @@ class ThreadMessageQueue:
                 "skippedToolCalls": self.skipped_tool_calls,
                 "undelivered": [m.to_dict() for m in self.undelivered],
                 "closeReason": self.close_reason,
+                "receivers": None if self._receivers is None
+                else sorted(self._receivers - self._done_agents),
             }
 
     def _pending_counts_locked(self) -> dict[str, int]:
@@ -378,13 +435,13 @@ class MessageQueueRegistry:
             return self._queues.get(thread_id)
 
     def enqueue(self, thread_id: str, kind: str, content: str, owner: QueueOwner | None,
-                message_id: str | None = None) -> dict[str, Any]:
+                message_id: str | None = None, target: str | None = None) -> dict[str, Any]:
         if not self.enabled:
             raise MessageQueueError("DISABLED", "message queue is disabled")
         q = self.get(thread_id)
         if q is None or q.state == STATE_CLOSED:
             raise MessageQueueError("NOT_ACTIVE", "no active run for this thread")
-        return q.enqueue(kind, content, owner, message_id=message_id)
+        return q.enqueue(kind, content, owner, message_id=message_id, target=target)
 
     def finish_run(self, thread_id: str, reason: str) -> list[QueuedMessage]:
         q = self.get(thread_id)
