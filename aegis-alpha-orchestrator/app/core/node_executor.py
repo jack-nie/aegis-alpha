@@ -158,6 +158,28 @@ HANDLERS = {
 # Control flow handlers
 FALLBACK_HANDLERS = {"start", "end", "condition", "logic"}
 
+_LABEL_ALTERNATION = r"INSUFFICIENT[_ ]DATA|STRONG[_ ]BUY|STRONG[_ ]SELL|BUY|SELL|HOLD|WATCH"
+_JSON_RECOMMENDATION_RE = re.compile(
+    r'"recommendation"\s*:\s*"(' + _LABEL_ALTERNATION + r')"', re.IGNORECASE
+)
+_LABELED_RECOMMENDATION_RE = re.compile(
+    r"(?:recommendation|rating|建议|评级|结论)\s*[:：]\s*\**\s*(" + _LABEL_ALTERNATION + r")\b",
+    re.IGNORECASE,
+)
+# Bare tokens must be upper-case words: prose like "shareholder", "buyback" or "hold on" never matches.
+_BARE_LABEL_RE = re.compile(r"(?<![A-Za-z0-9_])(" + _LABEL_ALTERNATION + r")(?![A-Za-z0-9_])")
+
+
+_LABEL_PRIORITY = ("INSUFFICIENT_DATA", "BUY", "SELL", "HOLD", "WATCH")
+
+
+def _normalize_label(raw: str) -> str:
+    label = raw.strip().upper().replace(" ", "_")
+    if label == "STRONG_BUY":
+        return "BUY"
+    if label == "STRONG_SELL":
+        return "SELL"
+    return label
 
 class NodeExecutor:
     """Executes individual workflow nodes."""
@@ -507,23 +529,24 @@ class NodeExecutor:
 
     @staticmethod
     def _extract_recommendation_label(text: str) -> str | None:
-        """Best-effort parse of recommendation enum from model text/JSON fence."""
+        """Best-effort parse of the recommendation enum from model text (P3-4).
+
+        Order: JSON ``"recommendation"`` field, then an explicit ``Recommendation:/Rating:/建议:/评级:``
+        line, then a standalone upper-case token with word boundaries (so ``SHAREHOLDER`` is not HOLD
+        and ``BUYBACK`` is not BUY). Structured response fields are preferred by the caller.
+        """
         if not text:
             return None
-        import re  # local import keeps module import surface small
-
-        # JSON fence recommendation field
-        match = re.search(
-            r'"recommendation"\s*:\s*"(BUY|HOLD|SELL|WATCH|INSUFFICIENT_DATA)"',
-            text,
-            re.IGNORECASE,
-        )
+        match = _JSON_RECOMMENDATION_RE.search(text)
         if match:
-            return match.group(1).upper()
-        upper = text.upper()
-        for label in ("INSUFFICIENT_DATA", "STRONG BUY", "BUY", "SELL", "HOLD", "WATCH"):
-            if label in upper:
-                return label.replace(" ", "_") if label != "STRONG BUY" else "BUY"
+            return _normalize_label(match.group(1))
+        match = _LABELED_RECOMMENDATION_RE.search(text)
+        if match:
+            return _normalize_label(match.group(1))
+        found = {_normalize_label(m.group(1)) for m in _BARE_LABEL_RE.finditer(text)}
+        for label in _LABEL_PRIORITY:  # same precedence as the previous substring scan
+            if label in found:
+                return label
         return None
 
     def _mock_result(
