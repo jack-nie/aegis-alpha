@@ -483,48 +483,39 @@ public class WorkflowService {
 
     public WorkflowRun createRun(String workflowKey, String subject, Map<String, Object> inputs,
                                  AuthenticatedPrincipal principal) {
-        String key = workflowKey == null || workflowKey.trim().isEmpty() ? "daily" : workflowKey.trim();
+        String key = workflowKeyOrDefault(workflowKey);
         WorkflowVersion version = mapper.findLatestVersion(key);
         Map<String, Object> runLayout = layoutForRun(key, version);
         validationService.validateLayout(runLayout);
         Map<String, Object> safeInputs = inputs == null ? new LinkedHashMap<String, Object>() : new LinkedHashMap<>(inputs);
         applyAuthenticatedUserId(safeInputs, principal == null ? null : principal.getUserId());
-        WorkflowRun run = new WorkflowRun();
-        run.setRunId(UUID.randomUUID().toString());
-        run.setWorkflowKey(key);
-        run.setTraceId(UUID.randomUUID().toString());
-        run.setStatus("RUNNING");
-        run.setSubject(subject);
-        run.setStartedAt(now());
-        run.setNodeCount(0);
-        run.setWorkflowVersionId(version == null ? null : version.getVersionId());
-        run.setInputsJson(toJson(safeInputs));
-        run.setControlStatus("ACTIVE");
-        run.setPauseRequested(0);
-        run.setCancelRequested(0);
+        WorkflowRun run = newRun(key, subject, version, safeInputs, false, null);
         applyRunOwner(run, principal);
         mapper.insertRun(run);
         recordRunEvent(run, "RUN_CREATED", null, null, "RUNNING", "Workflow run created.", null, 0);
         return run;
     }
 
+    /**
+     * Executes a run created by {@link #createRun} (Copilot dispatch). P3-13: the layout comes from the
+     * version recorded on the run ({@code workflowVersionId}), never from whatever is latest now, so a
+     * version published between create and execute does not change what runs. Success/failure handling
+     * (including the backtest record) is shared with {@link #start} and {@link #dispatchQueuedRun}.
+     */
     public void executeAsync(WorkflowRun run, Map<String, Object> inputs, String workflowKey) {
-        WorkflowVersion version = mapper.findLatestVersion(workflowKey);
-        Map<String, Object> runLayout = layoutForRun(workflowKey, version);
+        String key = run.getWorkflowKey() == null || run.getWorkflowKey().trim().isEmpty()
+                ? workflowKeyOrDefault(workflowKey) : run.getWorkflowKey();
+        Map<String, Object> runLayout;
         try {
-            runWorkflow(run, inputs, runLayout);
-            backtestService.createFromWorkflowRun(mapper.findRun(run.getRunId()), inputs);
-        } catch (WorkflowStoppedException stopped) {
-            // run already updated by execute()
+            runLayout = layoutForRun(key, run.getWorkflowVersionId());
         } catch (Exception ex) {
-            run.setStatus("FAILED");
-            run.setCompletedAt(now());
-            run.setErrorMessage(ex.getMessage());
-            run.setControlStatus("FAILED");
-            mapper.updateRun(run);
-            recordRunEvent(run, "RUN_FAILED", null, null, "FAILED", ex.getMessage(), null, 1000000);
+            markRunFailed(run, ex);
+            backtestService.createFromWorkflowRun(mapper.findRun(run.getRunId()), inputs);
+            return;
         }
+        executeAndFinish(run, inputs, runLayout, inputs);
     }
+
     public WorkflowRun start(String workflowKey, String subject) {
         return start(workflowKey, subject, new LinkedHashMap<String, Object>(), (String) null, null);
     }
@@ -539,7 +530,7 @@ public class WorkflowService {
 
     public WorkflowRun start(String workflowKey, String subject, Map<String, Object> inputs, String idempotencyKey,
                              AuthenticatedPrincipal principal) {
-        String key = workflowKey == null || workflowKey.trim().isEmpty() ? "daily" : workflowKey.trim();
+        String key = workflowKeyOrDefault(workflowKey);
         String normalizedIdempotencyKey = normalizeIdempotencyKey(idempotencyKey);
         WorkflowRun existing = findIdempotentRun(key, subject, normalizedIdempotencyKey);
         if (existing != null && (principal == null || isRunAccessible(existing, principal))) {
@@ -550,42 +541,74 @@ public class WorkflowService {
         validationService.validateLayout(runLayout);
         Map<String, Object> safeInputs = inputs == null ? new LinkedHashMap<String, Object>() : new LinkedHashMap<>(inputs);
         applyAuthenticatedUserId(safeInputs, principal == null ? null : principal.getUserId());
+        WorkflowRun run = newRun(key, subject, version, safeInputs, false, normalizedIdempotencyKey);
+        applyRunOwner(run, principal);
+        mapper.insertRun(run);
+        recordRunEvent(run, "RUN_CREATED", null, null, "RUNNING", "Workflow run created.", null, 0);
+        return executeAndFinish(run, safeInputs, runLayout, inputs);
+    }
+
+    /**
+     * P3-13: the one place a new {@code workflow_run} row is built (create/start/streaming/queue).
+     * Callers still apply the owner and insert; status is RUNNING, or QUEUED when {@code queued}.
+     */
+    private WorkflowRun newRun(String key, String subject, WorkflowVersion version, Map<String, Object> safeInputs,
+                               boolean queued, String idempotencyKey) {
+        String timestamp = now();
         WorkflowRun run = new WorkflowRun();
         run.setRunId(UUID.randomUUID().toString());
         run.setWorkflowKey(key);
         run.setTraceId(UUID.randomUUID().toString());
-        run.setStatus("RUNNING");
+        run.setStatus(queued ? "QUEUED" : "RUNNING");
         run.setSubject(subject);
-        run.setStartedAt(now());
+        run.setStartedAt(timestamp);
+        if (queued) {
+            run.setQueuedAt(timestamp);
+        }
         run.setNodeCount(0);
-        run.setIdempotencyKey(normalizedIdempotencyKey);
+        run.setIdempotencyKey(idempotencyKey);
         run.setWorkflowVersionId(version == null ? null : version.getVersionId());
         run.setInputsJson(toJson(safeInputs));
-        run.setControlStatus("ACTIVE");
+        run.setControlStatus(queued ? "QUEUED" : "ACTIVE");
         run.setPauseRequested(0);
         run.setCancelRequested(0);
-        applyRunOwner(run, principal);
-        mapper.insertRun(run);
-        recordRunEvent(run, "RUN_CREATED", null, null, "RUNNING", "Workflow run created.", null, 0);
+        return run;
+    }
 
+    private static String workflowKeyOrDefault(String workflowKey) {
+        return workflowKey == null || workflowKey.trim().isEmpty() ? "daily" : workflowKey.trim();
+    }
+
+    /**
+     * P3-13: shared execution + terminal handling for {@link #start}, {@link #dispatchQueuedRun} and
+     * {@link #executeAsync}. A backtest record is created for both completed and failed runs (the
+     * behaviour {@code start()} already had); stopped (paused/cancelled) runs are returned as stored.
+     */
+    private WorkflowRun executeAndFinish(WorkflowRun run, Map<String, Object> executionInputs,
+                                         Map<String, Object> runLayout, Map<String, Object> backtestInputs) {
         try {
-            runWorkflow(run, safeInputs, runLayout);
+            runWorkflow(run, executionInputs, runLayout);
             WorkflowRun completed = mapper.findRun(run.getRunId());
-            backtestService.createFromWorkflowRun(completed, inputs);
+            backtestService.createFromWorkflowRun(completed, backtestInputs);
             return completed;
         } catch (WorkflowStoppedException stopped) {
             return mapper.findRun(run.getRunId());
         } catch (Exception ex) {
-            run.setStatus("FAILED");
-            run.setCompletedAt(now());
-            run.setErrorMessage(ex.getMessage());
-            run.setControlStatus("FAILED");
-            mapper.updateRun(run);
-            recordRunEvent(run, "RUN_FAILED", null, null, "FAILED", ex.getMessage(), null, 1000000);
+            markRunFailed(run, ex);
             WorkflowRun failed = mapper.findRun(run.getRunId());
-            backtestService.createFromWorkflowRun(failed, inputs);
+            backtestService.createFromWorkflowRun(failed, backtestInputs);
             return failed;
         }
+    }
+
+    /** P3-13: single FAILED write for the non-streaming paths (the seam for a conditional/CAS write later). */
+    private void markRunFailed(WorkflowRun run, Exception ex) {
+        run.setStatus("FAILED");
+        run.setCompletedAt(now());
+        run.setErrorMessage(ex.getMessage());
+        run.setControlStatus("FAILED");
+        mapper.updateRun(run);
+        recordRunEvent(run, "RUN_FAILED", null, null, "FAILED", ex.getMessage(), null, 1000000);
     }
 
     public WorkflowRun startWithStreaming(String workflowKey, String subject, Map<String, Object> inputs,
@@ -604,25 +627,13 @@ public class WorkflowService {
     public WorkflowRun startWithStreaming(String workflowKey, String subject, Map<String, Object> inputs,
                                           org.springframework.web.servlet.mvc.method.annotation.SseEmitter emitter,
                                           String userId, String tenantId) {
-        String key = workflowKey == null || workflowKey.trim().isEmpty() ? "daily" : workflowKey.trim();
+        String key = workflowKeyOrDefault(workflowKey);
         WorkflowVersion version = mapper.findLatestVersion(key);
         Map<String, Object> runLayout = layoutForRun(key, version);
         validationService.validateLayout(runLayout);
         Map<String, Object> safeInputs = inputs == null ? new LinkedHashMap<String, Object>() : new LinkedHashMap<String, Object>(inputs);
         applyAuthenticatedUserId(safeInputs, userId);
-        final WorkflowRun run = new WorkflowRun();
-        run.setRunId(UUID.randomUUID().toString());
-        run.setWorkflowKey(key);
-        run.setTraceId(UUID.randomUUID().toString());
-        run.setStatus("RUNNING");
-        run.setSubject(subject);
-        run.setStartedAt(now());
-        run.setNodeCount(0);
-        run.setWorkflowVersionId(version == null ? null : version.getVersionId());
-        run.setInputsJson(toJson(safeInputs));
-        run.setControlStatus("ACTIVE");
-        run.setPauseRequested(0);
-        run.setCancelRequested(0);
+        final WorkflowRun run = newRun(key, subject, version, safeInputs, false, null);
         if (hasText(userId)) {
             run.setUserId(userId.trim());
         }
@@ -1097,7 +1108,7 @@ public class WorkflowService {
 
     public WorkflowRun queueStart(String workflowKey, String subject, Map<String, Object> inputs, String idempotencyKey,
                                   AuthenticatedPrincipal principal) {
-        String key = workflowKey == null || workflowKey.trim().isEmpty() ? "daily" : workflowKey.trim();
+        String key = workflowKeyOrDefault(workflowKey);
         String normalizedIdempotencyKey = normalizeIdempotencyKey(idempotencyKey);
         WorkflowRun existing = findIdempotentRun(key, subject, normalizedIdempotencyKey);
         if (existing != null && (principal == null || isRunAccessible(existing, principal))) {
@@ -1108,22 +1119,7 @@ public class WorkflowService {
         validationService.validateLayout(runLayout);
         Map<String, Object> safeInputs = inputs == null ? new LinkedHashMap<String, Object>() : new LinkedHashMap<>(inputs);
         applyAuthenticatedUserId(safeInputs, principal == null ? null : principal.getUserId());
-        String timestamp = now();
-        WorkflowRun run = new WorkflowRun();
-        run.setRunId(UUID.randomUUID().toString());
-        run.setWorkflowKey(key);
-        run.setTraceId(UUID.randomUUID().toString());
-        run.setStatus("QUEUED");
-        run.setSubject(subject);
-        run.setStartedAt(timestamp);
-        run.setQueuedAt(timestamp);
-        run.setNodeCount(0);
-        run.setIdempotencyKey(normalizedIdempotencyKey);
-        run.setWorkflowVersionId(version == null ? null : version.getVersionId());
-        run.setInputsJson(toJson(safeInputs));
-        run.setControlStatus("QUEUED");
-        run.setPauseRequested(0);
-        run.setCancelRequested(0);
+        WorkflowRun run = newRun(key, subject, version, safeInputs, true, normalizedIdempotencyKey);
         applyRunOwner(run, principal);
         mapper.insertRun(run);
         recordRunEvent(run, "RUN_CREATED", null, null, "QUEUED", "Workflow run queued.", safeInputs, 0);
@@ -1148,24 +1144,7 @@ public class WorkflowService {
         recordRunEvent(run, "RUN_DISPATCHED", null, null, "RUNNING", "Workflow run dispatched.", null, 1);
         Map<String, Object> inputs = parseJsonMap(run.getInputsJson());
         Map<String, Object> runLayout = layoutForRun(run.getWorkflowKey(), run.getWorkflowVersionId());
-        try {
-            runWorkflow(run, inputs, runLayout);
-            WorkflowRun completed = mapper.findRun(run.getRunId());
-            backtestService.createFromWorkflowRun(completed, inputs);
-            return completed;
-        } catch (WorkflowStoppedException stopped) {
-            return mapper.findRun(run.getRunId());
-        } catch (Exception ex) {
-            run.setStatus("FAILED");
-            run.setCompletedAt(now());
-            run.setErrorMessage(ex.getMessage());
-            run.setControlStatus("FAILED");
-            mapper.updateRun(run);
-            recordRunEvent(run, "RUN_FAILED", null, null, "FAILED", ex.getMessage(), null, 1000000);
-            WorkflowRun failed = mapper.findRun(run.getRunId());
-            backtestService.createFromWorkflowRun(failed, inputs);
-            return failed;
-        }
+        return executeAndFinish(run, inputs, runLayout, inputs);
     }
 
     public WorkflowRun pauseRun(String runId) {
