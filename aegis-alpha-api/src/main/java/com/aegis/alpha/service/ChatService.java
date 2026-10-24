@@ -202,7 +202,7 @@ public class ChatService {
             throw new SecurityException("thread belongs to another user");
         }
         int bounded = Math.max(1, Math.min(limit, THREAD_MESSAGES_MAX));
-        List<Map<String, Object>> rows = mapper.findRecentMessages(threadId, bounded);
+        List<Map<String, Object>> rows = newestFirst(mapper.findRecentMessages(threadId, bounded));
         List<Map<String, Object>> out = new ArrayList<Map<String, Object>>();
         if (rows != null) {
             for (int i = rows.size() - 1; i >= 0; i--) {
@@ -217,6 +217,21 @@ public class ChatService {
             }
         }
         return out;
+    }
+
+    /** D10c: re-apply the deterministic newest-first order (independent of the DB's tie order). */
+    private static List<Map<String, Object>> newestFirst(List<Map<String, Object>> rows) {
+        if (rows == null) {
+            return null;
+        }
+        List<Map<String, Object>> sorted = new ArrayList<Map<String, Object>>();
+        for (Map<String, Object> row : rows) {
+            if (row != null) {
+                sorted.add(row);
+            }
+        }
+        ChatMessageIds.sortNewestFirst(sorted);
+        return sorted;
     }
 
     /** Backward-compatible entry point for tests / internal callers without a principal. */
@@ -1034,6 +1049,7 @@ public class ChatService {
                 }
             }
         }
+        ChatMessageIds.sortNewestFirst(newestFirst);  // D10c: deterministic same-second order
         if (!newestFirst.isEmpty()) {
             Map<String, Object> newest = newestFirst.get(0);
             if ("user".equals(ownerText(newest, "role"))

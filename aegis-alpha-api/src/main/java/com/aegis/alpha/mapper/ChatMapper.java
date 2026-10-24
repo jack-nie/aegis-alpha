@@ -50,8 +50,17 @@ public interface ChatMapper {
     List<Map<String, Object>> threadsForPrincipal(@Param("userId") String userId,
                                                   @Param("tenantId") String tenantId);
 
-    /** P4-11/P4-12: newest messages of a thread (callers reverse to chronological order). */
+    /**
+     * P4-11/P4-12: newest messages of a thread (callers reverse to chronological order).
+     * D10c: same-second ties are broken deterministically (see {@code ChatMessageIds.CHRONOLOGICAL}):
+     * time-ordered ids ({@code <17 digits>-...}) after legacy UUID ids; legacy rows by role
+     * (assistant after user), then message_id.
+     */
     @Select("select message_id, role, content, created_at from chat_message where thread_id = #{threadId}"
-            + " order by created_at desc, message_id desc limit #{limit}")
+            + " order by created_at desc,"
+            + " case when message_id like '_________________-%' then 1 else 0 end desc,"
+            + " case when message_id like '_________________-%' then 0 when role = 'user' then 0"
+            + " when role = 'assistant' then 1 else 2 end desc,"
+            + " message_id desc limit #{limit}")
     List<Map<String, Object>> findRecentMessages(@Param("threadId") String threadId, @Param("limit") int limit);
 }
