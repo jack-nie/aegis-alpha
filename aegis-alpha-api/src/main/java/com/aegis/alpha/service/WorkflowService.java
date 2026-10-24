@@ -808,8 +808,17 @@ public class WorkflowService {
                 }
             }
 
-            /* P2-17: re-read before acting; a cancel requested meanwhile ends the stream as CANCELLED. */
-            private boolean stopIfCancelled() {
+            /* P4-10: next time the cancel flag may be re-read (high-rate v2 events are throttled). */
+            private long nextCancelCheckAt = Long.MIN_VALUE;
+
+            /* P2-17: re-read before acting; a cancel requested meanwhile ends the stream as CANCELLED.
+             * P4-10: at most one DB read per cancel-check interval unless {@code force} (terminal events). */
+            private boolean stopIfCancelled(boolean force) {
+                long nowMs = cancelCheckClock.getAsLong();
+                if (!force && nowMs < nextCancelCheckAt) {
+                    return false;
+                }
+                nextCancelCheckAt = nowMs + streamCancelCheckIntervalMs;
                 WorkflowRun latest = mapper.findRun(runId);
                 if (!isCancelRequested(latest)) {
                     return false;
@@ -834,10 +843,21 @@ public class WorkflowService {
 
             @Override public void onEvent(String eventName, String data) {
                 try {
-                    if (stopIfCancelled()) {
+                    if (stopIfCancelled(isTerminalStreamEvent(eventName))) {
                         return;
                     }
-                    if ("node_update".equals(eventName)) {
+                    if (isStreamV2Event(eventName)) {
+                        /* P4-10: v2 progress events are forwarded, not persisted; only a finished tool call
+                         * leaves a run event (no args, no result body). */
+                        if ("tool_execution_end".equals(eventName)) {
+                            Map<String, Object> audit = toolExecutionEndAudit(parseJsonMap(data));
+                            recordRunEvent(run, "TOOL_EXECUTION_END", null,
+                                    hasText(string(audit.get("nodeId"))) ? string(audit.get("nodeId")) : null, "RUNNING",
+                                    toolExecutionEndMessage(audit), audit, streamSequence.incrementAndGet() * 100);
+                        }
+                        send(org.springframework.web.servlet.mvc.method.annotation.SseEmitter.event()
+                                .name(eventName).data(data == null ? "{}" : data));
+                    } else if ("node_update".equals(eventName)) {
                         Map<String, Object> nodePayload = parseJsonMap(data);
                         WorkflowNodeRun nodeRun = upsertStreamedNodeRun(run, nodePayload, streamedNodeRuns,
                                 streamLayoutNodes, streamSequence.incrementAndGet());
@@ -1297,6 +1317,48 @@ public class WorkflowService {
         return mapper.findRun(runId);
     }
 
+    /** P4-10 (待确认): minimum interval between cancel-flag DB reads while streaming (terminal events always check). */
+    @Value("${aegis.workflow.stream.cancel-check-interval-ms:500}")
+    private long streamCancelCheckIntervalMs = 500L;
+
+    private java.util.function.LongSupplier cancelCheckClock = System::currentTimeMillis;
+
+    void setStreamCancelCheckIntervalMs(long intervalMs) {
+        this.streamCancelCheckIntervalMs = Math.max(0L, intervalMs);
+    }
+
+    void setCancelCheckClock(java.util.function.LongSupplier clock) {
+        this.cancelCheckClock = clock == null ? System::currentTimeMillis : clock;
+    }
+
+    /** P4-10: orchestrator event protocol v2 events forwarded to the client (P4-9). */
+    static boolean isStreamV2Event(String eventName) {
+        return "node_start".equals(eventName) || "message_delta".equals(eventName) || "token".equals(eventName)
+                || "tool_execution_start".equals(eventName) || "tool_execution_end".equals(eventName)
+                || "usage".equals(eventName);
+    }
+
+    static boolean isTerminalStreamEvent(String eventName) {
+        return "workflow_complete".equals(eventName) || "error".equals(eventName)
+                || "human_interrupt".equals(eventName) || "cancelled".equals(eventName);
+    }
+
+    /** Persisted subset of a tool_execution_end event: identity, outcome and timing only. */
+    static Map<String, Object> toolExecutionEndAudit(Map<String, Object> payload) {
+        Map<String, Object> audit = new LinkedHashMap<>();
+        for (String key : new String[] {"toolCallId", "toolName", "nodeId", "isError", "durationMs", "truncated"}) {
+            if (payload != null && payload.get(key) != null) {
+                audit.put(key, payload.get(key));
+            }
+        }
+        return audit;
+    }
+
+    private static String toolExecutionEndMessage(Map<String, Object> audit) {
+        String name = audit.get("toolName") == null ? "tool" : String.valueOf(audit.get("toolName"));
+        return (Boolean.TRUE.equals(audit.get("isError")) ? "Tool failed: " : "Tool completed: ") + name;
+    }
+
     /** P2-19 (待确认): stop reading and cancel the run when the SSE client goes away. */
     @Value("${aegis.workflow.stream.cancel-on-disconnect:false}")
     private boolean cancelStreamOnDisconnect = false;
@@ -1327,6 +1389,12 @@ public class WorkflowService {
     /** See {@link WorkflowApprovalService#decideApproval}. */
     public WorkflowRun decideApproval(String runId, boolean approved, String comment, AuthenticatedPrincipal approver) {
         return approval.decideApproval(runId, approved, comment, approver);
+    }
+
+    /** P4-10 (R11): streaming approval; see {@link WorkflowApprovalService#decideApprovalStreaming}. */
+    public void decideApprovalStreaming(String runId, boolean approved, String comment, AuthenticatedPrincipal approver,
+                                        org.springframework.web.servlet.mvc.method.annotation.SseEmitter emitter) {
+        approval.decideApprovalStreaming(runId, approved, comment, approver, emitter);
     }
 
     boolean isHumanInterrupt(WorkflowRun run) {

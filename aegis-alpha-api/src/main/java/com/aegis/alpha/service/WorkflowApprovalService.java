@@ -6,10 +6,14 @@ import com.aegis.alpha.mapper.WorkflowMapper;
 import com.aegis.alpha.security.AuthenticatedPrincipal;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * P3-10: human-approval gate extracted unchanged from {@link WorkflowService}
@@ -68,16 +72,38 @@ final class WorkflowApprovalService {
      * @throws IllegalStateException when the run never waited for approval
      */
     public WorkflowRun decideApproval(String runId, boolean approved, String comment, AuthenticatedPrincipal approver) {
+        Claim claim = claim(runId, approved, comment, approver);
+        if (claim.current != null) {
+            return claim.current;
+        }
+        WorkflowRun run = claim.run;
+        Map<String, Object> resume = gateway.resumeWorkflow(run.getRunId(), approved,
+                LangChainGateway.runOwner(run.getUserId(), run.getTenantId()), claim.delegatedToken);
+        return applyResumeOutcome(run, approved, claim.audit, resume);
+    }
+
+    /** Result of the HUMAN_INTERRUPT claim: {@code current} is set when this caller does not own the decision. */
+    static final class Claim {
+        WorkflowRun current;
+        WorkflowRun run;
+        Map<String, Object> audit;
+        String delegatedToken;
+    }
+
+    private Claim claim(String runId, boolean approved, String comment, AuthenticatedPrincipal approver) {
+        Claim claim = new Claim();
         WorkflowRun run = host.requireRun(runId);
         if (!host.isHumanInterrupt(run)) {
             if (isApprovalDecidedOrInFlight(run)) {
-                return mapper.findRun(runId);
+                claim.current = mapper.findRun(runId);
+                return claim;
             }
             throw new IllegalStateException("Workflow run is not awaiting human approval: " + runId);
         }
         if (mapper.transitionControlStatus(runId, "HUMAN_INTERRUPT", APPROVAL_IN_PROGRESS) == 0) {
             /* Another request claimed the decision first. */
-            return mapper.findRun(runId);
+            claim.current = mapper.findRun(runId);
+            return claim;
         }
         Map<String, Object> audit = new LinkedHashMap<>();
         audit.put("approved", approved);
@@ -96,8 +122,16 @@ final class WorkflowApprovalService {
         String delegatedToken = approved
                 ? host.issueDelegatedPortfolioReadToken(run.getRunId(), run.getUserId(), run.getTenantId(), null)
                 : null;
-        Map<String, Object> resume = gateway.resumeWorkflow(run.getRunId(), approved,
-                LangChainGateway.runOwner(run.getUserId(), run.getTenantId()), delegatedToken);
+        claim.run = run;
+        claim.audit = audit;
+        claim.delegatedToken = delegatedToken;
+        return claim;
+    }
+
+    /** Apply an orchestrator resume outcome (sync response or one assembled from the resume stream). */
+    private WorkflowRun applyResumeOutcome(WorkflowRun run, boolean approved, Map<String, Object> audit,
+                                           Map<String, Object> resume) {
+        String runId = run.getRunId();
         if (isResumeOk(resume)) {
             /* P2-13 / Phase-1 leftover: nodes that ran after the approval gate are materialized
              * as node runs + NODE_* events (same for runs started streaming or non-streaming). */
@@ -148,6 +182,156 @@ final class WorkflowApprovalService {
                     "Human approval resume failed.", resume, 960000);
         }
         return mapper.findRun(runId);
+    }
+
+    /**
+     * P4-10 (R11): streaming approval. Same claim / audit / run-owner delegation / outcome rules as
+     * {@link #decideApproval}, but the orchestrator is resumed through {@code /resume-workflow-stream} and
+     * its events are forwarded to {@code emitter}. v2 progress events are not persisted (a finished tool
+     * call leaves one TOOL_EXECUTION_END event); the run state is written once from the terminal event,
+     * then the terminal event and a {@code run_state} snapshot are sent and the emitter completes.
+     * The aggregate answer arrives only as the orchestrator's gated final {@code message_delta}.
+     */
+    public void decideApprovalStreaming(String runId, boolean approved, String comment, AuthenticatedPrincipal approver,
+                                        SseEmitter emitter) {
+        Claim claim;
+        try {
+            claim = claim(runId, approved, comment, approver);
+        } catch (IllegalStateException ex) {
+            Map<String, Object> error = new LinkedHashMap<>();
+            error.put("ok", false);
+            error.put("error", ex.getMessage());
+            error.put("code", "NOT_AWAITING_APPROVAL");
+            sendQuietly(emitter, "error", host.toJson(error));
+            completeQuietly(emitter);
+            return;
+        }
+        if (claim.current != null) {
+            sendQuietly(emitter, "run_state", host.toJson(claim.current));
+            completeQuietly(emitter);
+            return;
+        }
+        final WorkflowRun run = claim.run;
+        final List<Object> trace = new ArrayList<>();
+        final AtomicReference<Map<String, Object>> outcome = new AtomicReference<>();
+        final String[] terminal = new String[2];
+        final AtomicInteger sequence = new AtomicInteger(0);
+        Map<String, Object> resume;
+        if (!gateway.isEnabled()) {
+            resume = new LinkedHashMap<>();
+            resume.put("ok", false);
+            resume.put("error", "LangGraph disabled");
+        } else {
+            String body = gateway.buildResumeStreamBody(run.getRunId(), approved,
+                    LangChainGateway.runOwner(run.getUserId(), run.getTenantId()), claim.delegatedToken);
+            SseStreamReader.readSse(gateway.resumeWorkflowStreamUrl(), body, gateway.serviceAuthorizationHeader(),
+                    new SseStreamReader.SseEventHandler() {
+                        @Override public void onEvent(String eventName, String data) {
+                            if (outcome.get() != null) {
+                                return;
+                            }
+                            String payloadJson = data == null ? "{}" : data;
+                            if (WorkflowService.isStreamV2Event(eventName)) {
+                                if ("tool_execution_end".equals(eventName)) {
+                                    Map<String, Object> audit = WorkflowService.toolExecutionEndAudit(host.parseJsonMap(data));
+                                    String nodeId = host.string(audit.get("nodeId"));
+                                    host.recordRunEvent(run, "TOOL_EXECUTION_END", null,
+                                            nodeId == null || nodeId.isEmpty() ? null : nodeId, "RUNNING",
+                                            "Tool finished after approval.", audit, 957000 + sequence.incrementAndGet());
+                                }
+                                sendQuietly(emitter, eventName, payloadJson);
+                            } else if ("node_update".equals(eventName)) {
+                                trace.add(host.parseJsonMap(data));
+                                sendQuietly(emitter, eventName, payloadJson);
+                            } else if (WorkflowService.isMessageQueueEvent(eventName) || "degraded".equals(eventName)) {
+                                sendQuietly(emitter, eventName, payloadJson);
+                            } else if ("human_interrupt".equals(eventName)) {
+                                Map<String, Object> finalState = new LinkedHashMap<>();
+                                finalState.put("interrupted", true);
+                                outcome.set(resumeOutcome(true, trace, finalState, null));
+                                terminal[0] = eventName;
+                                terminal[1] = payloadJson;
+                            } else if ("workflow_complete".equals(eventName)) {
+                                Map<String, Object> payload = host.parseJsonMap(data);
+                                Map<String, Object> finalState = payload.get("final_state") instanceof Map
+                                        ? castMap(payload.get("final_state")) : new LinkedHashMap<String, Object>();
+                                outcome.set(resumeOutcome(true, trace, finalState, null));
+                                terminal[0] = eventName;
+                                terminal[1] = payloadJson;
+                            } else if ("error".equals(eventName) || "cancelled".equals(eventName)) {
+                                Map<String, Object> payload = host.parseJsonMap(data);
+                                String error = host.string(payload.get("error"));
+                                outcome.set(resumeOutcome(false, trace, null,
+                                        error == null || error.isEmpty() ? eventName : error));
+                                terminal[0] = "error";
+                                terminal[1] = payloadJson;
+                            }
+                        }
+
+                        @Override public void onError(Exception ex) {
+                            if (outcome.get() == null) {
+                                outcome.set(resumeOutcome(false, trace, null, "Stream error: " + ex.getMessage()));
+                            }
+                        }
+
+                        @Override public void onComplete() {
+                            // terminal handling happens after the reader returns
+                        }
+                    });
+            resume = outcome.get() != null ? outcome.get()
+                    : resumeOutcome(false, trace, null, "resume stream ended without a terminal event");
+        }
+        WorkflowRun updated = applyResumeOutcome(run, approved, claim.audit, resume);
+        if (terminal[0] != null) {
+            sendQuietly(emitter, terminal[0], terminal[1]);
+        } else {
+            Map<String, Object> error = new LinkedHashMap<>();
+            error.put("ok", false);
+            error.put("error", host.string(resume.get("error")));
+            sendQuietly(emitter, "error", host.toJson(error));
+        }
+        sendQuietly(emitter, "run_state", host.toJson(updated));
+        completeQuietly(emitter);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> castMap(Object value) {
+        return (Map<String, Object>) value;
+    }
+
+    /** Resume outcome in the shape of the sync /resume-workflow response (trace, node_outputs, final_state). */
+    private static Map<String, Object> resumeOutcome(boolean ok, List<Object> trace, Map<String, Object> finalState,
+                                                     String error) {
+        Map<String, Object> resume = new LinkedHashMap<>();
+        resume.put("ok", ok);
+        resume.put("trace", new ArrayList<Object>(trace));
+        if (finalState != null) {
+            resume.put("final_state", finalState);
+            if (finalState.get("nodes") instanceof Map) {
+                resume.put("node_outputs", finalState.get("nodes"));
+            }
+        }
+        if (error != null) {
+            resume.put("error", error);
+        }
+        return resume;
+    }
+
+    /* A gone client never stops the resume: the run state must still be written. */
+    private static void sendQuietly(SseEmitter emitter, String name, String data) {
+        try {
+            emitter.send(SseEmitter.event().name(name).data(data == null ? "{}" : data));
+        } catch (Exception ignored) {
+            // client disconnected
+        }
+    }
+
+    private static void completeQuietly(SseEmitter emitter) {
+        try {
+            emitter.complete();
+        } catch (Exception ignored) {
+            // already completed
+        }
     }
 
     /** Insert node runs for trace entries of the resumed graph that were not recorded before the pause. */

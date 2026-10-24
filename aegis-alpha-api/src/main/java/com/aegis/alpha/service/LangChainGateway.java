@@ -292,17 +292,7 @@ public class LangChainGateway {
             return failed;
         }
         try {
-            Map<String, Object> resumeValue = new LinkedHashMap<>();
-            resumeValue.put("approved", approved);
-            Map<String, Object> body = new LinkedHashMap<>();
-            body.put("threadId", threadId);
-            body.put("resumeValue", resumeValue);
-            if (owner != null && !owner.isEmpty()) {
-                body.put("owner", owner);
-            }
-            if (delegatedToken != null && !delegatedToken.trim().isEmpty()) {
-                body.put("delegatedToken", delegatedToken.trim());
-            }
+            Map<String, Object> body = resumeBody(threadId, approved, owner, delegatedToken);
             HttpHeaders headers = new HttpHeaders();
             headers.setContentType(MediaType.APPLICATION_JSON);
             applyServiceAuth(headers);
@@ -318,6 +308,37 @@ public class LangChainGateway {
             log.warn("[LangChainGateway] resumeWorkflow failed threadId={} error={}", threadId, ex.getMessage());
             failed.put("error", ex.getMessage());
             return failed;
+        }
+    }
+
+    private static Map<String, Object> resumeBody(String threadId, boolean approved, Map<String, String> owner,
+                                                  String delegatedToken) {
+        Map<String, Object> resumeValue = new LinkedHashMap<>();
+        resumeValue.put("approved", approved);
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("threadId", threadId);
+        body.put("resumeValue", resumeValue);
+        if (owner != null && !owner.isEmpty()) {
+            body.put("owner", owner);
+        }
+        if (delegatedToken != null && !delegatedToken.trim().isEmpty()) {
+            body.put("delegatedToken", delegatedToken.trim());
+        }
+        return body;
+    }
+
+    /** P4-10 (R11): SSE resume endpoint (same events as /stream-workflow). */
+    public String resumeWorkflowStreamUrl() {
+        return trimSlash(engineUrl) + "/resume-workflow-stream";
+    }
+
+    /** P4-10: JSON body for {@link #resumeWorkflowStreamUrl()}; same fields as {@link #resumeWorkflow}. */
+    public String buildResumeStreamBody(String threadId, boolean approved, Map<String, String> owner,
+                                        String delegatedToken) {
+        try {
+            return objectMapper.writeValueAsString(resumeBody(threadId, approved, owner, delegatedToken));
+        } catch (Exception ex) {
+            throw new IllegalStateException("Failed to serialize resume body", ex);
         }
     }
 

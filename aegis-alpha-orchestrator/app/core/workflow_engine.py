@@ -12,7 +12,7 @@ import uuid
 from collections import defaultdict, OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Annotated, Any, AsyncIterator, Optional
+from typing import Annotated, Any, AsyncIterator, Awaitable, Callable, Optional
 from typing_extensions import TypedDict
 
 from langgraph.checkpoint.memory import MemorySaver
@@ -1832,8 +1832,11 @@ class WorkflowEngine:
         label: str,
         queue: ThreadMessageQueue | None = None,
         owner: Any = None,
+        on_complete: Callable[[], Awaitable[None]] | None = None,
     ) -> AsyncIterator[SSEEvent]:
         """Shared ``astream`` → SSE translation for both streaming endpoints (P2-12).
+
+        ``on_complete`` (P4-10, resume stream) runs after a completed graph, before thread cleanup.
 
         ``token_node_id`` also emits the gated aggregate answer as one deprecated ``token`` alias event; ``report_degraded``
         collects degraded reasons and emits a ``degraded`` event before completion. The whole run
@@ -1988,6 +1991,11 @@ class WorkflowEngine:
                     )
                 complete["degraded"] = bool(degraded_reasons)
             complete["final_state"] = build_stream_final_state(streamed_state, streamed_outputs)
+            if on_complete is not None:
+                try:
+                    await on_complete()
+                except Exception as exc:  # noqa: BLE001 - post-run hooks never fail a finished run
+                    logger.warning("[THINKING] %s on_complete hook failed: %s", label, type(exc).__name__)
             await self._cleanup_thread(tid)
             outcome = "completed"
             closed = self._close_queue_event(queue, outcome)
@@ -2116,28 +2124,17 @@ class WorkflowEngine:
             async for event in events:
                 yield event
 
-    async def resume_workflow(
+    async def _resume_setup(
         self,
         thread_id: str,
-        resume_value: dict[str, Any] | None = None,
-        nodes: list[Node] | None = None,
-        edges: list[Edge] | None = None,
-        require_approval: bool | None = None,
-        owner: Any = None,
-    ) -> WorkflowResult:
-        """Resume an interrupted workflow using Command(resume=...).
-
-        Rebuilds the graph with the same require_approval flag used at start.
-        Prefers explicit args, then per-thread metadata saved during execute/stream.
-        When unknown, defaults require_approval=True because resume is used for
-        approval-gate interrupts.
-        """
+        resume_value: dict[str, Any] | None,
+        nodes: list[Node] | None,
+        edges: list[Edge] | None,
+        require_approval: bool | None,
+    ) -> tuple[list[Node], list[Edge], bool] | str:
+        """Validate the decision and recover layout + require_approval; returns an error text on failure."""
         if not is_valid_resume_value(resume_value):
-            return WorkflowResult(
-                ok=False,
-                error="resume_value must be an object with a boolean 'approved' field",
-                final_state={},
-            )
+            return "resume_value must be an object with a boolean 'approved' field"
         meta = dict(self._thread_meta.get(thread_id) or {})
         had_layout = bool(meta.get("nodes")) and bool(meta.get("edges"))
         if nodes is None:
@@ -2156,10 +2153,7 @@ class WorkflowEngine:
                     edges=edges,
                 )
         if nodes is None or edges is None:
-            return WorkflowResult(
-                ok=False,
-                error="Cannot resume: original workflow layout not available. Provide nodes and edges.",
-            )
+            return "Cannot resume: original workflow layout not available. Provide nodes and edges."
 
         if require_approval is None:
             if had_layout and "require_approval" in meta:
@@ -2171,6 +2165,75 @@ class WorkflowEngine:
             else:
                 # Resume targets approval interrupts; keep approval_gate in the graph.
                 require_approval = True
+
+        return nodes, edges, bool(require_approval)
+
+    async def resume_workflow_stream(
+        self,
+        thread_id: str,
+        resume_value: dict[str, Any] | None = None,
+        owner: Any = None,
+    ) -> AsyncIterator[SSEEvent]:
+        """P4-10 (R11): streaming resume with the same v2 events as ``stream_workflow``.
+
+        The aggregate after the approval gate is still released only through the gated final
+        ``message_delta``; an explicit approval writes the approved conclusion like the sync path.
+        """
+        setup = await self._resume_setup(thread_id, resume_value, None, None, None)
+        if isinstance(setup, str):
+            yield SSEEvent(event="error", data={"ok": False, "error": setup, "code": "RESUME_INVALID"})
+            return
+        nodes, edges, require_approval = setup
+        graph = self.build_graph(nodes, edges, require_approval=require_approval)
+        queue = self._open_run_queue(thread_id, owner, nodes)
+        config = self._run_config(thread_id, queue)
+
+        async def _after_complete() -> None:
+            if not is_explicit_approval(resume_value):
+                return
+            snapshot = await graph.aget_state({"configurable": {"thread_id": thread_id}})
+            result = self._result_from_graph_output(dict(getattr(snapshot, "values", None) or {}))
+            if not result.final_state.get("interrupted"):
+                await self._store_approved_conclusion(result, nodes, thread_id)
+
+        async with contextlib.aclosing(
+            self._stream_events(
+                graph,
+                Command(resume=resume_value),
+                config,
+                {},
+                tid=thread_id,
+                token_node_id=None,
+                report_degraded=True,
+                label="resume",
+                queue=queue,
+                owner=owner,
+                on_complete=_after_complete,
+            )
+        ) as events:
+            async for event in events:
+                yield event
+
+    async def resume_workflow(
+        self,
+        thread_id: str,
+        resume_value: dict[str, Any] | None = None,
+        nodes: list[Node] | None = None,
+        edges: list[Edge] | None = None,
+        require_approval: bool | None = None,
+        owner: Any = None,
+    ) -> WorkflowResult:
+        """Resume an interrupted workflow using Command(resume=...).
+
+        Rebuilds the graph with the same require_approval flag used at start.
+        Prefers explicit args, then per-thread metadata saved during execute/stream.
+        When unknown, defaults require_approval=True because resume is used for
+        approval-gate interrupts.
+        """
+        setup = await self._resume_setup(thread_id, resume_value, nodes, edges, require_approval)
+        if isinstance(setup, str):
+            return WorkflowResult(ok=False, error=setup, final_state={})
+        nodes, edges, require_approval = setup
 
         graph = self.build_graph(nodes, edges, require_approval=require_approval)
         # Queued messages kept while paused are delivered after the explicit resume

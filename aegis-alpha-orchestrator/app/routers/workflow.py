@@ -81,6 +81,32 @@ async def resume_workflow(body: ResumeRequest):
         )
 
 
+@router.post("/resume-workflow-stream")
+async def resume_workflow_stream(body: ResumeRequest):
+    """P4-10 (R11): SSE resume of an approval-gate interrupt (same events as /stream-workflow)."""
+    import json
+
+    async def event_generator():
+        with _authorization_context(body.delegated_token):
+            async for event in workflow_engine.resume_workflow_stream(
+                thread_id=body.thread_id,
+                # No default: a missing decision must never be treated as approval.
+                resume_value=body.resume_value,
+                owner=body.owner,
+            ):
+                yield f"event: {event.event}\ndata: {json.dumps(event.data)}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 @router.post("/stream-workflow")
 async def stream_workflow(request: Request, body: WorkflowRequest):
     """SSE streaming workflow execution."""
