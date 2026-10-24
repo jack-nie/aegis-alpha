@@ -23,6 +23,7 @@ from .context_assembly import (
 )
 from .prompt_safety import USER_INPUT_TAG, fence
 from .critique import critique_recommendation_draft
+from .log_safety import text_len
 from .llm_client import AgentToolResult, LLMClient, LLMResponse
 from .market_data import MarketDataService
 from .recommendation_policy import enforce_recommendation_policy
@@ -227,7 +228,8 @@ class NodeExecutor:
         handler = self._resolve_handler(node)
         node_type = self._resolve_node_type(node)
         node_label = node.data.label or node.data.title or node.id
-        logger.info(f"[THINKING] Node started: id={node.id} handler={handler} label={node_label} subject={subject}")
+        logger.info(f"[THINKING] Node started: id={node.id} handler={handler} label={node_label} subject_len={text_len(subject)}")
+        logger.debug("Node subject: id=%s subject=%s", node.id, subject)
 
         effective_provider = provider or self._config.provider
         if effective_provider not in ("openai", "deepseek"):
@@ -397,7 +399,8 @@ class NodeExecutor:
 
         duration_ms = int((datetime.now(timezone.utc) - datetime.fromisoformat(started_at)).total_seconds() * 1000)
         logger.info(f"[THINKING] Node completed: id={node.id} handler={handler} label={node_label} duration={duration_ms}ms status=completed confidence={response.confidence}")
-        logger.info(f"[THINKING] Node output: id={node.id} summary={response.summary[:200] if response.summary else 'N/A'}")
+        logger.info(f"[THINKING] Node output: id={node.id} summary_len={text_len(response.summary)}")
+        logger.debug("Node output summary: id=%s summary=%s", node.id, (response.summary or "")[:200])
 
         sources = [
             s if isinstance(s, dict) else {"title": str(s), "url": "", "type": "llm"}
