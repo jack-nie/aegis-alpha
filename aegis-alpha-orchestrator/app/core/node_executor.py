@@ -305,6 +305,18 @@ class NodeExecutor:
             return s
         return {"name": str(s), "value": s, "weight": 0.5}
 
+    @staticmethod
+    def _normalize_source(source) -> dict:
+        """Normalize a model-provided source to the Source contract (title required)."""
+        if isinstance(source, dict):
+            title = source.get("title") or source.get("name") or source.get("type") or "source"
+            return {
+                "title": str(title),
+                "url": str(source.get("url") or ""),
+                "type": str(source.get("type") or ""),
+            }
+        return {"title": str(source), "url": "", "type": "llm"}
+
     def _resolve_handler(self, node: Node) -> str:
         """Resolve handler name from node data."""
         data = node.data
@@ -402,10 +414,7 @@ class NodeExecutor:
         logger.info(f"[THINKING] Node output: id={node.id} summary_len={text_len(response.summary)}")
         logger.debug("Node output summary: id=%s summary=%s", node.id, (response.summary or "")[:200])
 
-        sources = [
-            s if isinstance(s, dict) else {"title": str(s), "url": "", "type": "llm"}
-            for s in response.sources
-        ]
+        sources = [self._normalize_source(s) for s in response.sources]
         # Prefer market hydration as a structured source when present
         market_ctx = state.get("marketDataContext")
         if isinstance(market_ctx, dict) and market_ctx:
@@ -752,10 +761,7 @@ class NodeExecutor:
             (datetime.now(timezone.utc) - datetime.fromisoformat(started_at)).total_seconds()
             * 1000
         )
-        sources = [
-            s if isinstance(s, dict) else {"title": str(s), "url": "", "type": "llm"}
-            for s in response.sources
-        ]
+        sources = [self._normalize_source(s) for s in response.sources]
         return NodeResult(
             ok=True,
             status="completed",
