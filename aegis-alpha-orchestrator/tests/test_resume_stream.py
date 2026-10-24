@@ -60,6 +60,24 @@ async def test_resume_stream_emits_v2_events_after_approval(mock_node_executor):
     assert final == [{"nodeId": "aggregate", "delta": "Full report", "final": True, "gatePassed": True}]
     assert names.index("message_delta") < names.index("workflow_complete")
     assert any(e.event == "node_update" and e.data["nodeId"] == "aggregate" for e in resumed)
+    # D10b: per-node results of the resumed nodes (not the trimmed final_state summaries).
+    complete = resumed[-1].data
+    assert "aggregate" in complete["node_outputs"] and "market" not in complete["node_outputs"]
+    assert complete["node_outputs"]["aggregate"]["content"] == "Full report"
+    assert complete["node_outputs"]["aggregate"]["data"]["recommendation"] == "HOLD"
+
+
+def test_bounded_node_outputs_caps_and_flags():
+    from app.core.workflow_engine import bounded_node_outputs
+
+    big = {"handler": "h", "ok": True, "summary": "s", "content": "x" * 5000}
+    small = {"handler": "h", "ok": True, "summary": "s", "content": "y"}
+    out = bounded_node_outputs({"a": small, "b": big, "c": "not-a-dict"}, per_node_max=1000)
+    assert out["a"] == small
+    assert out["b"]["truncated"] is True and "content" not in out["b"]
+    assert "c" not in out
+    capped = bounded_node_outputs({"a": small, "b": small}, total_max=len('{"handler": "h", "ok": true, "summary": "s", "content": "y"}') + 1)
+    assert "truncated" not in capped["a"] and capped["b"]["truncated"] is True
 
 
 @pytest.mark.asyncio

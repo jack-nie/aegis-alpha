@@ -328,6 +328,43 @@ _STREAM_RECOMMENDATION_KEYS = (
 )
 
 
+# D10b: per-node results attached to a resume stream's workflow_complete (Java materializes them
+# like the sync /resume-workflow node_outputs). Bounded per node and in total (JSON characters).
+RESUME_NODE_OUTPUT_MAX_CHARS = 32000
+RESUME_NODE_OUTPUTS_TOTAL_MAX_CHARS = 128000
+
+
+def bounded_node_outputs(
+    node_outputs: dict[str, Any] | None,
+    *,
+    per_node_max: int = RESUME_NODE_OUTPUT_MAX_CHARS,
+    total_max: int = RESUME_NODE_OUTPUTS_TOTAL_MAX_CHARS,
+) -> dict[str, Any]:
+    """Per-node results (JSON-safe) for nodes that ran in this stream; oversize entries are replaced by
+    the trimmed summary entry flagged ``truncated`` (never dropped silently)."""
+    out: dict[str, Any] = {}
+    used = 0
+    for node_id, payload in (node_outputs if isinstance(node_outputs, dict) else {}).items():
+        if not isinstance(payload, dict):
+            continue
+        safe = json.loads(json.dumps(payload, ensure_ascii=False, default=str))
+        size = len(json.dumps(safe, ensure_ascii=False))
+        if size > per_node_max or used + size > total_max:
+            summary = safe.get("summary")
+            safe = {
+                "handler": safe.get("handler", ""),
+                "ok": safe.get("ok", True),
+                "status": safe.get("status", ""),
+                "degraded": bool(safe.get("degraded", False)),
+                "summary": (str(summary) if summary is not None else "")[:_STREAM_SUMMARY_CHARS],
+                "truncated": True,
+            }
+            size = len(json.dumps(safe, ensure_ascii=False))
+        out[str(node_id)] = safe
+        used += size
+    return out
+
+
 def build_stream_final_state(
     final_state: dict[str, Any] | None,
     node_outputs: dict[str, Any] | None,
@@ -1914,8 +1951,12 @@ class WorkflowEngine:
         queue: ThreadMessageQueue | None = None,
         owner: Any = None,
         on_complete: Callable[[], Awaitable[None]] | None = None,
+        include_node_outputs: bool = False,
     ) -> AsyncIterator[SSEEvent]:
         """Shared ``astream`` → SSE translation for both streaming endpoints (P2-12).
+
+        ``include_node_outputs`` (D10b, resume stream) adds the bounded per-node results of the nodes
+        that ran in this stream to ``workflow_complete`` as ``node_outputs``.
 
         ``on_complete`` (P4-10, resume stream) runs after a completed graph, before thread cleanup.
 
@@ -2072,6 +2113,8 @@ class WorkflowEngine:
                     )
                 complete["degraded"] = bool(degraded_reasons)
             complete["final_state"] = build_stream_final_state(streamed_state, streamed_outputs)
+            if include_node_outputs:
+                complete["node_outputs"] = bounded_node_outputs(streamed_outputs)
             if on_complete is not None:
                 try:
                     await on_complete()
@@ -2293,6 +2336,7 @@ class WorkflowEngine:
                 queue=queue,
                 owner=owner,
                 on_complete=_after_complete,
+                include_node_outputs=True,
             )
         ) as events:
             async for event in events:

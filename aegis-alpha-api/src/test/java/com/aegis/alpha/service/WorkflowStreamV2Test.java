@@ -385,4 +385,23 @@ class WorkflowStreamV2Test {
         assertThat(result.getStatus()).isEqualTo("CANCELLED");
         assertThat(eventTypes()).contains("RUN_RESUME_DISCARDED").doesNotContain("RUN_APPROVED");
     }
+
+    @Test
+    void streamingApprovalMaterializesPerNodeOutputsNotTrimmedSummaries() throws Exception {
+        /* D10b: node_outputs from workflow_complete feed the materialized node run output. */
+        paused("run-o");
+        when(mapper.findNodeRuns("run-o")).thenReturn(java.util.Collections.<WorkflowNodeRun>emptyList());
+        when(gateway.buildResumeStreamBody(eq("run-o"), eq(true), any(), nullable(String.class))).thenReturn("{}");
+        serve(sse("node_update", "{\"nodeId\":\"aggregate\",\"nodeName\":\"Report\",\"status\":\"completed\",\"ok\":true}")
+                + sse("workflow_complete", "{\"ok\":true,\"final_state\":{\"nodes\":{\"aggregate\":{\"summary\":\"short\"}}},"
+                + "\"node_outputs\":{\"aggregate\":{\"summary\":\"short\",\"content\":\"Full report body\"}}}"));
+        WorkflowServiceStreamingControlTest.RecordingEmitter emitter = new WorkflowServiceStreamingControlTest.RecordingEmitter();
+
+        service.decideApprovalStreaming("run-o", true, null, null, emitter);
+
+        ArgumentCaptor<WorkflowNodeRun> inserted = ArgumentCaptor.forClass(WorkflowNodeRun.class);
+        verify(mapper, times(1)).insertNodeRun(inserted.capture());
+        assertThat(inserted.getValue().getOutputJson()).contains("Full report body");
+        assertThat(storedRun.get().getStatus()).isEqualTo("COMPLETED");
+    }
 }

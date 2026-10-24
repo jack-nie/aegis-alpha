@@ -283,7 +283,13 @@ final class WorkflowApprovalService {
                                 Map<String, Object> payload = host.parseJsonMap(data);
                                 Map<String, Object> finalState = payload.get("final_state") instanceof Map
                                         ? castMap(payload.get("final_state")) : new LinkedHashMap<String, Object>();
-                                outcome.set(resumeOutcome(true, trace, finalState, null));
+                                Map<String, Object> completed = resumeOutcome(true, trace, finalState, null);
+                                /* D10b: per-node results of the resumed nodes (bounded by the orchestrator)
+                                 * take precedence over the trimmed final_state.nodes summaries. */
+                                if (payload.get("node_outputs") instanceof Map) {
+                                    completed.put("node_outputs", payload.get("node_outputs"));
+                                }
+                                outcome.set(completed);
                                 terminal[0] = eventName;
                                 terminal[1] = payloadJson;
                             } else if ("error".equals(eventName) || "cancelled".equals(eventName)) {
