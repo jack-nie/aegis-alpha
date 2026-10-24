@@ -34,7 +34,15 @@ from ..models.workflow import Node, Edge, TraceEntry
 from ..models.responses import NodeResult, WorkflowResult, SSEEvent
 from .log_safety import text_len
 from .checkpointer_lifecycle import ensure_async_checkpointer
-from .context_assembly import apply_trace_usage, memory_hit_count
+from .context_assembly import (
+    apply_trace_usage,
+    memory_hit_count,
+    normalize_token_usage,
+    sum_token_usage,
+    usage_totals,
+    with_estimated_cost,
+)
+from .model_registry import get_model_registry
 from .memory_selector import load_run_memory, read_store_value, ticker_namespace
 from .market_data import run_scoped_market_cache
 from .memory_store import MemoryStoreManager
@@ -296,6 +304,9 @@ def build_stream_final_state(
         "nodes": nodes,
         "evidenceIds": sorted(str(k) for k in evidence) if isinstance(evidence, dict) else [],
     }
+    totals = usage_totals(final_state.get("usage_by_node"))
+    if totals:
+        trimmed["usageTotals"] = totals  # P4-7
 
     def size(value: Any) -> int:
         return len(json.dumps(value, ensure_ascii=False, default=str))
@@ -888,6 +899,37 @@ class WorkflowEngine:
                     traced[key] = resolution[key]
         return traced
 
+    def _agent_turn_usage(self, agent_result: Any) -> dict | None:
+        """Normalized usage of one agent LLM call, with a registry cost estimate when prices are configured."""
+        usage = getattr(agent_result, "turn_usage", None)
+        if not usage:
+            return None
+        resolution = getattr(agent_result, "model_resolution", None)
+        model = getattr(resolution, "effective", None) or getattr(
+            getattr(self._node_executor, "_config", None), "model", None
+        )
+        models_file = getattr(getattr(self._node_executor, "_config", None), "models_file", "") or None
+        return with_estimated_cost(usage, model, get_model_registry(models_file))
+
+    @staticmethod
+    def _prior_usage_turns(final_state: Any, node_id: str) -> list[dict[str, Any]]:
+        turns = ((final_state or {}).get("usage_turns") or {}).get(node_id) if isinstance(final_state, dict) else None
+        return [dict(t) for t in turns if isinstance(t, dict)] if isinstance(turns, list) else []
+
+    @staticmethod
+    def _usage_state(node_id: str, turns: list[dict[str, Any]]) -> dict[str, Any]:
+        """final_state keys for P4-7 usage (node-keyed, so deep_merge keeps parallel branches)."""
+        if not turns:
+            return {}
+        return {"usage_turns": {node_id: turns}, "usage_by_node": {node_id: sum_token_usage(turns)}}
+
+    @staticmethod
+    def _with_usage_totals(final_state: dict[str, Any]) -> dict[str, Any]:
+        totals = usage_totals(final_state.get("usage_by_node"))
+        if totals:
+            final_state["usageTotals"] = totals
+        return final_state
+
     @staticmethod
     def _node_result_from_cache(payload: Any) -> NodeResult | None:
         """Accept a flat NodeResult dump. aget Items are unwrapped by read_store_value."""
@@ -908,7 +950,7 @@ class WorkflowEngine:
         if not isinstance(graph_out, dict):
             graph_out = {}
         interrupted = bool(graph_out.get("__interrupt__"))
-        inner = dict(graph_out.get("final_state") or {})
+        inner = self._with_usage_totals(dict(graph_out.get("final_state") or {}))
         if interrupted:
             inner["interrupted"] = True
         trace: list[TraceEntry] = []
@@ -938,7 +980,7 @@ class WorkflowEngine:
             snapshot = await graph.aget_state(config)
             values = getattr(snapshot, "values", None) or {}
             if isinstance(values, dict):
-                final_state = dict(values.get("final_state") or {})
+                final_state = self._with_usage_totals(dict(values.get("final_state") or {}))
                 final_state["interrupted"] = True
                 for entry in values.get("trace") or []:
                     if isinstance(entry, dict):
@@ -1360,6 +1402,10 @@ class WorkflowEngine:
             if result.handler:
                 state_update[result.handler] = result.model_dump()
             self._merge_evidence(state_update, result)
+            node_usage = normalize_token_usage((result.data or {}).get("tokenUsage")) if isinstance(result.data, dict) else None
+            if node_usage:
+                # P4-7: per-node totals (node-keyed so parallel branches merge) → final_state.usageTotals.
+                state_update["usage_by_node"] = {node.id: node_usage}
             if is_agent_with_tools:
                 # Attribution for tools → agent return path
                 state_update["last_agent_id"] = node.id
@@ -1417,8 +1463,13 @@ class WorkflowEngine:
                 f"[THINKING] Agent requesting tools: id={node.id} round={next_round}/{MAX_TOOL_ROUNDS} "
                 f"tools={tool_names}"
             )
+            turn_usage = self._agent_turn_usage(agent_result)
+            prior_turns = self._prior_usage_turns(final_state, node.id)
+            turns = prior_turns + ([{"round": next_round, "kind": "tool_request", **turn_usage}] if turn_usage else [])
+            awaiting_extra: dict[str, Any] = {"turnUsage": turn_usage} if turn_usage else {}
             trace_entry = self._annotate_trace(
                 {
+                    **awaiting_extra,
                     "nodeId": node.id,
                     "nodeName": node_label,
                     "handler": handler,
@@ -1441,6 +1492,7 @@ class WorkflowEngine:
                 "final_state": {
                     "last_agent_id": node.id,
                     "tool_rounds": {node.id: next_round},
+                    **self._usage_state(node.id, turns),
                 },
                 "trace": [trace_entry],
             }
@@ -1469,6 +1521,17 @@ class WorkflowEngine:
                 }
             )
 
+        # P4-7: the node's tokenUsage is the sum over every turn (tool-requesting turns included).
+        final_turn = normalize_token_usage((result.data or {}).get("tokenUsage"))
+        turns = self._prior_usage_turns(final_state, node.id) + (
+            [{"round": current_round + 1, "kind": "final", **final_turn}] if final_turn else []
+        )
+        node_total = sum_token_usage(turns)
+        if node_total:
+            result = NodeResult(
+                **{**result.model_dump(), "data": {**(result.data or {}), "tokenUsage": node_total, "usageTurns": turns}}
+            )
+
         trace_entry = self._annotate_trace(
             {
                 "nodeId": result.node_id,
@@ -1480,6 +1543,7 @@ class WorkflowEngine:
                 "startedAt": started_at,
                 "completedAt": datetime.now(timezone.utc).isoformat(),
                 "durationMs": result.duration_ms,
+                **({"turns": turns} if turns else {}),
             },
             result.data,
             final_state,
@@ -1515,6 +1579,7 @@ class WorkflowEngine:
         state_update: dict[str, Any] = {
             node.id: result.model_dump(),
             "last_agent_id": node.id,
+            **self._usage_state(node.id, turns),
         }
         if result.handler:
             state_update[result.handler] = result.model_dump()
@@ -1776,6 +1841,8 @@ class WorkflowEngine:
                             "startedAt": trace_entry.get("startedAt", ""),
                             "completedAt": trace_entry.get("completedAt", ""),
                             "durationMs": node_duration,
+                            **({"tokenUsage": trace_entry["tokenUsage"]} if trace_entry.get("tokenUsage") else {}),
+                            **({"turnUsage": trace_entry["turnUsage"]} if trace_entry.get("turnUsage") else {}),
                         },
                     )
                 if saw_interrupt:

@@ -20,6 +20,7 @@ from .context_assembly import (
     AGGREGATE_TOKEN_BUDGET,
     DEFAULT_TOKEN_BUDGET,
     assemble_model_context,
+    with_estimated_cost,
 )
 from .prompt_safety import USER_INPUT_TAG, fence
 from .critique import critique_recommendation_draft
@@ -125,11 +126,16 @@ def register_market_evidence(market_context: dict[str, Any]) -> tuple[dict[str, 
     return {**market_context, "evidenceId": evidence_id}, {evidence_id: entry}
 
 
-def _with_token_usage(result_data: dict[str, Any], response: LLMResponse) -> dict[str, Any]:
-    """Attach provider token usage without dropping existing result data keys."""
+def _with_token_usage(
+    result_data: dict[str, Any], response: LLMResponse, model: str | None = None, models_file: str | None = None
+) -> dict[str, Any]:
+    """Attach provider token usage without dropping existing result data keys.
+
+    P4-7: ``costUsd``/``costEstimated`` are added only when the model registry has prices for ``model``.
+    """
     data = dict(result_data or {})
     if response.token_usage is not None:
-        data["tokenUsage"] = response.token_usage
+        data["tokenUsage"] = with_estimated_cost(response.token_usage, model, get_model_registry(models_file or None))
     return data
 
 
@@ -465,7 +471,9 @@ class NodeExecutor:
                 *sources,
             ]
 
-        result_data = _with_token_usage(response.data or {}, response)
+        result_data = _with_token_usage(
+            response.data or {}, response, model or self._config.model, getattr(self._config, "models_file", "")
+        )
         if is_digest:
             # A digest never carries an actionable label into stream summaries / Java materialization.
             result_data.pop("recommendation", None)
@@ -867,13 +875,16 @@ class NodeExecutor:
             s if isinstance(s, dict) else {"title": str(s), "url": "", "type": "llm"}
             for s in response.sources
         ]
-        result_data = _with_token_usage(response.data or {}, response)
-        if tool_errors:
-            result_data["toolErrors"] = int(tool_errors)
         resolution = getattr(agent_result, "model_resolution", None)
         if isinstance(resolution, ModelResolution):
-            result_data["modelResolution"] = resolution.as_trace()
             model = model or resolution.effective
+        result_data = _with_token_usage(
+            response.data or {}, response, model or self._config.model, getattr(self._config, "models_file", "")
+        )
+        if tool_errors:
+            result_data["toolErrors"] = int(tool_errors)
+        if isinstance(resolution, ModelResolution):
+            result_data["modelResolution"] = resolution.as_trace()
         return NodeResult(
             ok=True,
             status="completed",

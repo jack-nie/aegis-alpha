@@ -75,6 +75,13 @@ class AgentToolResult:
             out.append(self.ai_message)
         return out
 
+    @property
+    def turn_usage(self) -> dict | None:
+        """P4-7: usage of this single LLM call, including turns that only request tools."""
+        if self.llm_response is not None and self.llm_response.token_usage is not None:
+            return self.llm_response.token_usage
+        return normalize_token_usage(getattr(self.ai_message, "usage_metadata", None))
+
 
 class SignalModel(BaseModel):
     name: str = Field(default="", description="Signal name")
@@ -375,6 +382,9 @@ class LLMClient:
                 msg_id = getattr(response, "id", None)
                 if msg_id is not None:
                     ai_kwargs["id"] = msg_id
+                # P4-7: keep the usage of a tool-requesting turn (it used to be dropped here).
+                if getattr(response, "usage_metadata", None):
+                    ai_kwargs["usage_metadata"] = response.usage_metadata
                 response = AIMessage(**ai_kwargs)
             return AgentToolResult(
                 response,
