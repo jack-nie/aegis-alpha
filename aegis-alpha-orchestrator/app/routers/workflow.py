@@ -2,13 +2,14 @@
 
 from contextlib import nullcontext
 from fastapi import APIRouter, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, ConfigDict
 from typing import Any
 
 from ..models.requests import WorkflowRequest, NodeRequest
 from ..models.responses import WorkflowResult, NodeResult
 from ..dependencies import workflow_engine, node_executor
+from ..core.run_registry import RunRegistryError
 from ..core.tools import use_authorization
 
 router = APIRouter(tags=["workflow"])
@@ -20,6 +21,34 @@ class ResumeRequest(BaseModel):
     owner: dict[str, Any] | None = None
 
     model_config = ConfigDict(populate_by_name=True)
+
+
+class CancelRunRequest(BaseModel):
+    thread_id: str = Field(..., alias="threadId")
+    owner: dict[str, Any] | None = None
+    reason: str | None = None
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+_CANCEL_STATUS = {"NOT_ACTIVE": 404, "OWNER_MISMATCH": 403}
+
+
+@router.post("/cancel-run")
+async def cancel_run(body: CancelRunRequest):
+    """P4-3: stop an active run on this orchestrator (service token + owner check).
+
+    Java owns the run status (CAS to CANCELLED); this only stops the graph. ``NOT_ACTIVE`` means the
+    run already finished here (or runs on another replica, see P4-16) and is not an error for Java.
+    """
+    try:
+        result = workflow_engine.cancel_run(body.thread_id, body.owner, (body.reason or "cancelled")[:64])
+    except RunRegistryError as exc:
+        return JSONResponse(
+            status_code=_CANCEL_STATUS.get(exc.code, 400),
+            content={"ok": False, "code": exc.code, "error": exc.message},
+        )
+    return {"ok": True, **result}
 
 
 def _authorization_context(delegated_token: str | None):

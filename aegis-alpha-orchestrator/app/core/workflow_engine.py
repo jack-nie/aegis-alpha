@@ -49,6 +49,7 @@ from .message_queue import (
     to_human_messages,
 )
 from .node_executor import NodeExecutor
+from .run_registry import RunCancelled, RunHandle, RunRegistry, await_or_cancel
 from .tool_pipeline import (
     ToolPolicy,
     build_tool_node,
@@ -416,8 +417,11 @@ class WorkflowEngine:
         guardrails: "GraphGuardrails | None" = None,
         message_queues: MessageQueueRegistry | None = None,
         tool_policy: ToolPolicy | None = None,
+        run_registry: RunRegistry | None = None,
     ):
         self._node_executor = node_executor
+        # P4-3: active runs, cancellable through POST /cancel-run.
+        self._runs = run_registry or RunRegistry()
         # P4-1: validate / classify / truncate / fence every tool call.
         self._tool_policy = tool_policy or ToolPolicy.from_settings(getattr(node_executor, "_config", None))
         # Per-thread steering / follow-up queues (pi dual-loop semantics).
@@ -445,6 +449,14 @@ class WorkflowEngine:
     @property
     def message_queues(self) -> MessageQueueRegistry:
         return self._message_queues
+
+    @property
+    def runs(self) -> RunRegistry:
+        return self._runs
+
+    def cancel_run(self, thread_id: str, owner: Any, reason: str = "cancelled") -> dict[str, Any]:
+        """P4-3: stop the graph of an active run (owner-checked). Raises RunRegistryError."""
+        return self._runs.cancel(thread_id, owner, reason)
 
     # ── message queue (steering / follow-up) ─────────────────────────────
     def _open_message_queue(self, thread_id: str, owner: Any) -> ThreadMessageQueue | None:
@@ -708,13 +720,20 @@ class WorkflowEngine:
             "recursion_limit": self._guardrails.recursion_limit,
         }
 
-    async def _ainvoke_guarded(self, graph: Any, graph_input: Any, config: dict[str, Any]) -> Any:
-        """``ainvoke`` bounded by the configured whole-run timeout, with a run-scoped quote cache."""
+    async def _ainvoke_guarded(
+        self, graph: Any, graph_input: Any, config: dict[str, Any], run: RunHandle | None = None
+    ) -> Any:
+        """``ainvoke`` bounded by the configured whole-run timeout, with a run-scoped quote cache.
+
+        P4-3: a registry cancel raises :class:`RunCancelled` (not a timeout); cancellation of the
+        calling task (client gone) still propagates as ``CancelledError``.
+        """
         try:
             with run_scoped_market_cache():
-                return await asyncio.wait_for(
+                return await await_or_cancel(
                     graph.ainvoke(graph_input, config=config, **self._graph_run_kwargs()),
-                    timeout=self._guardrails.timeout_seconds,
+                    run,
+                    self._guardrails.timeout_seconds,
                 )
         except asyncio.TimeoutError:
             raise WorkflowTimeout(self._guardrails.timeout_seconds) from None
@@ -1554,10 +1573,11 @@ class WorkflowEngine:
             nodes, edges, require_approval, thread_id, owner=owner, state=state
         )
         initial_state = self._initial_state(state, subject, require_approval)
+        run = self._runs.open(tid, owner if owner is not None else _owner_from_state(state))
 
         outcome = "aborted"
         try:
-            final_state = await self._ainvoke_guarded(graph, initial_state, config)
+            final_state = await self._ainvoke_guarded(graph, initial_state, config, run)
             node_ids = [n.id for n in nodes]
             logger.info(f"[THINKING] Workflow execution completed: subject_len={text_len(subject)} nodes={node_ids} ok=True")
             outcome = "paused" if _graph_output_interrupted(final_state) else "completed"
@@ -1580,12 +1600,20 @@ class WorkflowEngine:
             outcome = "timeout"
             self._finish_message_queue(queue, outcome)
             return self._attach_queue_summary(WorkflowResult(ok=False, error=str(e), final_state=state), queue)
+        except RunCancelled as e:
+            logger.info("[THINKING] Workflow execution cancelled: thread_id=%s", tid)
+            outcome = "cancelled"
+            self._finish_message_queue(queue, outcome)
+            return self._attach_queue_summary(
+                WorkflowResult(ok=False, error=str(e), final_state={**(state or {}), "cancelled": True}), queue
+            )
         except Exception as e:
             logger.error(f"[THINKING] Workflow execution failed: subject_len={text_len(subject)} error={e}")
             outcome = "error"
             self._finish_message_queue(queue, outcome)
             return self._attach_queue_summary(WorkflowResult(ok=False, error=str(e), final_state=state), queue)
         finally:
+            self._runs.close(run)
             if outcome == "aborted":  # cancelled (client gone / server shutdown)
                 self._finish_message_queue(queue, outcome)
 
@@ -1601,6 +1629,7 @@ class WorkflowEngine:
         report_degraded: bool,
         label: str,
         queue: ThreadMessageQueue | None = None,
+        owner: Any = None,
     ) -> AsyncIterator[SSEEvent]:
         """Shared ``astream`` → SSE translation for both streaming endpoints (P2-12).
 
@@ -1622,6 +1651,7 @@ class WorkflowEngine:
         deadline = loop.time() + self._guardrails.timeout_seconds
         market_scope = run_scoped_market_cache()
         market_scope.__enter__()
+        run = self._runs.open(tid, owner)
         stream = _merge_queue_events(
             graph.astream(
                 graph_input,
@@ -1631,18 +1661,43 @@ class WorkflowEngine:
             ),
             queue,
         ).__aiter__()
+        # P4-3: the graph stream is consumed by one pump task (stable contextvars for LangGraph);
+        # this generator waits on its output, the run deadline and the cancel signal together.
+        pumped: asyncio.Queue = asyncio.Queue()
+
+        async def _pump() -> None:
+            try:
+                async for item in stream:
+                    await pumped.put(("item", item))
+                await pumped.put(("done", None))
+            except asyncio.CancelledError:
+                raise
+            except BaseException as exc:  # noqa: BLE001 - re-raised by the consumer below
+                await pumped.put(("error", exc))
+
+        pump_task = asyncio.ensure_future(_pump())
+        cancel_waiter = asyncio.ensure_future(run.cancelled.wait())
         outcome = "aborted"
         try:
             while True:
                 remaining = deadline - loop.time()
                 if remaining <= 0:
                     raise WorkflowTimeout(self._guardrails.timeout_seconds)
-                try:
-                    kind, chunk = await asyncio.wait_for(stream.__anext__(), timeout=remaining)
-                except StopAsyncIteration:
+                getter = asyncio.ensure_future(pumped.get())
+                done, _ = await asyncio.wait(
+                    {getter, cancel_waiter}, timeout=remaining, return_when=asyncio.FIRST_COMPLETED
+                )
+                if getter not in done:
+                    getter.cancel()
+                    if run.is_cancelled:
+                        raise RunCancelled(tid, run.cancel_reason or "cancelled")
+                    raise WorkflowTimeout(self._guardrails.timeout_seconds)
+                tag, payload = getter.result()
+                if tag == "done":
                     break
-                except asyncio.TimeoutError:
-                    raise WorkflowTimeout(self._guardrails.timeout_seconds) from None
+                if tag == "error":
+                    raise payload
+                kind, chunk = payload
                 if kind == "queue":
                     yield self._queue_sse(chunk)
                     continue
@@ -1753,6 +1808,16 @@ class WorkflowEngine:
             if closed is not None:
                 yield closed
             yield SSEEvent(event="error", data={"ok": False, "error": str(e), "code": "WORKFLOW_TIMEOUT"})
+        except RunCancelled as e:
+            logger.info("[THINKING] Workflow %s cancelled: thread_id=%s", label, tid)
+            outcome = "cancelled"
+            closed = self._close_queue_event(queue, outcome)
+            if closed is not None:
+                yield closed
+            yield SSEEvent(
+                event="cancelled",
+                data={"ok": False, "threadId": tid, "reason": e.reason, "code": "WORKFLOW_CANCELLED"},
+            )
         except Exception as e:
             logger.error(f"[THINKING] Workflow {label} failed: thread_id={tid} error={e}")
             outcome = "error"
@@ -1761,6 +1826,14 @@ class WorkflowEngine:
                 yield closed
             yield SSEEvent(event="error", data={"ok": False, "error": str(e), "code": "WORKFLOW_ERROR"})
         finally:
+            self._runs.close(run)
+            cancel_waiter.cancel()
+            if not pump_task.done():
+                pump_task.cancel()
+            try:
+                await pump_task
+            except BaseException:  # noqa: BLE001 - graph run is being torn down
+                pass
             if outcome == "aborted":
                 # Client disconnected / generator closed: discard undelivered messages.
                 self._finish_message_queue(queue, outcome)
@@ -1801,6 +1874,7 @@ class WorkflowEngine:
                 report_degraded=True,
                 label="streaming",
                 queue=queue,
+                owner=owner if owner is not None else _owner_from_state(state),
             )
         ) as events:
             async for event in events:
@@ -1836,6 +1910,7 @@ class WorkflowEngine:
                 report_degraded=False,
                 label="token-stream",
                 queue=queue,
+                owner=owner if owner is not None else _owner_from_state(state),
             )
         ) as events:
             async for event in events:
@@ -1902,11 +1977,12 @@ class WorkflowEngine:
         # (never used as the approval decision itself).
         queue = self._open_run_queue(thread_id, owner, nodes)
         config = self._run_config(thread_id, queue)
+        run = self._runs.open(thread_id, owner)
 
         outcome = "aborted"
         try:
             from langgraph.types import Command as LgCommand
-            final_state = await self._ainvoke_guarded(graph, LgCommand(resume=resume_value), config)
+            final_state = await self._ainvoke_guarded(graph, LgCommand(resume=resume_value), config, run)
             outcome = "paused" if _graph_output_interrupted(final_state) else "completed"
             self._finish_message_queue(queue, outcome)
             result = self._attach_queue_summary(self._result_from_graph_output(final_state), queue)
@@ -1925,12 +2001,18 @@ class WorkflowEngine:
             outcome = "timeout"
             self._finish_message_queue(queue, outcome)
             return WorkflowResult(ok=False, error=str(e), final_state={})
+        except RunCancelled as e:
+            logger.info("[THINKING] Workflow resume cancelled: thread_id=%s", thread_id)
+            outcome = "cancelled"
+            self._finish_message_queue(queue, outcome)
+            return WorkflowResult(ok=False, error=str(e), final_state={"cancelled": True})
         except Exception as e:
             logger.error(f"[THINKING] Workflow resume failed: thread_id={thread_id} error={e}")
             outcome = "error"
             self._finish_message_queue(queue, outcome)
             return WorkflowResult(ok=False, error=str(e), final_state={})
         finally:
+            self._runs.close(run)
             if outcome == "aborted":
                 self._finish_message_queue(queue, outcome)
 
