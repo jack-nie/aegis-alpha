@@ -3,8 +3,16 @@
 FROM python:3.11-slim
 WORKDIR /app
 
+# Package index is configurable at build time. Defaults to the official PyPI so the
+# image builds anywhere; docker-compose.aegis-alpha.yml passes a China mirror by default.
+# pip reads these build ARGs directly as PIP_* environment variables during RUN.
+ARG PIP_INDEX_URL=https://pypi.org/simple
+ARG PIP_DEFAULT_TIMEOUT=60
+ARG PIP_RETRIES=5
+
+# Dependency layer first: only re-runs when requirements.txt or the ARGs above change.
 COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --disable-pip-version-check -r requirements.txt
 
 COPY app/ ./app/
 
