@@ -3,8 +3,26 @@
 FROM maven:3.9-eclipse-temurin-17 AS build
 WORKDIR /workspace
 
+# Maven mirror is configurable at build time. Empty (default) = Maven Central, so the
+# image builds anywhere; docker-compose.aegis-alpha.yml passes the Aliyun mirror by default.
+ARG MAVEN_MIRROR_URL=
+RUN if [ -n "$MAVEN_MIRROR_URL" ]; then \
+      mkdir -p /root/.m2 \
+      && printf '%s\n' \
+        '<settings xmlns="http://maven.apache.org/SETTINGS/1.0.0">' \
+        '  <mirrors>' \
+        '    <mirror>' \
+        '      <id>build-mirror</id>' \
+        '      <mirrorOf>central</mirrorOf>' \
+        "      <url>${MAVEN_MIRROR_URL}</url>" \
+        '    </mirror>' \
+        '  </mirrors>' \
+        '</settings>' > /root/.m2/settings.xml; \
+    fi
+
+# Dependency layer first: only re-runs when pom.xml (or the mirror ARG) changes.
 COPY pom.xml .
-RUN mvn -B -ntp dependency:go-offline
+RUN mvn -B -ntp -Dmaven.wagon.http.retryHandler.count=5 dependency:go-offline
 
 COPY src ./src
 RUN mvn -B -ntp -DskipTests package

@@ -2,13 +2,20 @@
 
 FROM node:22-alpine AS deps
 WORKDIR /app
+# npm registry is configurable at build time. Defaults to the official registry so the
+# image builds anywhere; docker-compose.aegis-alpha.yml passes npmmirror by default.
+# (npm rewrites registry.npmjs.org "resolved" URLs in package-lock.json to this registry.)
+ARG NPM_REGISTRY=https://registry.npmjs.org/
+# Dependency layer first: only re-runs when package*.json (or the registry ARG) changes.
 COPY package.json package-lock.json ./
-RUN npm ci
+RUN npm ci --registry="$NPM_REGISTRY" --fetch-retries=5 --fetch-retry-mintimeout=20000 \
+      --fetch-retry-maxtimeout=120000 --no-audit --no-fund
 
 FROM node:22-alpine AS build
 WORKDIR /app
 ARG AEGIS_ALPHA_BACKEND_INTERNAL_URL=http://backend:5178
 ENV AEGIS_ALPHA_BACKEND_INTERNAL_URL=${AEGIS_ALPHA_BACKEND_INTERNAL_URL}
+ENV NEXT_TELEMETRY_DISABLED=1
 
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .

@@ -1,0 +1,7 @@
+# Keep the build context small and the `COPY . .` layer deterministic.
+node_modules
+.next
+npm-debug.log*
+.env*
+Dockerfile
+.dockerignore
