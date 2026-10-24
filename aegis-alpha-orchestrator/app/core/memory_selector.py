@@ -15,6 +15,16 @@ _SEARCH_LIMIT = 100
 _ITEM_DICT_KEYS = {"namespace", "key", "value", "created_at"}
 
 
+def ticker_namespace(symbol: str) -> tuple[str, str]:
+    """Build a store namespace for a ticker.
+
+    LangGraph store labels cannot contain periods, so exchange-qualified
+    tickers such as ``600183.SH`` become ``600183_SH``.
+    """
+    label = str(symbol or "").strip().replace(".", "_").replace("/", "_")
+    return ("ticker", label)
+
+
 def _is_reserved_key(key: str) -> bool:
     return (not key) or key.startswith("_") or key in _META_KEYS
 
@@ -141,7 +151,7 @@ async def load_run_memory(store, *, user_id: str | None, symbol: str | None) -> 
             })
 
     if symbol:
-        conclusion = await read_store_value(backend, ("ticker", symbol), _APPROVED_CONCLUSION_KEY)
+        conclusion = await read_store_value(backend, ticker_namespace(symbol), _APPROVED_CONCLUSION_KEY)
         if conclusion is not None:
             snippets.append({
                 "kind": "approved_conclusion",

@@ -43,6 +43,20 @@ async def test_ticker_insight(memory_mgr):
     assert result["summary"] == "Bullish"
 
 
+def test_ticker_namespace_replaces_periods():
+    from app.core.memory_selector import ticker_namespace
+
+    assert ticker_namespace("600183.SH") == ("ticker", "600183_SH")
+    assert ticker_namespace(" AAPL ") == ("ticker", "AAPL")
+
+
+@pytest.mark.asyncio
+async def test_ticker_insight_with_exchange_suffix(memory_mgr):
+    await memory_mgr.store_ticker_insight("600183.SH", "analysis", {"summary": "Bullish"})
+    result = await memory_mgr.get_ticker_insight("600183.SH", "analysis")
+    assert result["summary"] == "Bullish"
+
+
 @pytest.mark.asyncio
 async def test_workflow_pattern(memory_mgr):
     await memory_mgr.store_workflow_pattern("stock-analysis", "default_params", {"ticker": "AAPL"})

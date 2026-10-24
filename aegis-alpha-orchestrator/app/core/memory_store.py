@@ -6,7 +6,7 @@ import logging
 from typing import Any
 
 from ..config import Settings
-from .memory_selector import read_store_value
+from .memory_selector import read_store_value, ticker_namespace
 from .persistent_store import PersistentStore  # noqa: E402
 
 logger = logging.getLogger(__name__)
@@ -72,14 +72,14 @@ class MemoryStoreManager:
         return result.get("value") if result else None
 
     async def store_ticker_insight(self, symbol: str, insight_key: str, value: dict[str, Any]) -> None:
-        await self.put(("ticker", symbol), insight_key, value, ttl_seconds=TICKER_INSIGHT_TTL)
+        await self.put(ticker_namespace(symbol), insight_key, value, ttl_seconds=TICKER_INSIGHT_TTL)
 
     async def get_ticker_insight(self, symbol: str, insight_key: str) -> dict[str, Any] | None:
-        return await self.get(("ticker", symbol), insight_key)
+        return await self.get(ticker_namespace(symbol), insight_key)
 
     async def store_approved_conclusion(self, symbol: str, conclusion: dict[str, Any]) -> None:
         """Persist an approved conclusion. ttl 0 means no expiry (not the 30-minute insight TTL)."""
-        await self.put(("ticker", symbol), "approved_conclusion", conclusion, ttl_seconds=0)
+        await self.put(ticker_namespace(symbol), "approved_conclusion", conclusion, ttl_seconds=0)
 
     async def store_workflow_pattern(self, workflow_key: str, pattern_key: str, value: dict[str, Any]) -> None:
         await self.put(("workflow", workflow_key), pattern_key, value, ttl_seconds=WORKFLOW_PATTERN_TTL)

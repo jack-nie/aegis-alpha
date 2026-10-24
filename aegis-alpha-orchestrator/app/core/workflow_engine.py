@@ -28,7 +28,7 @@ from ..models.workflow import Node, Edge, TraceEntry
 from ..models.responses import NodeResult, WorkflowResult, SSEEvent
 from .checkpointer_lifecycle import ensure_async_checkpointer
 from .context_assembly import apply_trace_usage, memory_hit_count
-from .memory_selector import load_run_memory, read_store_value
+from .memory_selector import load_run_memory, read_store_value, ticker_namespace
 from .memory_store import MemoryStoreManager
 from .node_executor import NodeExecutor
 from .tool_registry import TOOL_SPECS, resolve_agent_roles, tools_for_roles
@@ -681,7 +681,7 @@ class WorkflowEngine:
                     ticker = exec_state.get("ticker", "") or exec_state.get("symbol", "")
                     cache_key = self._node_result_cache_key(node, handler)
                     if ticker:
-                        cached_data = await read_store_value(store, ("ticker", ticker), cache_key)
+                        cached_data = await read_store_value(store, ticker_namespace(ticker), cache_key)
                         result = self._node_result_from_cache(cached_data)
                         if result is not None:
                             logger.info(f"[THINKING] Cache hit for ticker={ticker} handler={handler}, skipping LLM")
@@ -777,7 +777,7 @@ class WorkflowEngine:
                     cache_key = self._node_result_cache_key(node, handler)
                     if ticker and result.ok:
                         await store.aput(
-                            ("ticker", ticker), cache_key,
+                            ticker_namespace(ticker), cache_key,
                             result.model_dump(),
                             ttl_seconds=1800,
                         )
@@ -923,7 +923,7 @@ class WorkflowEngine:
                 cache_key = self._node_result_cache_key(node, handler)
                 if ticker and result.ok:
                     await store.aput(
-                        ("ticker", ticker),
+                        ticker_namespace(ticker),
                         cache_key,
                         result.model_dump(),
                         ttl_seconds=1800,
