@@ -12,6 +12,7 @@ from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 
 from ..config import Settings
+from .agent_context import ContextPolicy, compact, is_context_overflow, transform_context
 from .context_assembly import normalize_token_usage
 from .message_queue import is_queued_human_message
 from .model_registry import ModelResolution, get_model_registry
@@ -62,6 +63,8 @@ class AgentToolResult:
         self.has_tool_calls = has_tool_calls
         self.llm_response = llm_response
         self.seed_human = seed_human
+        # P4-8: what transform_context did to the prior messages for this call (trace only).
+        self.context_stats: dict[str, Any] | None = None
         # P4-6: set by the node executor (requested vs effective model) for the trace.
         self.model_resolution: Any = None
 
@@ -325,11 +328,24 @@ class LLMClient:
             seed_human = HumanMessage(content=user_content)
             chat.append(seed_human)
 
+        # P4-8: transformContext — elide old tool results / compact over budget (graph state untouched).
+        policy = self._context_policy(resolved_model)
+        head = chat[:-len(prior)] if prior else chat
+        context_stats: dict[str, Any] | None = None
+        if prior:
+            sent_prior, context_stats = transform_context(prior, policy)
+            chat = head + sent_prior
         try:
             response = await client.ainvoke(chat)
         except Exception as e:
-            logger.error(f"Agent tool-loop invocation failed: {e}")
-            raise
+            if not (prior and is_context_overflow(e)):
+                logger.error(f"Agent tool-loop invocation failed: {e}")
+                raise
+            # Overflow: compact once and retry once; a second overflow propagates.
+            logger.warning("Agent context overflow; compacting once and retrying: %s", type(e).__name__)
+            chat = head + compact(prior, policy)
+            context_stats = {**(context_stats or {}), "compacted": True, "overflowRetry": True}
+            response = await client.ainvoke(chat)
 
         # Ensure we always work with an AIMessage-like object for ToolNode routing.
         if not isinstance(response, AIMessage):
@@ -369,7 +385,7 @@ class LLMClient:
                 additional_kwargs={TRUNCATED_TOOL_CALLS_FLAG: True},
             )
             logger.warning("Agent tool calls truncated by finish_reason=length; %d call(s) refused", len(merged))
-            return AgentToolResult(response, has_tool_calls=True, seed_human=seed_human)
+            return self._with_context_stats(context_stats, AgentToolResult(response, has_tool_calls=True, seed_human=seed_human))
 
         if tool_calls and not force_final:
             # Normalize tool_calls onto the message for route_to_tools / ToolNode.
@@ -386,11 +402,11 @@ class LLMClient:
                 if getattr(response, "usage_metadata", None):
                     ai_kwargs["usage_metadata"] = response.usage_metadata
                 response = AIMessage(**ai_kwargs)
-            return AgentToolResult(
+            return self._with_context_stats(context_stats, AgentToolResult(
                 response,
                 has_tool_calls=True,
                 seed_human=seed_human,
-            )
+            ))
 
         content = response.content if hasattr(response, "content") else str(response)
         if isinstance(content, list):
@@ -406,12 +422,21 @@ class LLMClient:
             content = "\n".join(parts)
         usage = getattr(response, "usage_metadata", None)
         llm_response = self._normalize_content(str(content or ""), usage)
-        return AgentToolResult(
+        return self._with_context_stats(context_stats, AgentToolResult(
             response,
             has_tool_calls=False,
             llm_response=llm_response,
             seed_human=seed_human,
-        )
+        ))
+
+    @staticmethod
+    def _with_context_stats(stats: dict[str, Any] | None, result: AgentToolResult) -> AgentToolResult:
+        result.context_stats = stats
+        return result
+
+    def _context_policy(self, model: str) -> ContextPolicy:
+        spec = get_model_registry(getattr(self._config, "models_file", "") or None).get(model)
+        return ContextPolicy.from_settings(self._config, getattr(spec, "context_window", None))
 
     async def classify_intent(
         self, message: str, tools: list[dict[str, Any]]

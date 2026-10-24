@@ -72,6 +72,24 @@ logger = logging.getLogger(__name__)
 _GRAPH_CACHE_MAX = 100
 # Max agent→tools→agent iterations per specialist node (avoids infinite tool loops).
 MAX_TOOL_ROUNDS = 3
+# P4-8: node-level data.maxToolRounds bounds (Java WorkflowValidationService rejects values outside).
+MIN_NODE_TOOL_ROUNDS = 1
+MAX_NODE_TOOL_ROUNDS = 8
+
+
+def max_tool_rounds_for(node: Node) -> int:
+    """``data.maxToolRounds`` clamped to 1–8; default ``MAX_TOOL_ROUNDS``."""
+    data = node.data
+    raw = None
+    if data is not None:
+        raw = getattr(data, "maxToolRounds", None)
+        if raw is None and getattr(data, "model_extra", None):
+            raw = data.model_extra.get("maxToolRounds") or data.model_extra.get("max_tool_rounds")
+    try:
+        value = int(raw) if raw is not None and not isinstance(raw, bool) else MAX_TOOL_ROUNDS
+    except (TypeError, ValueError):
+        value = MAX_TOOL_ROUNDS
+    return max(MIN_NODE_TOOL_ROUNDS, min(MAX_NODE_TOOL_ROUNDS, value))
 
 
 def _is_tools_node_name(name: str) -> bool:
@@ -1439,7 +1457,8 @@ class WorkflowEngine:
         if not isinstance(tool_rounds, dict):
             tool_rounds = {}
         current_round = int(tool_rounds.get(node.id, 0) or 0)
-        force_final = current_round >= MAX_TOOL_ROUNDS
+        max_rounds = max_tool_rounds_for(node)
+        force_final = current_round >= max_rounds
 
         agent_result = await self._node_executor.invoke_agent_with_tools(
             node=node,
@@ -1460,13 +1479,15 @@ class WorkflowEngine:
                 else:
                     tool_names.append(str(getattr(tc, "name", "") or ""))
             logger.info(
-                f"[THINKING] Agent requesting tools: id={node.id} round={next_round}/{MAX_TOOL_ROUNDS} "
+                f"[THINKING] Agent requesting tools: id={node.id} round={next_round}/{max_rounds} "
                 f"tools={tool_names}"
             )
             turn_usage = self._agent_turn_usage(agent_result)
             prior_turns = self._prior_usage_turns(final_state, node.id)
             turns = prior_turns + ([{"round": next_round, "kind": "tool_request", **turn_usage}] if turn_usage else [])
             awaiting_extra: dict[str, Any] = {"turnUsage": turn_usage} if turn_usage else {}
+            if getattr(agent_result, "context_stats", None):
+                awaiting_extra["contextStats"] = agent_result.context_stats  # P4-8
             trace_entry = self._annotate_trace(
                 {
                     **awaiting_extra,
@@ -1512,7 +1533,7 @@ class WorkflowEngine:
                     **result.model_dump(),
                     "degraded": True,
                     "summary": result.summary
-                    or f"Tool-call limit ({MAX_TOOL_ROUNDS}) reached for {node.id}",
+                    or f"Tool-call limit ({max_rounds}) reached for {node.id}",
                     "data": {
                         **(result.data or {}),
                         "tool_round_capped": True,
@@ -1544,6 +1565,7 @@ class WorkflowEngine:
                 "completedAt": datetime.now(timezone.utc).isoformat(),
                 "durationMs": result.duration_ms,
                 **({"turns": turns} if turns else {}),
+                **({"contextStats": agent_result.context_stats} if getattr(agent_result, "context_stats", None) else {}),
             },
             result.data,
             final_state,

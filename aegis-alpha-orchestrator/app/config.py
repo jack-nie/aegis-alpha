@@ -73,6 +73,11 @@ class Settings(BaseSettings):
     tool_result_max_chars: int = Field(default=6000, alias="AEGIS_ALPHA_TOOL_RESULT_MAX_CHARS")
     tool_result_max_items: int = Field(default=20, alias="AEGIS_ALPHA_TOOL_RESULT_MAX_ITEMS")
 
+    # P4-8 agent-loop context transform (待确认): verbatim recent tool results and the per-call budget
+    # (capped at 60% of the registry contextWindow when one is configured).
+    agent_keep_recent_tool_results: int = Field(default=4, alias="AEGIS_ALPHA_AGENT_KEEP_RECENT_TOOL_RESULTS")
+    agent_max_context_tokens: int = Field(default=12000, alias="AEGIS_ALPHA_AGENT_MAX_CONTEXT_TOKENS")
+
     # Market Data
     market_data_timeout_ms: int = Field(default=8000, alias="AEGIS_ALPHA_MARKET_DATA_TIMEOUT_MS")
 
