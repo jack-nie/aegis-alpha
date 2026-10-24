@@ -12,7 +12,6 @@ import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -98,94 +97,18 @@ public class PlaybookService {
         if (raw == null || raw.trim().isEmpty()) {
             return null;
         }
-        String content = raw.replace("\r\n", "\n");
-        Map<String, String> front = new LinkedHashMap<String, String>();
-        String body = content;
-        if (content.startsWith("---\n")) {
-            int end = content.indexOf("\n---\n", 4);
-            if (end > 0) {
-                String yaml = content.substring(4, end);
-                body = content.substring(end + 5);
-                parseFrontMatter(yaml, front);
-            }
-        }
+        FrontMatter front = FrontMatter.parse(raw, filename);
         Playbook playbook = new Playbook();
-        String id = front.get("id");
-        if (id == null || id.isEmpty()) {
+        String id = front.string("id");
+        if (id == null) {
             id = filename == null ? null : filename.replace(".md", "");
         }
         playbook.setId(id);
-        playbook.setTitle(front.getOrDefault("title", id == null ? "Playbook" : id));
-        playbook.setDeepLink(front.get("deepLink"));
-        playbook.setKeywords(parseKeywords(front.get("keywords")));
-        playbook.setBodyMarkdown(body.trim());
+        playbook.setTitle(front.string("title", id == null ? "Playbook" : id));
+        playbook.setDeepLink(front.string("deepLink"));
+        playbook.setKeywords(front.list("keywords"));
+        playbook.setBodyMarkdown(front.body().trim());
         return playbook;
-    }
-
-    private static void parseFrontMatter(String yaml, Map<String, String> out) {
-        String currentKey = null;
-        StringBuilder listBuf = null;
-        for (String line : yaml.split("\n")) {
-            String trimmed = line.trim();
-            if (trimmed.isEmpty() || trimmed.startsWith("#")) {
-                continue;
-            }
-            if (trimmed.startsWith("- ") && currentKey != null) {
-                String item = trimmed.substring(2).trim();
-                if (listBuf == null) {
-                    listBuf = new StringBuilder();
-                } else if (listBuf.length() > 0) {
-                    listBuf.append(",");
-                }
-                listBuf.append(item);
-                continue;
-            }
-            if (listBuf != null && currentKey != null) {
-                out.put(currentKey, listBuf.toString());
-                listBuf = null;
-            }
-            int colon = trimmed.indexOf(':');
-            if (colon <= 0) {
-                continue;
-            }
-            currentKey = trimmed.substring(0, colon).trim();
-            String value = trimmed.substring(colon + 1).trim();
-            if (value.isEmpty()) {
-                listBuf = new StringBuilder();
-            } else {
-                if ((value.startsWith("\"") && value.endsWith("\""))
-                        || (value.startsWith("'") && value.endsWith("'"))) {
-                    value = value.substring(1, value.length() - 1);
-                }
-                out.put(currentKey, value);
-                currentKey = null;
-            }
-        }
-        if (listBuf != null && currentKey != null) {
-            out.put(currentKey, listBuf.toString());
-        }
-    }
-
-    private static List<String> parseKeywords(String raw) {
-        List<String> list = new ArrayList<String>();
-        if (raw == null || raw.trim().isEmpty()) {
-            return list;
-        }
-        String cleaned = raw.trim();
-        if (cleaned.startsWith("[") && cleaned.endsWith("]")) {
-            cleaned = cleaned.substring(1, cleaned.length() - 1);
-        }
-        for (String part : cleaned.split(",")) {
-            String item = part.trim();
-            if ((item.startsWith("\"") && item.endsWith("\""))
-                    || (item.startsWith("'") && item.endsWith("'"))) {
-                item = item.substring(1, item.length() - 1);
-            }
-            if (!item.isEmpty()) {
-                list.add(item);
-            }
-        }
-        return list;
     }
 
     private static String readResource(Resource resource) throws Exception {
