@@ -89,8 +89,13 @@ class Settings(BaseSettings):
     workflow_recursion_limit: int = Field(default=100, alias="AEGIS_ALPHA_WORKFLOW_RECURSION_LIMIT")
     workflow_timeout_seconds: float = Field(default=900.0, alias="AEGIS_ALPHA_WORKFLOW_TIMEOUT_SECONDS")
     workflow_thread_meta_max: int = Field(default=1000, alias="AEGIS_ALPHA_WORKFLOW_THREAD_META_MAX")
-    # 待确认: default keeps checkpoints of finished runs (debuggability); set true to delete them.
-    workflow_cleanup_checkpoints: bool = Field(default=False, alias="AEGIS_ALPHA_WORKFLOW_CLEANUP_CHECKPOINTS")
+    # Decision D5: delete checkpoints of runs in a terminal state (completed incl. approved/rejected,
+    # cancelled, failed = error/timeout). Never for paused (HUMAN_INTERRUPT) or running runs, nor for a
+    # failed/cancelled resume (Java returns it to HUMAN_INTERRUPT for a retry). Debugging: set false.
+    workflow_cleanup_checkpoints: bool = Field(default=True, alias="AEGIS_ALPHA_WORKFLOW_CLEANUP_CHECKPOINTS")
+    workflow_cleanup_outcomes: str = Field(
+        default="completed,cancelled,failed", alias="AEGIS_ALPHA_WORKFLOW_CLEANUP_OUTCOMES"
+    )
     # Agent-loop message queue (steering / follow-up, modeled on pi-mono's dual loop).
     # Defaults are 待确认 (pending product confirmation); see 消息排队实现说明.md.
     # P4-16: backend selection (docs/多副本设计.md). Only sqlite/memory and memory are installed;
