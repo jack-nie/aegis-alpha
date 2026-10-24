@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from langgraph.checkpoint.memory import MemorySaver
 
-from app.core.memory_selector import load_run_memory, read_store_value
+from app.core.memory_selector import load_run_memory, read_store_value, ticker_namespace
 from app.core.persistent_store import PersistentStore
 from app.core.workflow_engine import WorkflowEngine
 from app.models.responses import NodeResult
@@ -63,10 +63,10 @@ def _clear_cache():
     WorkflowEngine._graph_cache.clear()
 
 
-async def _run(store, aggregate_data, approved: bool, thread: str, *, ok: bool = True):
+async def _run(store, aggregate_data, approved: bool, thread: str, *, ok: bool = True, ticker: str = "AAPL"):
     engine = WorkflowEngine(_executor(aggregate_data, ok=ok), store=store, checkpointer=MemorySaver())
     nodes, edges = _layout()
-    paused = await engine.execute_workflow(nodes, edges, {"ticker": "AAPL"}, "AAPL",
+    paused = await engine.execute_workflow(nodes, edges, {"ticker": ticker}, ticker,
                                            require_approval=True, thread_id=thread)
     assert paused.final_state.get("interrupted") is True
     return await engine.resume_workflow(thread, {"approved": approved})
@@ -82,6 +82,17 @@ async def test_approval_writes_policy_checked_conclusion(store):
     assert stored["threadId"] == "t-ok"
     assert stored["summary"].startswith("[HOLD]")
     memory = await load_run_memory(store, user_id=None, symbol="AAPL")
+    assert any(s["kind"] == "approved_conclusion" for s in memory["snippets"])
+
+
+@pytest.mark.asyncio
+async def test_approved_conclusion_uses_sanitized_ticker_namespace(store):
+    """Exchange-suffixed tickers (600183.SH) must be written where load_run_memory reads them."""
+    result = await _run(store, GOOD, True, "t-sh", ticker="600183.SH")
+    assert result.ok, result.error
+    stored = await read_store_value(store, ticker_namespace("600183.SH"), "approved_conclusion")
+    assert stored is not None and stored["recommendation"] == "HOLD"
+    memory = await load_run_memory(store, user_id=None, symbol="600183.SH")
     assert any(s["kind"] == "approved_conclusion" for s in memory["snippets"])
 
 

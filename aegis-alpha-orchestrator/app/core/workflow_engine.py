@@ -427,9 +427,9 @@ class WorkflowEngine:
         symbol, payload = entry
         try:
             # ttl 0 = no expiry for approved conclusions (same as MemoryStoreManager).
-            await self._store.aput(("ticker", symbol), APPROVED_CONCLUSION_KEY, payload, ttl_seconds=0)
+            await self._store.aput(ticker_namespace(symbol), APPROVED_CONCLUSION_KEY, payload, ttl_seconds=0)
         except TypeError:
-            await self._store.aput(("ticker", symbol), APPROVED_CONCLUSION_KEY, payload)
+            await self._store.aput(ticker_namespace(symbol), APPROVED_CONCLUSION_KEY, payload)
         except Exception as exc:  # noqa: BLE001
             logger.warning("[THINKING] approved_conclusion write failed thread_id=%s error=%s",
                            thread_id, type(exc).__name__)
