@@ -25,6 +25,8 @@ import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyBoolean;
+import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
@@ -65,6 +67,7 @@ class WorkflowRunMessageQueueEndpointTest {
         controller = new WorkflowController(authService, service, mock(WorkflowNodeExecutionService.class),
                 mock(TokenService.class), Runnable::run);
         when(mapper.findRun("run-a")).thenAnswer(inv -> run("run-a", "RUNNING", "ACTIVE"));
+        when(mapper.updateRunStatusIf(any(WorkflowRun.class), anyList(), anyBoolean())).thenReturn(1);
         when(mapper.findRun("run-done")).thenAnswer(inv -> run("run-done", "COMPLETED", "COMPLETED"));
         when(mapper.findRun("run-cancel")).thenAnswer(inv -> run("run-cancel", "RUNNING", "CANCEL_REQUESTED"));
     }

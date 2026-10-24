@@ -59,6 +59,7 @@ class WorkflowServiceDigestOutcomeTest {
         }
         doAnswer(inv -> { storedRun.set(copy(inv.getArgument(0))); return null; }).when(mapper).insertRun(any(WorkflowRun.class));
         doAnswer(inv -> { storedRun.set(copy(inv.getArgument(0))); return null; }).when(mapper).updateRun(any(WorkflowRun.class));
+        CasMapperStubs.casOn(mapper, storedRun, this::copy);
         when(mapper.findRun(anyString())).thenAnswer(inv -> storedRun.get() == null ? null : copy(storedRun.get()));
     }
 

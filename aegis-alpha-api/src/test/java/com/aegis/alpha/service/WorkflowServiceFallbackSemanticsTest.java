@@ -52,6 +52,7 @@ class WorkflowServiceFallbackSemanticsTest {
                 new WorkflowValidationService(), tokenService, false);
         doAnswer(inv -> { storedRun.set(copy(inv.getArgument(0))); return null; }).when(mapper).insertRun(any(WorkflowRun.class));
         doAnswer(inv -> { storedRun.set(copy(inv.getArgument(0))); return null; }).when(mapper).updateRun(any(WorkflowRun.class));
+        CasMapperStubs.casOn(mapper, storedRun, this::copy);
         when(mapper.findRun(anyString())).thenAnswer(inv -> storedRun.get() == null ? null : copy(storedRun.get()));
         doAnswer(inv -> { events.add(inv.getArgument(0)); return null; }).when(mapper).insertRunEvent(any(WorkflowRunEvent.class));
         doAnswer(inv -> { nodeRuns.add(inv.getArgument(0)); return null; }).when(mapper).updateNodeRun(any(WorkflowNodeRun.class));

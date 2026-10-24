@@ -60,6 +60,7 @@ class WorkflowServiceEngineRoutingTest {
         when(mapper.findDefinition("daily")).thenReturn(definition);
         doAnswer(inv -> { storedRun.set(copy(inv.getArgument(0))); return null; }).when(mapper).insertRun(any(WorkflowRun.class));
         doAnswer(inv -> { storedRun.set(copy(inv.getArgument(0))); return null; }).when(mapper).updateRun(any(WorkflowRun.class));
+        CasMapperStubs.casOn(mapper, storedRun, WorkflowServiceEngineRoutingTest::copy);
         doAnswer(inv -> { nodeRuns.add(inv.getArgument(0)); return null; }).when(mapper).insertNodeRun(any(WorkflowNodeRun.class));
         when(mapper.findRun(anyString())).thenAnswer(inv -> storedRun.get() == null ? null : copy(storedRun.get()));
     }
@@ -145,6 +146,98 @@ class WorkflowServiceEngineRoutingTest {
         verify(gateway, never()).executeWorkflow(anyMap(), anyString(), anyMap(), nullable(String.class), anyString(), anyBoolean(), any());
         assertThat(run.getStatus()).isEqualTo("COMPLETED");
         assertThat(run.getResultJson()).contains("\"engine\":\"java-fallback\"");
+    }
+
+    /* ---------------- P4-4: cancellation reaches the orchestrator; terminal writes are CAS ---------------- */
+
+    @Test
+    void cancelOfRunningRunAsksOrchestratorToStopTheGraph() {
+        WorkflowRun running = runningRun("run-c");
+        storedRun.set(copy(running));
+        when(gateway.isEnabled()).thenReturn(true);
+
+        WorkflowRun after = service.cancelRun("run-c");
+
+        assertThat(after.getControlStatus()).isEqualTo("CANCEL_REQUESTED");
+        verify(gateway).cancelRun("run-c", "u-1", "t-1");
+        verify(gateway).clearRunMessageQueue("run-c", "u-1", "t-1");
+    }
+
+    @Test
+    void cancelLosingTheRaceToCompletionDoesNotRewriteTheRun() {
+        WorkflowRun running = runningRun("run-c");
+        storedRun.set(copy(running));
+        when(gateway.isEnabled()).thenReturn(true);
+        WorkflowRun completed = copy(running);
+        completed.setStatus("COMPLETED");
+        completed.setControlStatus("COMPLETED");
+        /* requireRun sees RUNNING, then the run completes before the cancel write. */
+        when(mapper.findRun("run-c")).thenReturn(copy(running)).thenAnswer(inv -> {
+            storedRun.set(copy(completed));
+            return copy(completed);
+        });
+        storedRun.set(copy(completed));
+
+        WorkflowRun after = service.cancelRun("run-c");
+
+        assertThat(after.getStatus()).isEqualTo("COMPLETED");
+        verify(gateway, never()).cancelRun(anyString(), nullable(String.class), nullable(String.class));
+    }
+
+    @Test
+    void syncRunStoppedByCancelEndsCancelledNotFailed() {
+        when(gateway.isEnabled()).thenReturn(true);
+        Map<String, Object> cancelled = new LinkedHashMap<>();
+        cancelled.put("ok", false);
+        cancelled.put("error", "Workflow cancelled");
+        Map<String, Object> cancelledState = new LinkedHashMap<>();
+        cancelledState.put("cancelled", true);
+        cancelled.put("final_state", cancelledState);
+        when(gateway.executeWorkflow(anyMap(), anyString(), anyMap(), nullable(String.class), anyString(), anyBoolean(), any()))
+                .thenAnswer(inv -> {
+                    service.cancelRun(inv.getArgument(4));
+                    return cancelled;
+                });
+
+        WorkflowRun run = service.start("daily", "AAPL", new LinkedHashMap<String, Object>());
+
+        assertThat(run.getStatus()).isEqualTo("CANCELLED");
+        assertThat(run.getControlStatus()).isEqualTo("CANCELLED");
+        verify(gateway).cancelRun(eq(run.getRunId()), nullable(String.class), nullable(String.class));
+        verify(mapper, never()).insertRunEvent(org.mockito.ArgumentMatchers.argThat(
+                event -> "RUN_FAILED".equals(event.getEventType())));
+    }
+
+    @Test
+    void completionArrivingAfterCancelDoesNotOverwriteCancelled() {
+        when(gateway.isEnabled()).thenReturn(true);
+        Map<String, Object> finalState = new LinkedHashMap<>();
+        finalState.put("summary", "done");
+        when(gateway.executeWorkflow(anyMap(), anyString(), anyMap(), nullable(String.class), anyString(), anyBoolean(), any()))
+                .thenAnswer(inv -> {
+                    service.cancelRun(inv.getArgument(4));
+                    return response(true, finalState, trace("start", "end"));
+                });
+
+        WorkflowRun run = service.start("daily", "AAPL", new LinkedHashMap<String, Object>());
+
+        assertThat(run.getStatus()).isEqualTo("CANCELLED");
+        verify(mapper, never()).insertRunEvent(org.mockito.ArgumentMatchers.argThat(
+                event -> "RUN_COMPLETED".equals(event.getEventType())));
+    }
+
+    private static WorkflowRun runningRun(String runId) {
+        WorkflowRun run = new WorkflowRun();
+        run.setRunId(runId);
+        run.setWorkflowKey("daily");
+        run.setSubject("AAPL");
+        run.setStatus("RUNNING");
+        run.setControlStatus("ACTIVE");
+        run.setUserId("u-1");
+        run.setTenantId("t-1");
+        run.setCancelRequested(0);
+        run.setPauseRequested(0);
+        return run;
     }
 
     /* ---------------- P1-15: failures are not disguised as success ---------------- */

@@ -71,6 +71,9 @@ aegis:
     base-url: ${AEGIS_ALPHA_LANGCHAIN_BASE_URL:${OPENAI_BASE_URL:}}
     connect-timeout-ms: ${AEGIS_ALPHA_LANGCHAIN_CONNECT_TIMEOUT_MS:5000}
     read-timeout-ms: ${AEGIS_ALPHA_LANGCHAIN_READ_TIMEOUT_MS:120000}
+    # P4-4 (待确认): read timeout of the synchronous whole-run calls (/execute-workflow, /resume-workflow);
+    # keep it at the orchestrator AEGIS_ALPHA_WORKFLOW_TIMEOUT_SECONDS (900s) + 30s.
+    workflow-read-timeout-ms: ${AEGIS_ALPHA_LANGCHAIN_WORKFLOW_READ_TIMEOUT_MS:930000}
   router:
     # Intent routing: LLM results below llm-min-confidence never short-circuit keyword rules;
     # research-priority-confidence is the minimum to dispatch a workflow from chat.

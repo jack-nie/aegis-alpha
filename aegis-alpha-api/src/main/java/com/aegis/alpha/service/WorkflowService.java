@@ -670,14 +670,56 @@ public class WorkflowService {
         return digest;
     }
 
-    /** P3-13: single FAILED write for the non-streaming paths (the seam for a conditional/CAS write later). */
+    /**
+     * P3-13 / P4-4: single FAILED write for the non-streaming paths. Conditional (CAS) on RUNNING/QUEUED and
+     * no cancel request, so a failure observed after a user cancel (e.g. the orchestrator stopped the
+     * graph) never overwrites CANCELLED; a cancel requested meanwhile ends the run as CANCELLED instead.
+     */
     private void markRunFailed(WorkflowRun run, Exception ex) {
         run.setStatus("FAILED");
         run.setCompletedAt(now());
         run.setErrorMessage(ex.getMessage());
         run.setControlStatus("FAILED");
-        mapper.updateRun(run);
-        recordRunEvent(run, "RUN_FAILED", null, null, "FAILED", ex.getMessage(), null, 1000000);
+        if (mapper.updateRunStatusIf(run, RUNNING_OR_QUEUED, true) > 0) {
+            recordRunEvent(run, "RUN_FAILED", null, null, "FAILED", ex.getMessage(), null, 1000000);
+            return;
+        }
+        WorkflowRun latest = mapper.findRun(run.getRunId());
+        if (isCancelRequested(latest)) {
+            finishSyncAsCancelled(latest, "Workflow run cancelled; the orchestrator run was stopped.");
+        }
+    }
+
+    static final List<String> RUNNING_OR_QUEUED = Arrays.asList("RUNNING", "QUEUED");
+
+    /**
+     * P4-4: terminal / paused writes of the synchronous orchestrator path only apply while the run is
+     * still RUNNING and not cancelled (CAS). Losing the race means the user cancelled (finish as
+     * CANCELLED) or something else moved the run on; either way the caller stops.
+     */
+    private void writeSyncRunIfRunning(WorkflowRun run) {
+        if (mapper.updateRunStatusIf(run, RUNNING_ONLY, true) > 0) {
+            return;
+        }
+        WorkflowRun latest = mapper.findRun(run.getRunId());
+        if (isCancelRequested(latest)) {
+            finishSyncAsCancelled(latest, "Workflow run cancelled while the orchestrator was running it.");
+            throw new WorkflowStoppedException("CANCELLED");
+        }
+        throw new WorkflowStoppedException(latest == null ? "UNKNOWN" : String.valueOf(latest.getStatus()));
+    }
+
+    private void finishSyncAsCancelled(WorkflowRun latest, String message) {
+        if (latest == null || "CANCELLED".equals(latest.getStatus())) {
+            return;
+        }
+        latest.setStatus("CANCELLED");
+        latest.setControlStatus("CANCELLED");
+        latest.setCancelRequested(1);
+        latest.setCompletedAt(now());
+        if (mapper.updateRunStatusIf(latest, Arrays.asList("RUNNING", "PAUSED", "QUEUED"), false) > 0) {
+            recordRunEvent(latest, "RUN_CANCELLED", null, null, "CANCELLED", message, null, 1000000);
+        }
     }
 
     public WorkflowRun startWithStreaming(String workflowKey, String subject, Map<String, Object> inputs,
@@ -1307,11 +1349,34 @@ public class WorkflowService {
         } else if ("RUNNING".equals(run.getStatus())) {
             run.setCancelRequested(1);
             run.setControlStatus("CANCEL_REQUESTED");
-            mapper.updateRun(run);
-            recordRunEvent(run, "RUN_CANCEL_REQUESTED", null, null, "RUNNING", "Workflow run cancellation requested.", null, 4);
-            clearQueuedRunMessages(run);
+            /* P4-4: CAS so a run that completed meanwhile is not rewritten to RUNNING/CANCEL_REQUESTED. */
+            if (mapper.updateRunStatusIf(run, RUNNING_ONLY, false) > 0) {
+                recordRunEvent(run, "RUN_CANCEL_REQUESTED", null, null, "RUNNING", "Workflow run cancellation requested.", null, 4);
+                clearQueuedRunMessages(run);
+                requestOrchestratorCancel(run);
+            }
         }
         return mapper.findRun(runId);
+    }
+
+    /**
+     * P4-4: ask the orchestrator to stop the graph of a RUNNING run (best effort). The orchestrator answers
+     * the in-flight execute/stream call with a cancelled outcome; Java records CANCELLED via its CAS writes.
+     */
+    private void requestOrchestratorCancel(WorkflowRun run) {
+        if (langChainGateway == null || !langChainGateway.isEnabled()) {
+            return;
+        }
+        try {
+            Map<String, Object> response = langChainGateway.cancelRun(run.getRunId(), run.getUserId(), run.getTenantId());
+            if (response != null && !Boolean.TRUE.equals(response.get("ok"))) {
+                log.info("[WorkflowService] orchestrator cancel not applied runId={} code={}", run.getRunId(),
+                        response.get("code"));
+            }
+        } catch (RuntimeException ex) {
+            log.warn("[WorkflowService] orchestrator cancel failed runId={} type={}", run.getRunId(),
+                    ex.getClass().getSimpleName());
+        }
     }
 
     /** Cancelling a running / approval-paused run also drops its pending steering / follow-up messages (best effort). */
@@ -1483,6 +1548,12 @@ public class WorkflowService {
                 layout, run.getSubject(), state, delegatedToken, run.getRunId(), requireApproval,
                 LangChainGateway.runOwner(run.getUserId(), run.getTenantId()));
         if (response == null || Boolean.FALSE.equals(response.get("ok"))) {
+            /* P4-4: the orchestrator stopped the graph because the user cancelled -> CANCELLED, not FAILED. */
+            WorkflowRun latest = mapper.findRun(run.getRunId());
+            if (isCancelRequested(latest)) {
+                finishSyncAsCancelled(latest, "Workflow run cancelled; the orchestrator run was stopped.");
+                throw new WorkflowStoppedException("CANCELLED");
+            }
             String error = response == null ? "" : string(response.get("error"));
             throw new IllegalStateException(error == null || error.trim().isEmpty()
                     ? "Orchestrator workflow failed" : "Orchestrator workflow failed: " + error);
@@ -1510,7 +1581,7 @@ public class WorkflowService {
             run.setStatus("PAUSED");
             run.setControlStatus("HUMAN_INTERRUPT");
             run.setPauseRequested(1);
-            mapper.updateRun(run);
+            writeSyncRunIfRunning(run);
             recordRunEvent(run, "RUN_PAUSED", null, null, "PAUSED",
                     "Workflow paused for human approval.", null, 950000);
             return;
@@ -1523,7 +1594,7 @@ public class WorkflowService {
         if (degraded && (run.getErrorMessage() == null || run.getErrorMessage().trim().isEmpty())) {
             run.setErrorMessage("DEGRADED");
         }
-        mapper.updateRun(run);
+        writeSyncRunIfRunning(run);
         if (degraded) {
             recordRunEvent(run, "RUN_DEGRADED", null, null, "COMPLETED",
                     "Workflow completed with degraded nodes.", null, 999999);

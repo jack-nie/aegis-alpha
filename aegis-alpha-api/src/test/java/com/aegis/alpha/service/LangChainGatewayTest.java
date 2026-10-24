@@ -275,6 +275,53 @@ class LangChainGatewayTest {
     }
 
     @Test
+    void cancelRunPostsThreadAndOwnerAndMapsNotActive() throws Exception {
+        final java.util.concurrent.atomic.AtomicReference<String> body = new java.util.concurrent.atomic.AtomicReference<String>();
+        final java.util.concurrent.atomic.AtomicInteger calls = new java.util.concurrent.atomic.AtomicInteger();
+        server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/cancel-run", exchange -> {
+            body.set(new String(readAll(exchange), StandardCharsets.UTF_8));
+            if (calls.incrementAndGet() == 1) {
+                respond(exchange, 200, "{\"ok\":true,\"threadId\":\"run-1\",\"cancelled\":true}");
+            } else {
+                respond(exchange, 404, "{\"ok\":false,\"code\":\"NOT_ACTIVE\",\"error\":\"no active run\"}");
+            }
+        });
+        server.start();
+        LangChainGateway gateway = gateway("http://127.0.0.1:" + server.getAddress().getPort(), true);
+
+        Map<String, Object> first = gateway.cancelRun("run-1", "u-1", "t-1");
+        Map<String, Object> second = gateway.cancelRun("run-1", "u-1", "t-1");
+
+        assertThat(first.get("ok"), is((Object) true));
+        Map<?, ?> sent = new ObjectMapper().readValue(body.get(), Map.class);
+        assertThat(sent.get("threadId"), is((Object) "run-1"));
+        assertThat(((Map<?, ?>) sent.get("owner")).get("userId"), is((Object) "u-1"));
+        assertThat(second.get("ok"), is((Object) false));
+        assertThat(second.get("code"), is((Object) "NOT_ACTIVE"));
+    }
+
+    @Test
+    void cancelRunNeverThrowsWhenOrchestratorIsUnreachable() {
+        LangChainGateway gateway = gateway("http://127.0.0.1:1", true);
+
+        Map<String, Object> result = gateway.cancelRun("run-1", "u-1", "t-1");
+
+        assertThat(result.get("ok"), is((Object) false));
+        assertThat(result.get("code"), is((Object) "ORCHESTRATOR_UNAVAILABLE"));
+    }
+
+    @Test
+    void workflowCallsUseTheirOwnReadTimeout() {
+        LangChainGateway gateway = gateway("http://127.0.0.1:1", true);
+        assertThat(gateway.workflowReadTimeoutMs(), is(LangChainGateway.DEFAULT_WORKFLOW_READ_TIMEOUT_MS));
+
+        gateway.configureWorkflowTimeouts(1000, 45000);
+
+        assertThat(gateway.workflowReadTimeoutMs(), is(45000));
+    }
+
+    @Test
     void enqueueRunMessageForwardsOptionalAgentTarget() throws Exception {
         final java.util.concurrent.atomic.AtomicReference<String> body = new java.util.concurrent.atomic.AtomicReference<String>();
         server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
