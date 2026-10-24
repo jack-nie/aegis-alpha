@@ -73,6 +73,24 @@ class Settings(BaseSettings):
     workflow_thread_meta_max: int = Field(default=1000, alias="AEGIS_ALPHA_WORKFLOW_THREAD_META_MAX")
     # 待确认: default keeps checkpoints of finished runs (debuggability); set true to delete them.
     workflow_cleanup_checkpoints: bool = Field(default=False, alias="AEGIS_ALPHA_WORKFLOW_CLEANUP_CHECKPOINTS")
+    # Agent-loop message queue (steering / follow-up, modeled on pi-mono's dual loop).
+    # Defaults are 待确认 (pending product confirmation); see 消息排队实现说明.md.
+    message_queue_enabled: bool = Field(default=True, alias="AEGIS_ALPHA_MESSAGE_QUEUE_ENABLED")
+    message_queue_steering_mode: str = Field(
+        default="one-at-a-time", alias="AEGIS_ALPHA_MESSAGE_QUEUE_STEERING_MODE"
+    )
+    message_queue_follow_up_mode: str = Field(
+        default="one-at-a-time", alias="AEGIS_ALPHA_MESSAGE_QUEUE_FOLLOW_UP_MODE"
+    )
+    message_queue_max_pending: int = Field(default=8, alias="AEGIS_ALPHA_MESSAGE_QUEUE_MAX_PENDING")
+    message_queue_max_chars: int = Field(default=4000, alias="AEGIS_ALPHA_MESSAGE_QUEUE_MAX_CHARS")
+    message_queue_max_deliveries: int = Field(
+        default=16, alias="AEGIS_ALPHA_MESSAGE_QUEUE_MAX_DELIVERIES"
+    )
+    message_queue_skip_remaining_tools: bool = Field(
+        default=True, alias="AEGIS_ALPHA_MESSAGE_QUEUE_SKIP_REMAINING_TOOLS"
+    )
+    message_queue_max_threads: int = Field(default=1000, alias="AEGIS_ALPHA_MESSAGE_QUEUE_MAX_THREADS")
 
     # OpenAI fallback
     openai_api_key: str = Field(default="", alias="OPENAI_API_KEY")
