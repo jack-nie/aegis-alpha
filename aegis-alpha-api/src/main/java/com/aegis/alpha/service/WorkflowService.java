@@ -18,6 +18,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 
 import java.time.Duration;
@@ -566,9 +567,38 @@ public class WorkflowService {
         applyAuthenticatedUserId(safeInputs, principal == null ? null : principal.getUserId());
         WorkflowRun run = newRun(key, subject, version, safeInputs, false, normalizedIdempotencyKey);
         applyRunOwner(run, principal);
-        mapper.insertRun(run);
+        WorkflowRun raced = insertRunOrExisting(run, principal);
+        if (raced != null) {
+            return raced;
+        }
         recordRunEvent(run, "RUN_CREATED", null, null, "RUNNING", "Workflow run created.", null, 0);
         return executeAndFinish(run, safeInputs, runLayout, inputs);
+    }
+
+    /**
+     * P3-14: inserts an idempotent run. When a concurrent request with the same
+     * (workflow_key, subject, idempotency_key) won the unique index, returns that run instead
+     * (null means this run was inserted). A key already used by a run the caller cannot access is
+     * rejected (待确认: previously a second run was created).
+     */
+    WorkflowRun insertRunOrExisting(WorkflowRun run, AuthenticatedPrincipal principal) {
+        try {
+            mapper.insertRun(run);
+            return null;
+        } catch (DuplicateKeyException duplicate) {
+            if (run.getIdempotencyKey() == null) {
+                throw duplicate;
+            }
+            WorkflowRun existing = mapper.findRunByIdempotencyKey(run.getWorkflowKey(), run.getSubject(), run.getIdempotencyKey());
+            if (existing == null) {
+                throw duplicate;
+            }
+            if (principal != null && !isRunAccessible(existing, principal)) {
+                throw new IllegalArgumentException("Idempotency key already used by another run.");
+            }
+            log.info("Idempotent run race resolved: runId={} existingRunId={}", run.getRunId(), existing.getRunId());
+            return existing;
+        }
     }
 
     /**
@@ -1174,7 +1204,10 @@ public class WorkflowService {
         applyAuthenticatedUserId(safeInputs, principal == null ? null : principal.getUserId());
         WorkflowRun run = newRun(key, subject, version, safeInputs, true, normalizedIdempotencyKey);
         applyRunOwner(run, principal);
-        mapper.insertRun(run);
+        WorkflowRun raced = insertRunOrExisting(run, principal);
+        if (raced != null) {
+            return raced;
+        }
         recordRunEvent(run, "RUN_CREATED", null, null, "QUEUED", "Workflow run queued.", safeInputs, 0);
         return mapper.findRun(run.getRunId());
     }

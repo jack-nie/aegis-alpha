@@ -128,7 +128,9 @@ CREATE TABLE IF NOT EXISTS workflow_run (
   INDEX idx_workflow_run_key (workflow_key),
   INDEX idx_workflow_run_status (status, queued_at),
   INDEX idx_workflow_run_owner (user_id, tenant_id),
-  INDEX idx_workflow_run_idempotency (workflow_key, subject, idempotency_key)
+  -- P3-14: unique; NULL idempotency_key rows never collide (MySQL allows multiple NULLs in a UNIQUE index).
+  -- Existing databases: run db/mysql/migrations/P3-14-workflow-run-idempotency-unique.sql.
+  UNIQUE INDEX idx_workflow_run_idempotency (workflow_key, subject, idempotency_key)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS workflow_node_run (
