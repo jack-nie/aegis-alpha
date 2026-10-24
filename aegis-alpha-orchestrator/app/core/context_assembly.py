@@ -323,7 +323,11 @@ def _render_latest_tools(state: dict, *, max_tokens: int | None = None) -> str |
     if latest is None:
         return None
     if isinstance(latest, str):
-        body = latest
+        # P4-1: a fenced ToolMessage body (or its JSON) is rendered as its inner data; the whole
+        # context is fenced again by build_user_content, so no nested tags reach the model.
+        from .tool_pipeline import unfence_tool_result
+
+        body = unfence_tool_result(latest)
     else:
         body = json.dumps(latest, ensure_ascii=False, default=str)
     if max_tokens is not None and estimate_tokens(body) > max_tokens:

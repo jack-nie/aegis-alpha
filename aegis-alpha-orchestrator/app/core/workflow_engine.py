@@ -19,7 +19,7 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import StateGraph, START, END
 from langchain_core.messages import ToolMessage
 from langchain_core.runnables import RunnableConfig
-from langgraph.prebuilt import ToolNode
+from langgraph.prebuilt import ToolNode  # noqa: F401 - re-exported for tests
 from langgraph.store.base import BaseStore
 
 try:
@@ -49,6 +49,7 @@ from .message_queue import (
     to_human_messages,
 )
 from .node_executor import NodeExecutor
+from .tool_pipeline import ToolPolicy, build_tool_node, count_tool_errors
 from .tool_registry import TOOL_SPECS, resolve_agent_roles, tools_for_roles
 
 logger = logging.getLogger(__name__)
@@ -408,8 +409,11 @@ class WorkflowEngine:
         tool_registry: dict[str, Any] | None = None,
         guardrails: "GraphGuardrails | None" = None,
         message_queues: MessageQueueRegistry | None = None,
+        tool_policy: ToolPolicy | None = None,
     ):
         self._node_executor = node_executor
+        # P4-1: validate / classify / truncate / fence every tool call.
+        self._tool_policy = tool_policy or ToolPolicy.from_settings(getattr(node_executor, "_config", None))
         # Per-thread steering / follow-up queues (pi dual-loop semantics).
         self._message_queues = message_queues or MessageQueueRegistry()
         self._guardrails = guardrails or GraphGuardrails()
@@ -419,7 +423,7 @@ class WorkflowEngine:
         self._tool_registry = tool_registry
         self._store = store
         # Shared ToolNode for backward-compatible single-tools-list mode.
-        self._tool_node = ToolNode(self._tools) if self._tools else None
+        self._tool_node = build_tool_node(self._tools, self._tool_policy) if self._tools else None
         # Persist layout/flags per thread so resume rebuilds the same graph. Bounded LRU (P2-12);
         # evicted threads fall back to the durable layout in the store.
         self._thread_meta: OrderedDict[str, dict[str, Any]] = OrderedDict()
@@ -989,7 +993,7 @@ class WorkflowEngine:
                 if not filtered:
                     continue
                 tools_node_id = f"tools__{node.id}"
-                graph.add_node(tools_node_id, self._agent_tools_fn(ToolNode(filtered), [node.id]))
+                graph.add_node(tools_node_id, self._agent_tools_fn(build_tool_node(filtered, self._tool_policy), [node.id]))
                 agent_tools_node_ids[node.id] = tools_node_id
                 agent_nodes.append(node.id)
         elif self._tool_node:
@@ -1407,6 +1411,7 @@ class WorkflowEngine:
             subject=subject,
             agent_result=agent_result,
             started_at=started_at,
+            tool_errors=count_tool_errors(prior_for_tools if mid_tool_loop else []),
         )
         if force_final and agent_result.has_tool_calls:
             # Model still tried to call tools past the cap; surface as degraded text.

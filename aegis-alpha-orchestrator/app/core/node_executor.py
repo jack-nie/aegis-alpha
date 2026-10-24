@@ -740,8 +740,13 @@ class NodeExecutor:
         agent_result: AgentToolResult,
         started_at: str,
         model: str | None = None,
+        tool_errors: int = 0,
     ) -> NodeResult:
-        """Convert a final (no tool_calls) AgentToolResult into NodeResult."""
+        """Convert a final (no tool_calls) AgentToolResult into NodeResult.
+
+        P4-1: ``tool_errors`` (error ToolMessages seen in this agent's loop) marks the result degraded
+        so a conclusion drawn without the requested data is never presented as a clean one.
+        """
         handler = self._resolve_handler(node)
         data = node.data
         response = agent_result.llm_response or LLMResponse(
@@ -756,6 +761,9 @@ class NodeExecutor:
             s if isinstance(s, dict) else {"title": str(s), "url": "", "type": "llm"}
             for s in response.sources
         ]
+        result_data = _with_token_usage(response.data or {}, response)
+        if tool_errors:
+            result_data["toolErrors"] = int(tool_errors)
         return NodeResult(
             ok=True,
             status="completed",
@@ -767,10 +775,10 @@ class NodeExecutor:
             signals=[self._normalize_signal(s) for s in response.signals],
             sources=sources,
             confidence=response.confidence,
-            data=_with_token_usage(response.data or {}, response),
+            data=result_data,
             duration_ms=duration_ms,
             content=response.content,
-            degraded=False,
+            degraded=bool(tool_errors),
             provider=self._config.provider,
             model=model or self._config.model,
         )

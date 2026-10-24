@@ -67,6 +67,10 @@ class Settings(BaseSettings):
     # Prefer contextvar authorization_override on ToolBackendClient for per-run use.
     delegated_token: str = Field(default="", alias="AEGIS_ALPHA_DELEGATED_TOKEN")
 
+    # P4-1 tool pipeline: per-call result caps (list items first, then characters).
+    tool_result_max_chars: int = Field(default=6000, alias="AEGIS_ALPHA_TOOL_RESULT_MAX_CHARS")
+    tool_result_max_items: int = Field(default=20, alias="AEGIS_ALPHA_TOOL_RESULT_MAX_ITEMS")
+
     # Market Data
     market_data_timeout_ms: int = Field(default=8000, alias="AEGIS_ALPHA_MARKET_DATA_TIMEOUT_MS")
 

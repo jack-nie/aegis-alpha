@@ -4,6 +4,7 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.tools import tool
 from langgraph.checkpoint.memory import MemorySaver
 
+from app.core.tool_pipeline import unfence_tool_result  # P4-1: tool results are fenced
 from app.models.workflow import Edge, Node, NodeData
 
 
@@ -24,7 +25,7 @@ def _install_fake_agent(executor, seen: dict):
             )
             return AgentToolResult(ai, has_tool_calls=True, seed_human=HumanMessage(content=f"task {node.id}"))
         seen[node.id] = list(prior_messages)
-        tool_texts = [m.content for m in prior_messages if isinstance(m, ToolMessage)]
+        tool_texts = [unfence_tool_result(m.content) for m in prior_messages if isinstance(m, ToolMessage)]
         return AgentToolResult(
             AIMessage(content=f"done {node.id}"),
             has_tool_calls=False,
@@ -63,7 +64,7 @@ async def test_parallel_agents_do_not_see_each_others_tool_calls(mock_node_execu
         assert set(seen) == {"agent_a", "agent_b"}
         for agent_id, other in (("agent_a", "agent_b"), ("agent_b", "agent_a")):
             tool_msgs = [m for m in seen[agent_id] if isinstance(m, ToolMessage)]
-            assert [m.content for m in tool_msgs] == [f"echo:{agent_id}"]
+            assert [unfence_tool_result(m.content) for m in tool_msgs] == [f"echo:{agent_id}"]
             assert all(other not in str(m.content) for m in seen[agent_id])
         summaries = {k: v["summary"] for k, v in result.node_outputs.items() if k.startswith("agent_")}
         assert summaries == {
