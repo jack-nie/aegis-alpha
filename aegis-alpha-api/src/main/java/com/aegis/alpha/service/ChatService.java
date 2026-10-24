@@ -795,7 +795,7 @@ public class ChatService {
                 state.put("marketDataOverview", marketOverview(ticker));
             }
         }
-        Map<String, Object> node = copilotNode(body);
+        Map<String, Object> node = copilotNode();
         Map<String, Object> result = langChainGateway.runAgent(copilot, state, node, ticker.isEmpty() ? "copilot chat" : ticker);
         String reply = text(result, "content", text(result, "message", ""));
         if (reply.trim().isEmpty()) {
@@ -887,11 +887,15 @@ public class ChatService {
         return new LinkedHashMap<String, Object>();
     }
 
-    private Map<String, Object> copilotNode(Map<String, Object> body) {
+    static final String COPILOT_HANDLER = "general.agent";
+
+    private Map<String, Object> copilotNode() {
         Map<String, Object> data = new LinkedHashMap<String, Object>();
         data.put("label", "Aegis Alpha Copilot");
         data.put("nodeType", "agent");
-        data.put("handler", text(body, "handler", "general.agent"));
+        // P3-8: the copilot node handler is fixed; a client-supplied body.handler must not pick a
+        // workflow handler (e.g. finance.stock_recommendation_aggregate) for free-form chat.
+        data.put("handler", COPILOT_HANDLER);
         data.put("agentId", "aegis-alpha-copilot");
         Map<String, Object> node = new LinkedHashMap<String, Object>();
         node.put("id", "aegis-alpha-copilot");
