@@ -58,6 +58,10 @@ aegis:
       # 待确认: when the browser disconnects, false = keep consuming the orchestrator stream so the run
       # finishes and is recorded (CLIENT_DISCONNECTED event); true = stop reading and cancel the run.
       cancel-on-disconnect: ${AEGIS_ALPHA_WORKFLOW_STREAM_CANCEL_ON_DISCONNECT:false}
+  models:
+    # P4-6 (待确认): model names a client may request (chat body.modelName, agent modelName).
+    # Keep in sync with aegis-alpha-orchestrator app/core/models.yaml.
+    allowed-names: ${AEGIS_ALPHA_ALLOWED_MODEL_NAMES:deepseek-v4-flash,deepseek-v4-pro}
   agent:
     # P3-16 (待确认): default model for agents / inline workflow agents without an explicit modelName.
     # Defaults to the orchestrator gateway model so one env var changes both.

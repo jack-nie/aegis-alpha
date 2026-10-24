@@ -391,6 +391,28 @@ class LangChainGatewayTest {
         assertThat(cleared.get("ok"), is((Object) false));
     }
 
+    @Test
+    void agentModelIsForwardedWithoutSilentRewrite() {
+        LangChainGateway gw = gateway("http://127.0.0.1:1", false);
+        AgentTemplate agent = new AgentTemplate();
+        agent.setAgentId("a-1");
+        agent.setModelName("deepseek-v4-pro");
+        Map<String, Object> node = new LinkedHashMap<String, Object>();
+        node.put("id", "n1");
+        assertThat(gw.runAgent(agent, new LinkedHashMap<String, Object>(), node, "AAPL").get("model"),
+                is((Object) "deepseek-v4-pro"));
+
+        /* P4-6: proxy-hosted names are no longer rewritten to deepseek-v4-flash by Java; the orchestrator
+         * registry resolves them and records modelFallbackReason when it falls back. */
+        agent.setModelName("proxy-model-x");
+        assertThat(gw.runAgent(agent, new LinkedHashMap<String, Object>(), node, "AAPL").get("model"),
+                is((Object) "proxy-model-x"));
+
+        agent.setModelName(" ");
+        assertThat(gw.runAgent(agent, new LinkedHashMap<String, Object>(), node, "AAPL").get("model"),
+                is((Object) "deepseek-v4-flash"));
+    }
+
     private static LangChainGateway gateway(String url, boolean enabled) {
         return new LangChainGateway(new ObjectMapper(), enabled, url, "openai", "deepseek-v4-flash",
                 "test-key", "http://example.test/v1");

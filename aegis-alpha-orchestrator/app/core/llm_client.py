@@ -14,10 +14,12 @@ from pydantic import BaseModel, Field
 from ..config import Settings
 from .context_assembly import normalize_token_usage
 from .message_queue import is_queued_human_message
+from .model_registry import ModelResolution, get_model_registry
 from .prompt_safety import build_user_content, with_untrusted_notice
 
 logger = logging.getLogger(__name__)
 
+# Kept for importers; the allowed set now lives in the model registry (app/core/models.yaml).
 DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-flash"
 SUPPORTED_DEEPSEEK_MODELS = {"deepseek-v4-pro", "deepseek-v4-flash"}
 
@@ -60,6 +62,8 @@ class AgentToolResult:
         self.has_tool_calls = has_tool_calls
         self.llm_response = llm_response
         self.seed_human = seed_human
+        # P4-6: set by the node executor (requested vs effective model) for the trace.
+        self.model_resolution: Any = None
 
     @property
     def messages_to_append(self) -> list[Any]:
@@ -136,14 +140,16 @@ class LLMClient:
         self._config = config
         self._client_cache: dict[str, ChatOpenAI] = {}
 
-    def _resolve_model(self, requested: str | None = None) -> str:
-        """Resolve model name with DeepSeek compatibility."""
-        requested = requested or self._config.model
-        base_url = self._config.effective_base_url
+    def resolve_model(self, requested: str | None = None) -> ModelResolution:
+        """P4-6: registry-based resolution (warning + fallback instead of a silent rewrite)."""
+        registry = get_model_registry(getattr(self._config, "models_file", "") or None)
+        return registry.resolve(
+            requested, default=self._config.model, base_url=self._config.effective_base_url
+        )
 
-        if self._uses_deepseek_endpoint(base_url) and requested not in SUPPORTED_DEEPSEEK_MODELS:
-            return DEFAULT_DEEPSEEK_MODEL
-        return requested
+    def _resolve_model(self, requested: str | None = None) -> str:
+        """Effective model name for one call (see :meth:`resolve_model`)."""
+        return self.resolve_model(requested).effective
 
     def _uses_deepseek_endpoint(self, base_url: str) -> bool:
         """Check if using DeepSeek-compatible endpoint."""
@@ -406,7 +412,14 @@ class LLMClient:
         workflow function, ``None`` when it deliberately called nothing (non-workflow intent)
         or the call failed. ``confidence`` is the model-provided value (may be ``None``).
         """
-        resolved_model = self._resolve_model(getattr(self._config, "router_model", "") or None)
+        # The router model is operator configuration (like the default model), not a request:
+        # it is only checked against the endpoint family, never against the registry list.
+        registry = get_model_registry(getattr(self._config, "models_file", "") or None)
+        resolved_model = registry.resolve(
+            None,
+            default=getattr(self._config, "router_model", "") or self._config.model,
+            base_url=self._config.effective_base_url,
+        ).effective
         timeout_ms = int(getattr(self._config, "router_timeout_ms", 0) or 2500)
         client = self._build_client(resolved_model, temperature=0, timeout_ms=timeout_ms)
 

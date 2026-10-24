@@ -36,6 +36,8 @@ class Settings(BaseSettings):
     api_key: str = Field(default="", alias="AEGIS_ALPHA_LANGCHAIN_API_KEY")
     base_url: str = Field(default="", alias="AEGIS_ALPHA_LANGCHAIN_BASE_URL")
     timeout_ms: int = Field(default=25000, alias="AEGIS_ALPHA_LANGCHAIN_TIMEOUT_MS")
+    # P4-6: model registry file (YAML). Empty = the packaged app/core/models.yaml.
+    models_file: str = Field(default="", alias="AEGIS_ALPHA_MODELS_FILE")
     mock_mode: bool = Field(default=False, alias="AEGIS_ALPHA_LANGCHAIN_MOCK")
 
     # Intent router (classification). Empty model -> fall back to the main model.

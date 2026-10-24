@@ -26,6 +26,7 @@ from .critique import critique_recommendation_draft
 from .log_safety import text_len
 from .llm_client import AgentToolResult, LLMClient, LLMResponse
 from .market_data import MarketDataService
+from .model_registry import ModelResolution, get_model_registry
 from .recommendation_policy import enforce_recommendation_policy
 
 logger = logging.getLogger(__name__)
@@ -221,6 +222,37 @@ class NodeExecutor:
         base = float(2 ** attempt)
         return base * (0.5 + self._random())
 
+    @staticmethod
+    def requested_model_for(
+        node: Node, agent: AgentTemplate | None = None, explicit: str | None = None
+    ) -> str | None:
+        """P4-6: model asked for by this call: explicit > node ``data.modelName`` > agent template."""
+        if explicit and str(explicit).strip():
+            return str(explicit).strip()
+        data = node.data
+        extra = getattr(data, "model_extra", None) or {}
+        for key in ("modelName", "model_name", "model"):
+            value = extra.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        if agent is not None and (agent.model_name or "").strip():
+            return agent.model_name.strip()
+        return None
+
+    def resolve_model(self, requested: str | None) -> ModelResolution:
+        registry = get_model_registry(getattr(self._config, "models_file", "") or None)
+        return registry.resolve(
+            requested, default=self._config.model, base_url=self._config.effective_base_url
+        )
+
+    @staticmethod
+    def _attach_model_resolution(result: NodeResult, resolution: ModelResolution | None) -> NodeResult:
+        if resolution is None:
+            return result
+        result.model = resolution.effective
+        result.data = {**(result.data or {}), "modelResolution": resolution.as_trace()}
+        return result
+
     async def execute(
         self,
         node: Node,
@@ -262,6 +294,10 @@ class NodeExecutor:
             known.update(evidence_entries)
             state = {**state, "marketDataContext": market_context, "evidence": known}
 
+        # P4-6: node/agent model through the registry (warning + fallback, recorded in the trace).
+        resolution = self.resolve_model(self.requested_model_for(node, agent, model))
+        model = resolution.effective
+
         # Invoke LLM with retry: bounded attempts, jittered backoff and a total deadline.
         max_attempts, deadline_s = self._retry_budget()
         retry_started = self._clock()
@@ -284,7 +320,7 @@ class NodeExecutor:
                 if evidence_entries:
                     # Engine merges data.evidence into final_state.evidence (server-issued ids).
                     result.data = {**(result.data or {}), "evidence": evidence_entries}
-                return result
+                return self._attach_model_resolution(result, resolution)
             except Exception as e:
                 last_error = e
                 if not self._is_retryable(e):
@@ -730,6 +766,9 @@ class NodeExecutor:
             f"prior_messages={len(prior_messages or [])}"
         )
 
+        resolution = self.resolve_model(self.requested_model_for(node, agent, model))
+        model = resolution.effective
+
         # P4-2: same bounded retry budget as execute() (attempts + total deadline, jittered
         # backoff, non-retryable auth errors fail fast). Exhaustion raises AgentTurnError and the
         # engine records an explicit degraded result instead of silently re-running execute().
@@ -738,7 +777,7 @@ class NodeExecutor:
         last_error: Exception | None = None
         for attempt in range(max_attempts):
             try:
-                return await self._llm_client.invoke_agent_with_tools(
+                agent_result = await self._llm_client.invoke_agent_with_tools(
                     system=system,
                     prompt=prompt,
                     context=context,
@@ -749,6 +788,11 @@ class NodeExecutor:
                     timeout_ms=self._config.timeout_ms,
                     force_final=force_final,
                 )
+                try:
+                    agent_result.model_resolution = resolution
+                except AttributeError:
+                    pass
+                return agent_result
             except asyncio.CancelledError:
                 raise
             except Exception as e:  # noqa: BLE001
@@ -826,6 +870,10 @@ class NodeExecutor:
         result_data = _with_token_usage(response.data or {}, response)
         if tool_errors:
             result_data["toolErrors"] = int(tool_errors)
+        resolution = getattr(agent_result, "model_resolution", None)
+        if isinstance(resolution, ModelResolution):
+            result_data["modelResolution"] = resolution.as_trace()
+            model = model or resolution.effective
         return NodeResult(
             ok=True,
             status="completed",

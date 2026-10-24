@@ -248,6 +248,36 @@ class ChatServiceSecurityTest {
         verify(chatMapper, never()).insertThread(anyString(), anyString());
     }
 
+    /* ======================= model control (P4-6 / R5) ======================= */
+
+    @Test
+    void clientModelNameOutsideAllowlistIsIgnored() {
+        when(helpRoutingService.classifyExtended(anyString(), any())).thenReturn(intent(HelpIntent.RouteAction.COPILOT));
+        Map<String, Object> body = body("你好");
+        body.put("modelName", "gpt-expensive-unlisted");
+
+        chatService.reply(body, principal("u-1", "tenant-1"));
+
+        ArgumentCaptor<com.aegis.alpha.domain.AgentTemplate> agent =
+                ArgumentCaptor.forClass(com.aegis.alpha.domain.AgentTemplate.class);
+        verify(langChainGateway).runAgent(agent.capture(), any(), any(), any());
+        assertThat(agent.getValue().getModelName()).isEmpty();
+    }
+
+    @Test
+    void clientModelNameOnAllowlistIsForwarded() {
+        when(helpRoutingService.classifyExtended(anyString(), any())).thenReturn(intent(HelpIntent.RouteAction.COPILOT));
+        Map<String, Object> body = body("你好");
+        body.put("modelName", "deepseek-v4-pro");
+
+        chatService.reply(body, principal("u-1", "tenant-1"));
+
+        ArgumentCaptor<com.aegis.alpha.domain.AgentTemplate> agent =
+                ArgumentCaptor.forClass(com.aegis.alpha.domain.AgentTemplate.class);
+        verify(langChainGateway).runAgent(agent.capture(), any(), any(), any());
+        assertThat(agent.getValue().getModelName()).isEqualTo("deepseek-v4-pro");
+    }
+
     /* ========================= run diagnosis ========================= */
 
     @Test

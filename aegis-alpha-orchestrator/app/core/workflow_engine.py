@@ -880,6 +880,12 @@ class WorkflowEngine:
         if not isinstance(traced, dict):
             traced = trace_entry
         traced["memoryHits"] = memory_hit_count(exec_state if isinstance(exec_state, dict) else {})
+        resolution = (result_data or {}).get("modelResolution") if isinstance(result_data, dict) else None
+        if isinstance(resolution, dict):
+            # P4-6: requested vs effective model (fallbacks are visible, never silent).
+            for key in ("requestedModel", "effectiveModel", "modelFallbackReason"):
+                if resolution.get(key) is not None:
+                    traced[key] = resolution[key]
         return traced
 
     @staticmethod

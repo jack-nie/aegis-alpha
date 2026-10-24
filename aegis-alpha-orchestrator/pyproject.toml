@@ -20,6 +20,7 @@ dependencies = [
     "aiosqlite>=0.20.0",
     "langgraph-checkpoint>=4.3",
     "langgraph-checkpoint-sqlite>=3.1",
+    "pyyaml",
 ]
 
 [project.scripts]
@@ -27,3 +28,6 @@ aegis-orchestrator = "app.main:start"
 
 [tool.setuptools.packages.find]
 include = ["app*"]
+
+[tool.setuptools.package-data]
+"app.core" = ["models.yaml"]

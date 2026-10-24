@@ -56,6 +56,15 @@ public class ChatService {
     private final HelpTraceService helpTraceService;
     private final Executor workflowExecutor;
 
+    private ModelAllowlist modelAllowlist = ModelAllowlist.defaults();
+
+    @Autowired(required = false)
+    void setModelAllowlist(ModelAllowlist modelAllowlist) {
+        if (modelAllowlist != null) {
+            this.modelAllowlist = modelAllowlist;
+        }
+    }
+
     @Autowired
     public ChatService(ChatMapper mapper,
                        LangChainGateway langChainGateway,
@@ -781,7 +790,10 @@ public class ChatService {
         copilot.setCategory("copilot");
         copilot.setTags("chat,copilot,research");
         copilot.setPrompt(COPILOT_SYSTEM_PROMPT);
-        copilot.setModelName(text(body, "modelName", ""));
+        // P4-6 (R5): body.modelName is client input; only allowlisted names are forwarded, others are
+        // ignored (empty = the gateway default model) rather than trusted.
+        String requestedModel = text(body, "modelName", "");
+        copilot.setModelName(modelAllowlist.isAllowed(requestedModel) ? requestedModel.trim() : "");
         copilot.setToolsJson("[\"market-data\",\"portfolio\",\"news\",\"workflow\"]");
 
         Map<String, Object> state = trustedState(body, principal);

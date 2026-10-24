@@ -597,24 +597,13 @@ public class LangChainGateway {
         return value == null || value.trim().isEmpty() ? fallback : value.trim();
     }
 
+    /*
+     * P4-6: no silent model rewrite here. User-supplied names are allowlisted upstream (ModelAllowlist)
+     * and the orchestrator model registry resolves/falls back visibly (requestedModel/effectiveModel/
+     * modelFallbackReason in the trace).
+     */
     private String resolveModel(AgentTemplate agent) {
-        String requested = first(agent == null ? null : agent.getModelName(), defaultModel);
-        if (usesDeepSeekCompatibleEndpoint() && !isSupportedDeepSeekModel(requested)) {
-            return deepSeekDefaultModel();
-        }
-        return requested;
-    }
-
-    private boolean usesDeepSeekCompatibleEndpoint() {
-        return isSupportedDeepSeekModel(defaultModel) || (baseUrl != null && !baseUrl.trim().isEmpty());
-    }
-
-    private boolean isSupportedDeepSeekModel(String model) {
-        return "deepseek-v4-pro".equals(model) || "deepseek-v4-flash".equals(model);
-    }
-
-    private String deepSeekDefaultModel() {
-        return isSupportedDeepSeekModel(defaultModel) ? defaultModel : "deepseek-v4-flash";
+        return first(agent == null ? null : agent.getModelName(), defaultModel);
     }
 
     private final RestTemplate shortTimeoutRestTemplate;
