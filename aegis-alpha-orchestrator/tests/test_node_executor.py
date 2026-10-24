@@ -16,6 +16,17 @@ def test_handlers_set():
     assert "end" in FALLBACK_HANDLERS
 
 
+def test_normalize_source_maps_llm_name_to_title(mock_node_executor):
+    assert mock_node_executor._normalize_source({"name": "marketDataContext", "error": "HTTP 401"}) == {
+        "title": "marketDataContext",
+        "url": "",
+        "type": "",
+    }
+    assert mock_node_executor._normalize_source("web") == {"title": "web", "url": "", "type": "llm"}
+    result = NodeResult(sources=[mock_node_executor._normalize_source({"name": "marketDataContext"})])
+    assert result.sources[0].title == "marketDataContext"
+
+
 def test_resolve_handler(mock_node_executor):
     node = Node(id="test", data=NodeData(handler="finance.market_analysis"))
     assert mock_node_executor._resolve_handler(node) == "finance.market_analysis"
