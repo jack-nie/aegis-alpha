@@ -181,19 +181,25 @@ public class HelpToolGateway implements DisposableBean {
 
     /** Tail of the audit ring buffer, oldest first, at most {@code limit} entries. */
     public List<Map<String, Object>> audit(int limit) {
+        return audit(limit, null);
+    }
+
+    /**
+     * Tail of the audit entries recorded for one principal (null = every principal), oldest first,
+     * at most {@code limit} entries.
+     */
+    public List<Map<String, Object>> audit(int limit, String principal) {
         int effective = limit <= 0 ? AUDIT_CAPACITY : Math.min(limit, AUDIT_CAPACITY);
-        List<Map<String, Object>> snapshot = new ArrayList<Map<String, Object>>();
+        List<Map<String, Object>> matching = new ArrayList<Map<String, Object>>();
         synchronized (auditLock) {
-            int skip = Math.max(0, auditEntries.size() - effective);
-            int index = 0;
             for (AuditEntry entry : auditEntries) {
-                if (index++ < skip) {
-                    continue;
+                if (principal == null || principal.equals(entry.principal)) {
+                    matching.add(entry.toMap());
                 }
-                snapshot.add(entry.toMap());
             }
         }
-        return snapshot;
+        int skip = Math.max(0, matching.size() - effective);
+        return new ArrayList<Map<String, Object>>(matching.subList(skip, matching.size()));
     }
 
     public int auditSize() {

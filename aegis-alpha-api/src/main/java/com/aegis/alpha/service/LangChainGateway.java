@@ -25,6 +25,10 @@ public class LangChainGateway {
     private final String engineUrl;
     private final String provider;
     private final String defaultModel;
+    /**
+     * P2-10: model credentials live only in the orchestrator's own environment. These settings are
+     * kept for configuration compatibility (baseUrl still selects model naming) but never sent in request bodies.
+     */
     private final String apiKey;
     private final String baseUrl;
     private final String serviceToken;
@@ -137,12 +141,6 @@ public class LangChainGateway {
                                              String subject, String path, String delegatedToken) {
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("provider", provider);
-        if (apiKey != null && !apiKey.trim().isEmpty()) {
-            body.put("apiKey", apiKey);
-        }
-        if (baseUrl != null && !baseUrl.trim().isEmpty()) {
-            body.put("baseUrl", baseUrl);
-        }
         body.put("model", resolveModel(agent));
         body.put("agent", agent);
         body.put("state", state);
@@ -190,12 +188,6 @@ public class LangChainGateway {
     public String buildStreamBody(Map<String, Object> layout, String subject, Map<String, Object> inputs,
                                   String delegatedToken, String threadId, boolean requireApproval) {
         Map<String, Object> body = new LinkedHashMap<>();
-        if (apiKey != null && !apiKey.trim().isEmpty()) {
-            body.put("apiKey", apiKey);
-        }
-        if (baseUrl != null && !baseUrl.trim().isEmpty()) {
-            body.put("baseUrl", baseUrl);
-        }
         body.put("provider", provider);
         body.put("model", defaultModel);
         body.put("nodes", layout.get("nodes"));
@@ -298,12 +290,6 @@ public class LangChainGateway {
             Map<String, Object> body = new LinkedHashMap<>();
             body.put("message", message);
             body.put("workflows", workflows);
-            if (apiKey != null && !apiKey.trim().isEmpty()) {
-                body.put("apiKey", apiKey);
-            }
-            if (baseUrl != null && !baseUrl.trim().isEmpty()) {
-                body.put("baseUrl", baseUrl);
-            }
             body.put("model", defaultModel);
             HttpHeaders headers = new HttpHeaders();
             headers.setContentType(MediaType.APPLICATION_JSON);
@@ -343,9 +329,6 @@ public class LangChainGateway {
                 body.put("intent", intentEnvelope);
             }
             body.put("chunks", chunks == null ? java.util.Collections.emptyList() : chunks);
-            if (apiKey != null && !apiKey.trim().isEmpty()) {
-                body.put("apiKey", apiKey);
-            }
             body.put("model", defaultModel);
             HttpHeaders headers = new HttpHeaders();
             headers.setContentType(MediaType.APPLICATION_JSON);

@@ -114,4 +114,15 @@ class PortfolioControllerAuthTest {
 
         assertThat(controller.isReadAuthorized("Bearer " + token + "tamper")).isFalse();
     }
+
+    /* P2-21: delegated reads are attributed to the token subject. */
+    @Test
+    void delegatedReadIsAttributedToTheTokenSubject() {
+        String token = tokenService.issueServiceDelegation("run-9", "u-77", "t-1",
+                Collections.singletonList("portfolio:read"), 60_000L);
+
+        assertThat(controller.isReadAuthorized("Bearer " + token, "p-1")).isTrue();
+        assertThat(PortfolioController.delegatedSubject(tokenService.verify(token))).isEqualTo("u-77");
+        assertThat(PortfolioController.delegatedSubject(null)).isNull();
+    }
 }

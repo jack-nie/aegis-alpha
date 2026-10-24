@@ -57,6 +57,8 @@ class IntentResult(BaseModel):
     source: str = ""
     reason: str | None = None
     error: str | None = None
+    # P2-7: "OUT_OF_SCOPE" when the model declined every workflow as unrelated; else None
+    domain: str | None = None
     # Optional extras (e.g. normalized symbol); ignored by older Java consumers
     data: dict[str, Any] = Field(default_factory=dict)
 

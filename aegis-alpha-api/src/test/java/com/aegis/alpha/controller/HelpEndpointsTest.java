@@ -44,6 +44,27 @@ class HelpEndpointsTest {
         when(authService.me("Bearer ok")).thenReturn(me);
         when(authService.me(null)).thenReturn(null);
         when(authService.me("")).thenReturn(null);
+        when(authService.principal("Bearer ok")).thenReturn(new com.aegis.alpha.security.AuthenticatedPrincipal(
+                "u-1", "user", "t-1", Collections.singletonList("research_user")));
+        when(authService.principal("Bearer admin")).thenReturn(new com.aegis.alpha.security.AuthenticatedPrincipal(
+                "u-admin", "admin", "t-1", Collections.singletonList("admin")));
+    }
+
+    /* Extra (b): the audit tail is not exposed to every logged-in user. */
+    @Test
+    @SuppressWarnings("unchecked")
+    void toolsAuditShowsOnlyOwnEntriesToNonAdminsAndEverythingToAdmins() {
+        gateway.execute(HelpToolCatalog.GET_WORKFLOW_RUN, "u-1",
+                () -> Collections.<String, Object>singletonMap("run", "ok"));
+        gateway.execute(HelpToolCatalog.GET_WORKFLOW_RUN, "u-2",
+                () -> Collections.<String, Object>singletonMap("run", "ok"));
+
+        List<Map<String, Object>> own = (List<Map<String, Object>>) toolsController.tools("Bearer ok").getBody().get("audit");
+        List<Map<String, Object>> all = (List<Map<String, Object>>) toolsController.tools("Bearer admin").getBody().get("audit");
+
+        assertThat(own).hasSize(1);
+        assertThat(own.get(0).get("principal")).isEqualTo("u-1");
+        assertThat(all).extracting(entry -> entry.get("principal")).containsExactly("u-1", "u-2");
     }
 
     @Test

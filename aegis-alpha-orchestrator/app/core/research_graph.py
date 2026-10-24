@@ -36,8 +36,9 @@ def _edge(source: str, target: str) -> dict[str, str]:
     return {"source": source, "target": target}
 
 
-def _chain_edges(node_ids: list[str]) -> list[dict[str, str]]:
-    return [_edge(node_ids[i], node_ids[i + 1]) for i in range(len(node_ids) - 1)]
+def _fan_out_in_edges(source: str, specialists: list[str], sink: str) -> list[dict[str, str]]:
+    """P2-14: ``source`` fans out to every specialist in parallel; all of them fan in to ``sink``."""
+    return [_edge(source, s) for s in specialists] + [_edge(s, sink) for s in specialists]
 
 
 def _subject_prompt(template: str, subject_placeholder: str) -> str:
@@ -51,18 +52,16 @@ def build_single_name_research_layout(
     include_portfolio: bool = False,
     require_approval: bool = False,
 ) -> dict[str, Any]:
-    """Build a sequential multi-specialist single-name research layout.
+    """Build a parallel multi-specialist single-name research layout.
 
-    Topology (sequential DAG — engine-friendly equivalent of fan-in to aggregate)::
+    Topology (P2-14: parallel fan-out → fan-in; the engine defers the aggregate until every
+    specialist, including a tool-looping agent, has finished)::
 
-        start
-          → fundamentals (finance.fundamental_analysis)
-          → news (finance.industry_news)
-          → valuation (finance.valuation_analysis)
-          → risk (finance.risk_assessment)
-          → [optional portfolio_context via general.agent]
-          → aggregate (finance.stock_recommendation_aggregate)
-          → end
+        start ─┬→ fundamentals (finance.fundamental_analysis) ─┐
+               ├→ news (finance.industry_news)                 ├→ aggregate → end
+               ├→ valuation (finance.valuation_analysis)       │
+               ├→ risk (finance.risk_assessment)               │
+               └→ [optional portfolio_context, general.agent] ─┘
 
     Returns a plain dict suitable as a published workflow template.
     """
@@ -126,7 +125,7 @@ def build_single_name_research_layout(
         ),
     ]
 
-    ordered_ids = ["start", "fundamentals", "news", "valuation", "risk"]
+    parallel_ids = ["fundamentals", "news", "valuation", "risk"]
 
     if include_portfolio:
         specialists.insert(-1, "portfolio_context")
@@ -146,7 +145,7 @@ def build_single_name_research_layout(
                 agent_id="specialist_portfolio",
             )
         )
-        ordered_ids.append("portfolio_context")
+        parallel_ids.append("portfolio_context")
 
     nodes.append(
         _node(
@@ -167,16 +166,16 @@ def build_single_name_research_layout(
         )
     )
     nodes.append(_node("end", handler="end", label="End", node_type="end"))
-    ordered_ids.extend(["aggregate", "end"])
 
     return {
         "workflowKey": "stock_analysis_v2",
         "engine": "langgraph",
         "nodes": nodes,
-        "edges": _chain_edges(ordered_ids),
+        "edges": _fan_out_in_edges("start", parallel_ids, "aggregate") + [_edge("aggregate", "end")],
         "metadata": {
             "specialists": specialists,
             "pattern": "fan_in_aggregate",
+            "parallel": True,
             "subjectPlaceholder": subject_placeholder,
             "requireApproval": require_approval,
             "includePortfolio": include_portfolio,
@@ -191,23 +190,13 @@ def build_earnings_reaction_layout(
 ) -> dict[str, Any]:
     """Build an earnings-reaction research layout.
 
-    Topology::
+    Topology (parallel fan-out → fan-in)::
 
-        start
-          → market_analysis
-          → financial_interpretation
-          → industry_news
-          → stock_recommendation_aggregate
-          → end
+        start ─┬→ market_analysis          ─┐
+               ├→ financial_interpretation ─┼→ stock_recommendation_aggregate → end
+               └→ industry_news            ─┘
     """
-    ordered_ids = [
-        "start",
-        "market_analysis",
-        "financial_interpretation",
-        "industry_news",
-        "aggregate",
-        "end",
-    ]
+    parallel_ids = ["market_analysis", "financial_interpretation", "industry_news"]
     nodes = [
         _node("start", handler="start", label="Start", node_type="start"),
         _node(
@@ -265,8 +254,9 @@ def build_earnings_reaction_layout(
         "workflowKey": "earnings_reaction",
         "engine": "langgraph",
         "nodes": nodes,
-        "edges": _chain_edges(ordered_ids),
+        "edges": _fan_out_in_edges("start", parallel_ids, "aggregate") + [_edge("aggregate", "end")],
         "metadata": {
+            "parallel": True,
             "specialists": [
                 "market",
                 "financials",
@@ -287,24 +277,15 @@ def build_watchlist_digest_layout(
 ) -> dict[str, Any]:
     """Build a watchlist morning-digest layout.
 
-    Topology::
+    Topology (parallel fan-out → fan-in)::
 
-        start
-          → market_analysis
-          → industry_news
-          → risk_assessment
-          → end
+        start ─┬→ market_analysis ─┐
+               └→ industry_news   ─┴→ risk_assessment → end
 
     Uses risk_assessment as a short closing summary (no full recommendation
     aggregate) so digest runs stay lightweight.
     """
-    ordered_ids = [
-        "start",
-        "market_analysis",
-        "industry_news",
-        "risk_assessment",
-        "end",
-    ]
+    parallel_ids = ["market_analysis", "industry_news"]
     nodes = [
         _node("start", handler="start", label="Start", node_type="start"),
         _node(
@@ -347,8 +328,10 @@ def build_watchlist_digest_layout(
         "workflowKey": "watchlist_digest",
         "engine": "langgraph",
         "nodes": nodes,
-        "edges": _chain_edges(ordered_ids),
+        "edges": _fan_out_in_edges("start", parallel_ids, "risk_assessment")
+        + [_edge("risk_assessment", "end")],
         "metadata": {
+            "parallel": True,
             "specialists": ["market", "news", "risk"],
             "pattern": "watchlist_digest",
             "subjectPlaceholder": subject_placeholder,

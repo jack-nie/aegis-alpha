@@ -450,22 +450,35 @@ public class HelpService {
     /**
      * Safety refusals for approve/trade style prompts (no side-effect tools).
      */
+    /** P2-7: fixed polite decline for out-of-scope requests (no LLM call). */
+    public Map<String, Object> outOfScope(String threadId, HelpIntent.Result intent) {
+        String body = "这个问题超出了我的服务范围。我可以帮你：\n"
+                + "- 研究个股、板块或财报（例如「分析一下 NVDA」）\n"
+                + "- 解答产品使用问题（例如「如何发布工作流」）\n"
+                + "- 诊断工作流运行（附上 runId）";
+        Map<String, Object> response = buildResponse(threadId, body, intent, "help-out-of-scope",
+                HelpIntent.RouteAction.DECLINE, sourceRef("playbook", "out-of-scope", "服务范围", null), false, null);
+        response.put("ok", true);
+        response.put("escalateHuman", false);
+        return response;
+    }
+
     public Map<String, Object> safetyRefuse(String threadId, String message, HelpIntent.Result intent) {
-        String lower = message == null ? "" : message.toLowerCase(Locale.ROOT);
         String body;
-        if (containsAny(lower, "批准", "approve", "驳回推荐", "reject recommendation")) {
-            body = "我不能代为审批或驳回推荐。请打开 **推荐/审批收件箱**，核对证据后由人工操作。\n\n"
-                    + "相关说明见 playbook：如何审批。入口：`/recommendations`";
-        } else if (containsAny(lower, "下单", "买入 100", "卖出 100", "place order", "下单买入")) {
-            body = "我不能执行下单或组合写入。交易与仓位调整请在组合界面由人工完成；"
-                    + "如需研究结论，请描述标的并走研究工作流。";
-        } else if (containsAny(lower, "别人的组合", "userid=", "user_id")) {
-            body = "我不能查询其他用户的组合或私有数据。仅能在你的授权范围内只读查询。";
-        } else if (containsAny(lower, "帮我下单", "执行交易", "trade now")) {
-            body = "我不能执行下单或组合写入。交易与仓位调整请在组合界面由人工完成；"
-                    + "如需研究结论，请描述标的并走研究工作流。";
-        } else {
-            return null;
+        switch (HelpSafetyRules.classify(message)) {
+            case APPROVE_ON_BEHALF:
+                body = "我不能代为审批或驳回推荐。请打开 **推荐/审批收件箱**，核对证据后由人工操作。\n\n"
+                        + "相关说明见 playbook：如何审批。入口：`/recommendations`";
+                break;
+            case TRADE:
+                body = "我不能执行下单或组合写入。交易与仓位调整请在组合界面由人工完成；"
+                        + "如需研究结论，请描述标的并走研究工作流。";
+                break;
+            case CROSS_TENANT:
+                body = "我不能查询其他用户的组合或私有数据。仅能在你的授权范围内只读查询。";
+                break;
+            default:
+                return null;
         }
         Map<String, Object> response = buildResponse(
                 threadId,

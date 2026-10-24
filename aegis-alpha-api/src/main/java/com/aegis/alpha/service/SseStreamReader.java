@@ -15,15 +15,55 @@ public class SseStreamReader {
         void onComplete();
     }
 
+    /**
+     * Cancellation handle (P2-17/P2-19): {@link #cancel()} stops reading and closes the upstream
+     * connection. After cancellation no further handler callbacks are made.
+     */
+    public static final class Handle {
+        private volatile boolean cancelled;
+        private volatile HttpURLConnection connection;
+
+        public void cancel() {
+            cancelled = true;
+            HttpURLConnection current = connection;
+            if (current != null) {
+                try {
+                    current.disconnect();
+                } catch (Exception ignored) {
+                    // already closed
+                }
+            }
+        }
+
+        public boolean isCancelled() {
+            return cancelled;
+        }
+
+        void attach(HttpURLConnection connection) {
+            this.connection = connection;
+            if (cancelled) {
+                cancel();
+            }
+        }
+    }
+
     public static void readSse(String urlStr, String jsonBody, SseEventHandler handler) {
         readSse(urlStr, jsonBody, null, handler);
     }
 
     public static void readSse(String urlStr, String jsonBody, String authorization, SseEventHandler handler) {
+        readSse(urlStr, jsonBody, authorization, handler, null);
+    }
+
+    public static void readSse(String urlStr, String jsonBody, String authorization, SseEventHandler handler,
+                               Handle handle) {
         HttpURLConnection connection = null;
         try {
             URL url = new URL(urlStr);
             connection = (HttpURLConnection) url.openConnection();
+            if (handle != null) {
+                handle.attach(connection);
+            }
             connection.setRequestMethod("POST");
             connection.setRequestProperty("Content-Type", "application/json");
             connection.setRequestProperty("Accept", "text/event-stream");
@@ -64,6 +104,10 @@ public class SseStreamReader {
             String line;
 
             while ((line = reader.readLine()) != null) {
+                if (handle != null && handle.isCancelled()) {
+                    reader.close();
+                    return;
+                }
                 if (line.isEmpty()) {
                     if (currentData.length() > 0) {
                         handler.onEvent(currentEvent, currentData.toString().trim());
@@ -82,6 +126,10 @@ public class SseStreamReader {
                 }
             }
 
+            if (handle != null && handle.isCancelled()) {
+                reader.close();
+                return;
+            }
             if (currentData.length() > 0) {
                 handler.onEvent(currentEvent, currentData.toString().trim());
             }
@@ -89,6 +137,9 @@ public class SseStreamReader {
             handler.onComplete();
 
         } catch (Exception ex) {
+            if (handle != null && handle.isCancelled()) {
+                return;  // the disconnect we caused; not an upstream error
+            }
             handler.onError(ex);
         } finally {
             if (connection != null) {

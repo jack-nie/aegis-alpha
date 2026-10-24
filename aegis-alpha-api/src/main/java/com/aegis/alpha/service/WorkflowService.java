@@ -44,7 +44,8 @@ public class WorkflowService {
     private static final Logger log = LoggerFactory.getLogger(WorkflowService.class);
 
     /** Bump when research default graphs change so stale DB layouts are skipped on read. */
-    static final int CURRENT_RESEARCH_LAYOUT_VERSION = 2;
+    /** 3 = parallel specialist fan-out → fan-in (P2-14); older un-customised defaults are refreshed. */
+    static final int CURRENT_RESEARCH_LAYOUT_VERSION = 3;
     /** Short-lived portfolio:read delegation for orchestrator tool calls (15 minutes). */
     static final long DELEGATED_PORTFOLIO_READ_TTL_MS = 15L * 60L * 1000L;
     static final String SCOPE_PORTFOLIO_READ = "portfolio:read";
@@ -147,12 +148,17 @@ public class WorkflowService {
         mapper.deleteEditableDefinition(workflowKey);
     }
 
+    /** P2-23: default and maximum page size of the run list. */
+    static final int DEFAULT_RUN_PAGE_SIZE = 50;
+    static final int MAX_RUN_PAGE_SIZE = 200;
+
     public List<WorkflowRun> runs() {
-        List<WorkflowRun> runs = mapper.findRuns();
-        for (WorkflowRun run : runs) {
-            hydrateRunContract(run);
-        }
-        return runs;
+        return runs(null, null);
+    }
+
+    /** Unscoped page (internal/test callers). */
+    public List<WorkflowRun> runs(Integer limit, Integer offset) {
+        return hydrate(mapper.findRunsPage(null, null, true, pageLimit(limit), pageOffset(offset)));
     }
 
     /**
@@ -160,17 +166,45 @@ public class WorkflowService {
      * internal/test callers; HTTP callers always pass a principal.
      */
     public List<WorkflowRun> runsForPrincipal(AuthenticatedPrincipal principal) {
-        List<WorkflowRun> runs = runs();
+        return runsForPrincipal(principal, null, null);
+    }
+
+    /** P2-23: paged (default 50, max 200), newest first; owners are filtered in SQL so pages are exact. */
+    public List<WorkflowRun> runsForPrincipal(AuthenticatedPrincipal principal, Integer limit, Integer offset) {
         if (principal == null) {
-            return runs;
+            return runs(limit, offset);
         }
+        boolean admin = principal.hasRole("admin");
+        List<WorkflowRun> page = mapper.findRunsPage(principal.getUserId(), principal.getTenantId(), admin,
+                pageLimit(limit), pageOffset(offset));
         List<WorkflowRun> visible = new ArrayList<WorkflowRun>();
-        for (WorkflowRun run : runs) {
+        for (WorkflowRun run : page == null ? Collections.<WorkflowRun>emptyList() : page) {
             if (canAccess(run, principal)) {
                 visible.add(run);
             }
         }
-        return visible;
+        return hydrate(visible);
+    }
+
+    private List<WorkflowRun> hydrate(List<WorkflowRun> runs) {
+        if (runs == null) {
+            return new ArrayList<WorkflowRun>();
+        }
+        for (WorkflowRun run : runs) {
+            hydrateRunContract(run);
+        }
+        return runs;
+    }
+
+    static int pageLimit(Integer limit) {
+        if (limit == null || limit <= 0) {
+            return DEFAULT_RUN_PAGE_SIZE;
+        }
+        return Math.min(limit, MAX_RUN_PAGE_SIZE);
+    }
+
+    static int pageOffset(Integer offset) {
+        return offset == null || offset < 0 ? 0 : offset;
     }
 
     public WorkflowRun run(String runId) {
@@ -298,11 +332,10 @@ public class WorkflowService {
     }
 
     private Map<String, Object> lastEvent(String runId) {
-        List<WorkflowRunEvent> events = mapper.findRunEvents(runId);
-        if (events.isEmpty()) {
+        WorkflowRunEvent event = mapper.findLastRunEvent(runId);
+        if (event == null) {
             return null;
         }
-        WorkflowRunEvent event = events.get(events.size() - 1);
         Map<String, Object> result = new LinkedHashMap<String, Object>();
         result.put("eventId", event.getEventId());
         result.put("eventType", event.getEventType());
@@ -599,7 +632,7 @@ public class WorkflowService {
         mapper.insertRun(run);
         recordRunEvent(run, "RUN_CREATED", null, null, "RUNNING", "Workflow run created (streaming).", null, 0);
         String streamUrl = langChainGateway.streamWorkflowUrl();
-        String delegatedToken = issueDelegatedPortfolioReadToken(run.getRunId(), userId, tenantId, safeInputs);
+        String delegatedToken = delegatedTokenFor(run, safeInputs);
         boolean requireApproval = requireApprovalRequested(safeInputs, runLayout);
         String streamBody = langChainGateway.buildStreamBody(
                 runLayout, subject, safeInputs, delegatedToken, run.getRunId(), requireApproval);
@@ -611,10 +644,76 @@ public class WorkflowService {
         for (Map<String, Object> layoutNode : castList(runLayout.get("nodes"))) {
             streamLayoutNodes.put(nodeId(layoutNode), layoutNode);
         }
+        final SseStreamReader.Handle readerHandle = new SseStreamReader.Handle();
+        final java.util.concurrent.atomic.AtomicBoolean emitterClosed = new java.util.concurrent.atomic.AtomicBoolean(false);
+        final java.util.concurrent.atomic.AtomicBoolean clientGone = new java.util.concurrent.atomic.AtomicBoolean(false);
+        /* P2-19: the client stream ending on its own (timeout, network error, browser closed). */
+        final Runnable onClientGone = () -> {
+            if (emitterClosed.get() || !clientGone.compareAndSet(false, true)) {
+                return;
+            }
+            recordClientDisconnected(runId);
+            if (cancelStreamOnDisconnect && emitterClosed.compareAndSet(false, true)) {
+                finishStreamingAsCancelled(run, emitter, readerHandle);
+            }
+        };
+        emitter.onTimeout(onClientGone);
+        emitter.onError(ex -> onClientGone.run());
+        emitter.onCompletion(onClientGone);
         SseStreamReader.readSse(streamUrl, streamBody, langChainGateway.serviceAuthorizationHeader(),
                 new SseStreamReader.SseEventHandler() {
+            /* P2-18: every terminal or paused outcome ends the client stream exactly once. */
+            private void closeEmitter() {
+                if (emitterClosed.compareAndSet(false, true)) {
+                    try {
+                        emitter.complete();
+                    } catch (Exception ignored) {
+                        // already completed by the container
+                    }
+                }
+            }
+
+            /* P2-19: a failed send means the client went away; the run itself keeps going. */
+            private void send(org.springframework.web.servlet.mvc.method.annotation.SseEmitter.SseEventBuilder event) {
+                if (clientGone.get() || emitterClosed.get()) {
+                    return;
+                }
+                try {
+                    emitter.send(event);
+                } catch (java.io.IOException | IllegalStateException ex) {
+                    onClientGone.run();
+                }
+            }
+
+            /* P2-17: re-read before acting; a cancel requested meanwhile ends the stream as CANCELLED. */
+            private boolean stopIfCancelled() {
+                WorkflowRun latest = mapper.findRun(runId);
+                if (!isCancelRequested(latest)) {
+                    return false;
+                }
+                emitterClosed.set(true);
+                finishStreamingAsCancelled(run, emitter, readerHandle);
+                return true;
+            }
+
+            /* Terminal/paused writes only apply while the run is still RUNNING and not cancelled. */
+            private boolean writeIfRunning() {
+                if (mapper.updateRunStatusIf(run, RUNNING_ONLY, true) > 0) {
+                    return true;
+                }
+                WorkflowRun latest = mapper.findRun(runId);
+                if (isCancelRequested(latest)) {
+                    emitterClosed.set(true);
+                    finishStreamingAsCancelled(run, emitter, readerHandle);
+                }
+                return false;
+            }
+
             @Override public void onEvent(String eventName, String data) {
                 try {
+                    if (stopIfCancelled()) {
+                        return;
+                    }
                     if ("node_update".equals(eventName)) {
                         Map<String, Object> nodePayload = parseJsonMap(data);
                         WorkflowNodeRun nodeRun = upsertStreamedNodeRun(run, nodePayload, streamedNodeRuns,
@@ -624,12 +723,12 @@ public class WorkflowService {
                                 nodeRun.getStatus(), (nodeOk ? "Node completed: " : "Node failed: ") + nodeRun.getNodeName(),
                                 nodePayload, nodeRun.getSortOrder() + 1);
                         recordStreamedNodeSpan(run, nodeRun, nodePayload);
-                        emitter.send(org.springframework.web.servlet.mvc.method.annotation.SseEmitter.event().name("node_update").data(data));
+                        send(org.springframework.web.servlet.mvc.method.annotation.SseEmitter.event().name("node_update").data(data));
                     } else if ("degraded".equals(eventName)) {
                         Map<String, Object> payload = parseJsonMap(data);
                         recordRunEvent(run, "RUN_DEGRADED", null, null, "RUNNING",
                                 "Workflow run degraded (streaming).", payload, 900000);
-                        emitter.send(org.springframework.web.servlet.mvc.method.annotation.SseEmitter.event()
+                        send(org.springframework.web.servlet.mvc.method.annotation.SseEmitter.event()
                                 .name("degraded").data(data == null ? "{}" : data));
                     } else if ("human_interrupt".equals(eventName)) {
                         Map<String, Object> payload = parseJsonMap(data);
@@ -637,11 +736,15 @@ public class WorkflowService {
                         run.setControlStatus("HUMAN_INTERRUPT");
                         run.setPauseRequested(1);
                         run.setResultJson(data == null ? "{}" : data);
-                        mapper.updateRun(run);
+                        if (!writeIfRunning()) {
+                            return;
+                        }
                         recordRunEvent(run, "RUN_PAUSED", null, null, "PAUSED",
                                 "Workflow paused for human interrupt (streaming).", payload, 950000);
-                        emitter.send(org.springframework.web.servlet.mvc.method.annotation.SseEmitter.event()
+                        send(org.springframework.web.servlet.mvc.method.annotation.SseEmitter.event()
                                 .name("human_interrupt").data(data == null ? "{}" : data));
+                        /* The run waits for approval (resumed via decideApproval), not on this stream. */
+                        closeEmitter();
                     } else if ("workflow_complete".equals(eventName)) {
                         if ("HUMAN_INTERRUPT".equals(run.getControlStatus())) {
                             return;
@@ -661,12 +764,16 @@ public class WorkflowService {
                                 run.setErrorMessage("DEGRADED");
                             }
                             run.setResultJson(toJson(result));
-                            recordRunEvent(run, "RUN_DEGRADED", null, null, "COMPLETED",
-                                    "Workflow completed with degradation (streaming).", payload, 999999);
                         } else if (result != null && !result.isEmpty()) {
                             run.setResultJson(toJson(result));
                         }
-                        mapper.updateRun(run);
+                        if (!writeIfRunning()) {
+                            return;
+                        }
+                        if (degraded) {
+                            recordRunEvent(run, "RUN_DEGRADED", null, null, "COMPLETED",
+                                    "Workflow completed with degradation (streaming).", payload, 999999);
+                        }
                         recordRunEvent(run, "RUN_COMPLETED", null, null, "COMPLETED",
                                 degraded ? "Workflow run completed degraded (streaming)." : "Workflow run completed (streaming).",
                                 payload, 1000000);
@@ -674,23 +781,34 @@ public class WorkflowService {
                         String completeData = data == null || data.trim().isEmpty()
                                 ? (degraded ? "{\"ok\":true,\"degraded\":true}" : "{\"ok\":true}")
                                 : data;
-                        emitter.send(org.springframework.web.servlet.mvc.method.annotation.SseEmitter.event()
+                        send(org.springframework.web.servlet.mvc.method.annotation.SseEmitter.event()
                                 .name("workflow_complete").data(completeData));
-                        emitter.complete();
+                        closeEmitter();
                     } else if ("error".equals(eventName)) {
                         JsonNode en = objectMapper.readTree(data);
                         run.setStatus("FAILED");
                         run.setCompletedAt(now());
                         run.setErrorMessage(en.has("error") ? en.get("error").asText() : "Unknown error");
                         run.setControlStatus("FAILED");
-                        mapper.updateRun(run);
+                        if (!writeIfRunning()) {
+                            return;
+                        }
                         recordRunEvent(run, "RUN_FAILED", null, null, "FAILED", run.getErrorMessage(), null, 1000000);
-                        emitter.send(org.springframework.web.servlet.mvc.method.annotation.SseEmitter.event().name("error").data(data));
-                        emitter.complete();
+                        send(org.springframework.web.servlet.mvc.method.annotation.SseEmitter.event().name("error").data(data));
+                        closeEmitter();
                     }
                 } catch (Exception ex) {
-                    try { run.setStatus("FAILED"); run.setCompletedAt(now()); run.setControlStatus("FAILED"); mapper.updateRun(run); } catch (Exception ignored) {}
+                    try {
+                        run.setStatus("FAILED");
+                        run.setCompletedAt(now());
+                        run.setControlStatus("FAILED");
+                        writeIfRunning();
+                    } catch (Exception ignored) {
+                        // best effort
+                    }
+                    if (emitterClosed.compareAndSet(false, true)) {
                     try { emitter.completeWithError(ex); } catch (Exception ignored) {}
+                }
                 }
             }
             @Override public void onError(Exception ex) {
@@ -698,25 +816,92 @@ public class WorkflowService {
                     run.setStatus("FAILED"); run.setCompletedAt(now());
                     run.setErrorMessage("Stream error: " + ex.getMessage());
                     run.setControlStatus("FAILED");
-                    mapper.updateRun(run);
-                    recordRunEvent(run, "RUN_FAILED", null, null, "FAILED", run.getErrorMessage(), null, 1000000);
-                    emitter.send(org.springframework.web.servlet.mvc.method.annotation.SseEmitter.event().name("error").data("{\"ok\":false}"));
+                    if (writeIfRunning()) {
+                        recordRunEvent(run, "RUN_FAILED", null, null, "FAILED", run.getErrorMessage(), null, 1000000);
+                        send(org.springframework.web.servlet.mvc.method.annotation.SseEmitter.event().name("error").data("{\"ok\":false}"));
+                    }
                 } catch (Exception ignored) {}
-                try { emitter.completeWithError(ex); } catch (Exception ignored) {}
+                if (emitterClosed.compareAndSet(false, true)) {
+                    try { emitter.completeWithError(ex); } catch (Exception ignored) {}
+                }
             }
             @Override public void onComplete() {
                 WorkflowRun latest = mapper.findRun(runId);
+                if (isCancelRequested(latest)) {
+                    emitterClosed.set(true);
+                    finishStreamingAsCancelled(run, emitter, readerHandle);
+                    return;
+                }
+                /* P2-18: PAUSED / HUMAN_INTERRUPT and any other final state also end the client stream. */
                 if (latest != null && "RUNNING".equals(latest.getStatus())) {
                     latest.setStatus("COMPLETED"); latest.setCompletedAt(now());
                     latest.setControlStatus("COMPLETED");
-                    mapper.updateRun(latest);
-                    recordRunEvent(latest, "RUN_COMPLETED", null, null, "COMPLETED",
-                            "Workflow run completed (streaming stream end).", null, 1000000);
-                    materializeStreamingCompletedRun(runId, safeInputs);
+                    if (mapper.updateRunStatusIf(latest, RUNNING_ONLY, true) > 0) {
+                        recordRunEvent(latest, "RUN_COMPLETED", null, null, "COMPLETED",
+                                "Workflow run completed (streaming stream end).", null, 1000000);
+                        materializeStreamingCompletedRun(runId, safeInputs);
+                    }
                 }
+                closeEmitter();
             }
-        });
+        }, readerHandle);
         return mapper.findRun(runId);
+    }
+
+    static final List<String> RUNNING_ONLY = Collections.singletonList("RUNNING");
+
+    private void recordClientDisconnected(String runId) {
+        try {
+            WorkflowRun latest = mapper.findRun(runId);
+            if (latest != null) {
+                recordRunEvent(latest, "CLIENT_DISCONNECTED", null, null, latest.getStatus(),
+                        cancelStreamOnDisconnect
+                                ? "Streaming client disconnected; run will be cancelled."
+                                : "Streaming client disconnected; run continues in the background.",
+                        null, 990500);
+            }
+        } catch (Exception ex) {
+            log.warn("[WorkflowService] CLIENT_DISCONNECTED event failed runId={} error={}",
+                    runId, ex.getClass().getSimpleName());
+        }
+    }
+
+    private static boolean isCancelRequested(WorkflowRun run) {
+        return run != null && ((run.getCancelRequested() != null && run.getCancelRequested() == 1)
+                || "CANCEL_REQUESTED".equals(run.getControlStatus())
+                || "CANCELLED".equals(run.getStatus()));
+    }
+
+    /**
+     * End a streaming run that was cancelled while the orchestrator stream was open (P2-17).
+     * The orchestrator has no cancel API, so the upstream read is stopped (connection closed),
+     * the run is marked CANCELLED and the client stream is ended.
+     */
+    private void finishStreamingAsCancelled(WorkflowRun run, org.springframework.web.servlet.mvc.method.annotation.SseEmitter emitter,
+                                            SseStreamReader.Handle readerHandle) {
+        readerHandle.cancel();
+        WorkflowRun latest = mapper.findRun(run.getRunId());
+        if (latest != null && !"CANCELLED".equals(latest.getStatus())) {
+            latest.setStatus("CANCELLED");
+            latest.setControlStatus("CANCELLED");
+            latest.setCancelRequested(1);
+            latest.setCompletedAt(now());
+            if (mapper.updateRunStatusIf(latest, Arrays.asList("RUNNING", "PAUSED"), false) > 0) {
+                recordRunEvent(latest, "RUN_CANCELLED", null, null, "CANCELLED",
+                        "Workflow run cancelled during streaming; upstream stream reading stopped.", null, 1000000);
+            }
+        }
+        try {
+            emitter.send(org.springframework.web.servlet.mvc.method.annotation.SseEmitter.event()
+                    .name("workflow_cancelled").data("{\"ok\":false,\"cancelled\":true}"));
+        } catch (Exception ignored) {
+            // client already gone
+        }
+        try {
+            emitter.complete();
+        } catch (Exception ignored) {
+            // already completed
+        }
     }
 
     /**
@@ -804,13 +989,22 @@ public class WorkflowService {
      * Fail soft: returns null on any error so market tools still run.
      * userId: param → inputs.userId → "system"; tenantId: param → inputs.tenantId → "default".
      */
+    /**
+     * P2-21: the delegation carries the authenticated identity only (principal, or the run owner on
+     * replays/dispatch). Client-supplied {@code inputs.userId/tenantId} are ignored; without an
+     * identity no token is issued (the caller records DELEGATION_SKIPPED).
+     */
     String issueDelegatedPortfolioReadToken(String runId, String userId, String tenantId, Map<String, Object> inputs) {
         if (tokenService == null) {
             return null;
         }
+        if (!hasText(userId)) {
+            log.info("[WorkflowService] portfolio:read delegation not issued: no authenticated identity runId={}", runId);
+            return null;
+        }
         try {
-            String resolvedUserId = firstNonBlank(userId, text(inputs, "userId", null), "system");
-            String resolvedTenantId = firstNonBlank(tenantId, text(inputs, "tenantId", null), "default");
+            String resolvedUserId = userId.trim();
+            String resolvedTenantId = firstNonBlank(tenantId, null, "default");
             return tokenService.issueServiceDelegation(
                     runId,
                     resolvedUserId,
@@ -822,6 +1016,16 @@ public class WorkflowService {
                     runId, ex.getMessage());
             return null;
         }
+    }
+
+    /** Delegation for the run owner; records DELEGATION_SKIPPED when the run has no identity. */
+    private String delegatedTokenFor(WorkflowRun run, Map<String, Object> inputs) {
+        String token = issueDelegatedPortfolioReadToken(run.getRunId(), run.getUserId(), run.getTenantId(), inputs);
+        if (token == null && tokenService != null && !hasText(run.getUserId())) {
+            recordRunEvent(run, "DELEGATION_SKIPPED", null, null, run.getStatus(),
+                    "No authenticated identity; portfolio:read delegation not issued.", null, 2);
+        }
+        return token;
     }
 
     /**
@@ -988,6 +1192,14 @@ public class WorkflowService {
         return mapper.findRun(runId);
     }
 
+    /** P2-19 (待确认): stop reading and cancel the run when the SSE client goes away. */
+    @Value("${aegis.workflow.stream.cancel-on-disconnect:false}")
+    private boolean cancelStreamOnDisconnect = false;
+
+    void setCancelStreamOnDisconnect(boolean cancelStreamOnDisconnect) {
+        this.cancelStreamOnDisconnect = cancelStreamOnDisconnect;
+    }
+
     /** Roles allowed to approve/reject runs paused at the approval gate (comma separated). */
     @Value("${aegis.workflow.approver-roles:desk,admin}")
     private String approverRoles = "desk,admin";
@@ -1060,6 +1272,21 @@ public class WorkflowService {
 
         Map<String, Object> resume = langChainGateway.resumeWorkflow(run.getRunId(), approved);
         if (isResumeOk(resume)) {
+            /* P2-13 / Phase-1 leftover: nodes that ran after the approval gate are materialized
+             * as node runs + NODE_* events (same for runs started streaming or non-streaming). */
+            int resumedNodes = materializeResumeTrace(run, resume);
+            if (resumedNodes > 0) {
+                run.setNodeCount((run.getNodeCount() == null ? 0 : run.getNodeCount()) + resumedNodes);
+            }
+            if (isInterruptedAgain(resume)) {
+                run.setStatus("PAUSED");
+                run.setControlStatus("HUMAN_INTERRUPT");
+                run.setPauseRequested(1);
+                mapper.updateRun(run);
+                recordRunEvent(run, "RUN_PAUSED", null, null, "PAUSED",
+                        "Workflow paused for human approval again after resume.", null, 990000);
+                return mapper.findRun(runId);
+            }
             run.setStatus(approved ? "COMPLETED" : "REJECTED");
             run.setCompletedAt(now());
             run.setControlStatus(approved ? "COMPLETED" : "REJECTED");
@@ -1094,6 +1321,44 @@ public class WorkflowService {
                     "Human approval resume failed.", resume, 960000);
         }
         return mapper.findRun(runId);
+    }
+
+    /** Insert node runs for trace entries of the resumed graph that were not recorded before the pause. */
+    @SuppressWarnings("unchecked")
+    private int materializeResumeTrace(WorkflowRun run, Map<String, Object> resume) {
+        if (resume == null || !(resume.get("trace") instanceof List)) {
+            return 0;
+        }
+        try {
+            List<Object> trace = (List<Object>) resume.get("trace");
+            Map<String, Object> nodeOutputs = resume.get("node_outputs") instanceof Map
+                    ? (Map<String, Object>) resume.get("node_outputs") : new LinkedHashMap<String, Object>();
+            java.util.Set<String> recorded = new java.util.HashSet<String>();
+            int maxSort = 0;
+            List<WorkflowNodeRun> existing = mapper.findNodeRuns(run.getRunId());
+            if (existing != null) {
+                for (WorkflowNodeRun nodeRun : existing) {
+                    if (nodeRun.getNodeId() != null) {
+                        recorded.add(nodeRun.getNodeId());
+                    }
+                    if (nodeRun.getSortOrder() != null) {
+                        maxSort = Math.max(maxSort, nodeRun.getSortOrder());
+                    }
+                }
+            }
+            Map<String, Object> layout = layoutForRun(run.getWorkflowKey(), run.getWorkflowVersionId());
+            return materializeOrchestratorTrace(run, layout, trace, nodeOutputs, recorded, maxSort, 956000);
+        } catch (Exception ex) {
+            log.warn("[WorkflowService] resume trace materialization failed runId={} error={}",
+                    run.getRunId(), ex.getClass().getSimpleName());
+            return 0;
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private boolean isInterruptedAgain(Map<String, Object> resume) {
+        Object finalState = resume.get("final_state");
+        return finalState instanceof Map && Boolean.TRUE.equals(((Map<String, Object>) finalState).get("interrupted"));
     }
 
     private boolean isApprovalDecidedOrInFlight(WorkflowRun run) {
@@ -1205,7 +1470,7 @@ public class WorkflowService {
         state.put("workflowKey", run.getWorkflowKey());
         state.put("runId", run.getRunId());
         state.put("subject", run.getSubject());
-        String delegatedToken = issueDelegatedPortfolioReadToken(run.getRunId(), run.getUserId(), run.getTenantId(), inputs);
+        String delegatedToken = delegatedTokenFor(run, inputs);
         boolean requireApproval = requireApprovalRequested(inputs == null ? new LinkedHashMap<String, Object>() : inputs, layout);
         Map<String, Object> response = langChainGateway.executeWorkflow(
                 layout, run.getSubject(), state, delegatedToken, run.getRunId(), requireApproval);
@@ -1260,13 +1525,25 @@ public class WorkflowService {
     }
 
     /** Persist one node run + NODE_COMPLETED/NODE_FAILED event per orchestrator trace entry, in order. */
-    @SuppressWarnings("unchecked")
     private int materializeOrchestratorTrace(WorkflowRun run, Map<String, Object> layout, List<Object> trace,
                                              Map<String, Object> nodeOutputs) {
+        return materializeOrchestratorTrace(run, layout, trace, nodeOutputs, null, 0, 0);
+    }
+
+    /**
+     * Same as above. When {@code skipNodeIds} is non-null, node ids in it and repeated ids within the
+     * trace are skipped (resume path: only nodes that ran after the pause); node sort orders start
+     * after {@code sortBase}, event sequences after {@code eventBase}. Returns the number inserted.
+     */
+    @SuppressWarnings("unchecked")
+    private int materializeOrchestratorTrace(WorkflowRun run, Map<String, Object> layout, List<Object> trace,
+                                             Map<String, Object> nodeOutputs, java.util.Set<String> skipNodeIds,
+                                             int sortBase, int eventBase) {
         Map<String, Map<String, Object>> layoutNodes = new LinkedHashMap<>();
-        for (Map<String, Object> node : castList(layout.get("nodes"))) {
+        for (Map<String, Object> node : castList(layout == null ? null : layout.get("nodes"))) {
             layoutNodes.put(nodeId(node), node);
         }
+        java.util.Set<String> skip = skipNodeIds == null ? null : new java.util.HashSet<String>(skipNodeIds);
         int sort = 0;
         for (Object raw : trace) {
             if (!(raw instanceof Map)) {
@@ -1276,6 +1553,9 @@ public class WorkflowService {
             String nodeId = string(entry.get("nodeId"));
             if (nodeId == null || nodeId.isEmpty()) {
                 nodeId = string(entry.get("node_id"));
+            }
+            if (skip != null && nodeId != null && !skip.add(nodeId)) {
+                continue;
             }
             sort += 1;
             Map<String, Object> layoutNode = layoutNodes.get(nodeId);
@@ -1296,10 +1576,11 @@ public class WorkflowService {
             nodeRun.setOutputJson(toJson(output == null ? entry : output));
             nodeRun.setStartedAt(firstNonBlank(string(entry.get("startedAt")), null, now()));
             nodeRun.setCompletedAt(firstNonBlank(string(entry.get("completedAt")), null, now()));
-            nodeRun.setSortOrder(sort * 100);
+            nodeRun.setSortOrder(sortBase + sort * 100);
             mapper.insertNodeRun(nodeRun);
             recordRunEvent(run, ok ? "NODE_COMPLETED" : "NODE_FAILED", nodeRun, nodeId,
-                    ok ? "COMPLETED" : "FAILED", ok ? "Node completed." : "Node failed.", entry, sort * 100 + 1);
+                    ok ? "COMPLETED" : "FAILED", ok ? "Node completed." : "Node failed.", entry,
+                    eventBase + sort * 100 + 1);
         }
         return sort;
     }
@@ -1313,8 +1594,12 @@ public class WorkflowService {
         state.put("runId", run.getRunId());
         state.put("subject", run.getSubject());
         // Sync path: same portfolio:read delegation as streaming (fail soft)
-        String delegatedToken = issueDelegatedPortfolioReadToken(run.getRunId(), null, null, inputs);
+        String delegatedToken = delegatedTokenFor(run, inputs);
         List<String> degradedNodes = new ArrayList<>();
+        /* P2-20: each node sees the run inputs plus only what it declares (inputKeys) or its direct upstreams. */
+        Set<String> baseKeys = new HashSet<>(state.keySet());
+        Map<String, List<String>> upstream = upstreamIds(edges);
+        int retriesLeft = Math.max(0, runRetryBudget);
 
         int index = 0;
         for (Map<String, Object> node : orderedNodes) {
@@ -1340,16 +1625,17 @@ public class WorkflowService {
                 nodeRun.setMaxAttempts(maxAttempts);
                 nodeRun.setRetryPolicyJson(retryPolicy.isEmpty() ? null : toJson(retryPolicy));
                 nodeRun.setTimeoutMs(timeoutMs == 0 ? null : timeoutMs);
-                Map<String, Object> inputSnapshot = new LinkedHashMap<>(state);
-                nodeRun.setInputJson(toJson(inputSnapshot));
+                final Map<String, Object> inputSnapshot = nodeInput(node, state, baseKeys, upstream);
+                nodeRun.setInputJson(cappedInputJson(inputSnapshot));
                 nodeRun.setStartedAt(now());
                 nodeRun.setSortOrder(index * 100 + attempt);
                 mapper.insertNodeRun(nodeRun);
                 recordRunEvent(run, "NODE_STARTED", nodeRun, nodeRun.getNodeId(), "RUNNING", "Node started.", null, index * 100 + attempt * 10);
 
                 try {
-                    long started = System.currentTimeMillis();
-                    Map<String, Object> output = executeNode(node, state, run, delegatedToken);
+                    final Map<String, Object> callNode = node;
+                    Map<String, Object> output = callWithTimeout(
+                            () -> executeNode(callNode, inputSnapshot, run, delegatedToken), timeoutMs);
                     if (output != null && Boolean.FALSE.equals(output.get("ok"))) {
                         /* Orchestrator reported failure: retry per retryPolicy instead of storing it as success. */
                         Object error = output.get("error") != null ? output.get("error") : output.get("summary");
@@ -1358,10 +1644,6 @@ public class WorkflowService {
                     }
                     if (output != null && Boolean.TRUE.equals(output.get("degraded"))) {
                         degradedNodes.add(nodeId(node));
-                    }
-                    long elapsed = System.currentTimeMillis() - started;
-                    if (timeoutMs > 0 && elapsed > timeoutMs) {
-                        throw new IllegalStateException("Node timed out after " + elapsed + "ms; timeout=" + timeoutMs + "ms");
                     }
                     state.put(nodeRun.getNodeId(), output);
                     mergeOutputKeys(node, output, state);
@@ -1389,7 +1671,13 @@ public class WorkflowService {
                     mapper.updateNodeRun(nodeRun);
                     agentTraceService.recordNodeSpan(run, nodeRun, handler(node), inputSnapshot, output);
                     recordRunEvent(run, "NODE_FAILED", nodeRun, nodeRun.getNodeId(), "FAILED", ex.getMessage(), output, index * 100 + attempt * 10 + 1);
+                    if (attempt < maxAttempts && retriesLeft <= 0) {
+                        recordRunEvent(run, "RETRY_BUDGET_EXHAUSTED", nodeRun, nodeRun.getNodeId(), "FAILED",
+                                "Run retry budget exhausted; node not retried.", null, index * 100 + attempt * 10 + 2);
+                        break;
+                    }
                     if (attempt < maxAttempts) {
+                        retriesLeft -= 1;
                         recordRunEvent(run, "NODE_RETRYING", nodeRun, nodeRun.getNodeId(), "RETRYING", "Retrying node after failure.", output, index * 100 + attempt * 10 + 2);
                         sleepBackoff(backoffMs);
                     }
@@ -1421,6 +1709,127 @@ public class WorkflowService {
         }
         recordRunEvent(run, "RUN_COMPLETED", null, null, "COMPLETED", "Workflow run completed.", state, 1000000);
         cacheService.put("aegis:workflow:run:" + run.getRunId(), run, Duration.ofHours(2));
+    }
+
+    /** P2-20: cap on the stored workflow_node_run.input_json (characters). */
+    static final int MAX_NODE_INPUT_JSON_CHARS = 32000;
+    private static final String[] UPSTREAM_SUMMARY_KEYS = {"ok", "summary", "signals", "label", "confidence", "degraded"};
+
+    /** P2-20 (待确认): node retries allowed per run across all nodes (the only retry layer). */
+    @Value("${aegis.workflow.run-retry-budget:4}")
+    private int runRetryBudget = 4;
+
+    void setRunRetryBudget(int runRetryBudget) {
+        this.runRetryBudget = runRetryBudget;
+    }
+
+    private static final java.util.concurrent.ExecutorService NODE_CALL_EXECUTOR =
+            java.util.concurrent.Executors.newCachedThreadPool(runnable -> {
+                Thread thread = new Thread(runnable, "workflow-node-call");
+                thread.setDaemon(true);
+                return thread;
+            });
+
+    private static Map<String, List<String>> upstreamIds(List<Map<String, Object>> edges) {
+        Map<String, List<String>> upstream = new HashMap<>();
+        for (Map<String, Object> edge : edges) {
+            Object source = edge.get("source");
+            Object target = edge.get("target");
+            if (source == null || target == null) {
+                continue;
+            }
+            List<String> sources = upstream.get(String.valueOf(target));
+            if (sources == null) {
+                sources = new ArrayList<>();
+                upstream.put(String.valueOf(target), sources);
+            }
+            sources.add(String.valueOf(source));
+        }
+        return upstream;
+    }
+
+    /**
+     * Input for one node: run inputs (workflowKey/runId/subject and the request inputs), plus the
+     * state keys the node declares in {@code inputKeys}; without a declaration, a compact view
+     * (summary/signals/...) of each direct upstream output. Keeps the request size independent of chain length.
+     */
+    @SuppressWarnings("unchecked")
+    Map<String, Object> nodeInput(Map<String, Object> node, Map<String, Object> state, Set<String> baseKeys,
+                                  Map<String, List<String>> upstream) {
+        Map<String, Object> input = new LinkedHashMap<>();
+        for (String key : baseKeys) {
+            if (state.containsKey(key)) {
+                input.put(key, state.get(key));
+            }
+        }
+        Object declared = data(node).get("inputKeys");
+        if (!(declared instanceof List) || ((List<Object>) declared).isEmpty()) {
+            declared = data(node).get("input_keys");
+        }
+        if (declared instanceof List && !((List<Object>) declared).isEmpty()) {
+            for (Object key : (List<Object>) declared) {
+                if (key != null && state.containsKey(String.valueOf(key))) {
+                    input.put(String.valueOf(key), state.get(String.valueOf(key)));
+                }
+            }
+            return input;
+        }
+        List<String> sources = upstream.get(nodeId(node));
+        if (sources != null) {
+            for (String source : sources) {
+                Object value = state.get(source);
+                if (value instanceof Map) {
+                    Map<String, Object> compact = new LinkedHashMap<>();
+                    for (String key : UPSTREAM_SUMMARY_KEYS) {
+                        if (((Map<String, Object>) value).containsKey(key)) {
+                            compact.put(key, ((Map<String, Object>) value).get(key));
+                        }
+                    }
+                    input.put(source, compact);
+                } else if (value != null) {
+                    input.put(source, value);
+                }
+            }
+        }
+        return input;
+    }
+
+    /** Stored input_json is capped; an oversized snapshot keeps only its keys and size. */
+    String cappedInputJson(Map<String, Object> input) {
+        String json = toJson(input);
+        if (json == null || json.length() <= MAX_NODE_INPUT_JSON_CHARS) {
+            return json;
+        }
+        Map<String, Object> marker = new LinkedHashMap<>();
+        marker.put("truncated", true);
+        marker.put("originalChars", json.length());
+        marker.put("keys", new ArrayList<>(input.keySet()));
+        return toJson(marker);
+    }
+
+    /** Enforce the node timeout for real: the call is abandoned (interrupted) once timeoutMs elapses. */
+    private static Map<String, Object> callWithTimeout(java.util.concurrent.Callable<Map<String, Object>> call,
+                                                       int timeoutMs) throws Exception {
+        if (timeoutMs <= 0) {
+            return call.call();
+        }
+        java.util.concurrent.Future<Map<String, Object>> future = NODE_CALL_EXECUTOR.submit(call);
+        try {
+            return future.get(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS);
+        } catch (java.util.concurrent.TimeoutException ex) {
+            future.cancel(true);
+            throw new IllegalStateException("Node timed out; timeout=" + timeoutMs + "ms");
+        } catch (java.util.concurrent.ExecutionException ex) {
+            Throwable cause = ex.getCause();
+            if (cause instanceof Exception) {
+                throw (Exception) cause;
+            }
+            throw ex;
+        } catch (InterruptedException ex) {
+            future.cancel(true);
+            Thread.currentThread().interrupt();
+            throw new WorkflowStoppedException("CANCELLED");
+        }
     }
 
     private void enforceRunControl(WorkflowRun run) {
@@ -1871,22 +2280,22 @@ public class WorkflowService {
     private List<Map<String, Object>> stockAnalysisNodes() {
         List<Map<String, Object>> nodes = new ArrayList<>();
         nodes.add(flowNode("start", "Start", "start", 80, 260, "scheduler.manual", null));
-        nodes.add(flowNode("fundamentals", "Fundamentals", "agent", 320, 260, "finance.fundamental_analysis", null));
-        nodes.add(flowNode("news", "Industry News", "agent", 560, 260, "finance.industry_news", null));
-        nodes.add(flowNode("valuation", "Valuation", "agent", 800, 260, "finance.valuation_analysis", null));
-        nodes.add(flowNode("risk", "Risk Assessment", "agent", 1040, 260, "finance.risk_assessment", null));
-        nodes.add(flowNode("aggregate", "Recommendation Aggregate", "agent", 1280, 260, "finance.stock_recommendation_aggregate", null));
-        nodes.add(flowNode("end", "End", "end", 1520, 260, "workflow.end", null));
+        nodes.add(flowNode("fundamentals", "Fundamentals", "agent", 340, 80, "finance.fundamental_analysis", null));
+        nodes.add(flowNode("news", "Industry News", "agent", 340, 200, "finance.industry_news", null));
+        nodes.add(flowNode("valuation", "Valuation", "agent", 340, 320, "finance.valuation_analysis", null));
+        nodes.add(flowNode("risk", "Risk Assessment", "agent", 340, 440, "finance.risk_assessment", null));
+        nodes.add(flowNode("aggregate", "Recommendation Aggregate", "agent", 620, 260, "finance.stock_recommendation_aggregate", null));
+        nodes.add(flowNode("end", "End", "end", 880, 260, "workflow.end", null));
         return nodes;
     }
 
     private List<Map<String, Object>> stockAnalysisEdges() {
         List<Map<String, Object>> edges = new ArrayList<>();
-        edges.add(edge("start", "fundamentals"));
-        edges.add(edge("fundamentals", "news"));
-        edges.add(edge("news", "valuation"));
-        edges.add(edge("valuation", "risk"));
-        edges.add(edge("risk", "aggregate"));
+        /* Parallel specialists fan in to the aggregate (orchestrator defers the join). */
+        for (String specialist : Arrays.asList("fundamentals", "news", "valuation", "risk")) {
+            edges.add(edge("start", specialist));
+            edges.add(edge(specialist, "aggregate"));
+        }
         edges.add(edge("aggregate", "end"));
         return edges;
     }
@@ -2115,19 +2524,19 @@ public class WorkflowService {
     private List<Map<String, Object>> earningsReactionNodes() {
         List<Map<String, Object>> nodes = new ArrayList<>();
         nodes.add(flowNode("start", "Start", "start", 80, 260, "scheduler.manual", null));
-        nodes.add(flowNode("market_analysis", "Market Reaction", "agent", 320, 260, "finance.market_analysis", null));
-        nodes.add(flowNode("financial_interpretation", "Earnings Interpretation", "agent", 560, 260, "finance.financial_interpretation", null));
-        nodes.add(flowNode("industry_news", "Industry & Guidance News", "agent", 800, 260, "finance.industry_news", null));
-        nodes.add(flowNode("aggregate", "Earnings Recommendation", "agent", 1040, 260, "finance.stock_recommendation_aggregate", null));
-        nodes.add(flowNode("end", "End", "end", 1280, 260, "workflow.end", null));
+        nodes.add(flowNode("market_analysis", "Market Reaction", "agent", 340, 140, "finance.market_analysis", null));
+        nodes.add(flowNode("financial_interpretation", "Earnings Interpretation", "agent", 340, 260, "finance.financial_interpretation", null));
+        nodes.add(flowNode("industry_news", "Industry & Guidance News", "agent", 340, 380, "finance.industry_news", null));
+        nodes.add(flowNode("aggregate", "Earnings Recommendation", "agent", 620, 260, "finance.stock_recommendation_aggregate", null));
+        nodes.add(flowNode("end", "End", "end", 880, 260, "workflow.end", null));
         return nodes;
     }
     private List<Map<String, Object>> earningsReactionEdges() {
         List<Map<String, Object>> edges = new ArrayList<>();
-        edges.add(edge("start", "market_analysis"));
-        edges.add(edge("market_analysis", "financial_interpretation"));
-        edges.add(edge("financial_interpretation", "industry_news"));
-        edges.add(edge("industry_news", "aggregate"));
+        for (String specialist : Arrays.asList("market_analysis", "financial_interpretation", "industry_news")) {
+            edges.add(edge("start", specialist));
+            edges.add(edge(specialist, "aggregate"));
+        }
         edges.add(edge("aggregate", "end"));
         return edges;
     }
@@ -2136,17 +2545,18 @@ public class WorkflowService {
     private List<Map<String, Object>> watchlistDigestNodes() {
         List<Map<String, Object>> nodes = new ArrayList<>();
         nodes.add(flowNode("start", "Start", "start", 80, 260, "scheduler.manual", null));
-        nodes.add(flowNode("market_analysis", "Watchlist Market Snapshot", "agent", 320, 260, "finance.market_analysis", null));
-        nodes.add(flowNode("industry_news", "Watchlist News", "agent", 560, 260, "finance.industry_news", null));
-        nodes.add(flowNode("risk_assessment", "Digest Risk Summary", "agent", 800, 260, "finance.risk_assessment", null));
-        nodes.add(flowNode("end", "End", "end", 1040, 260, "workflow.end", null));
+        nodes.add(flowNode("market_analysis", "Watchlist Market Snapshot", "agent", 340, 180, "finance.market_analysis", null));
+        nodes.add(flowNode("industry_news", "Watchlist News", "agent", 340, 340, "finance.industry_news", null));
+        nodes.add(flowNode("risk_assessment", "Digest Risk Summary", "agent", 620, 260, "finance.risk_assessment", null));
+        nodes.add(flowNode("end", "End", "end", 880, 260, "workflow.end", null));
         return nodes;
     }
     private List<Map<String, Object>> watchlistDigestEdges() {
         List<Map<String, Object>> edges = new ArrayList<>();
-        edges.add(edge("start", "market_analysis"));
-        edges.add(edge("market_analysis", "industry_news"));
-        edges.add(edge("industry_news", "risk_assessment"));
+        for (String specialist : Arrays.asList("market_analysis", "industry_news")) {
+            edges.add(edge("start", specialist));
+            edges.add(edge(specialist, "risk_assessment"));
+        }
         edges.add(edge("risk_assessment", "end"));
         return edges;
     }

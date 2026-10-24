@@ -2,13 +2,34 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from .workflow import Node, Edge, AgentTemplate
 
+logger = logging.getLogger(__name__)
 
-class WorkflowRequest(BaseModel):
+
+class _IgnoresRequestCredentials(BaseModel):
+    """P2-10: ``apiKey`` / ``baseUrl`` are still accepted on the wire for backward compatibility, but
+    are never used: the orchestrator only uses its own configured credentials. A warning (without
+    the values) is logged when a caller still sends them, then the fields are cleared."""
+
+    @model_validator(mode="after")
+    def _drop_request_credentials(self):
+        sent = [name for name in ("api_key", "base_url") if getattr(self, name, None)]
+        if sent:
+            logger.warning(
+                "Ignoring request-level credentials %s on %s; using orchestrator configuration",
+                sent, type(self).__name__,
+            )
+            for name in sent:
+                object.__setattr__(self, name, None)
+        return self
+
+
+class WorkflowRequest(_IgnoresRequestCredentials):
     """Request for workflow execution."""
 
     nodes: list[Node] = Field(default_factory=list)
@@ -28,7 +49,7 @@ class WorkflowRequest(BaseModel):
         populate_by_name = True
 
 
-class NodeRequest(BaseModel):
+class NodeRequest(_IgnoresRequestCredentials):
     """Request for single node execution."""
 
     node: Node = Field(default_factory=lambda: Node(id="inline"))
@@ -45,7 +66,7 @@ class NodeRequest(BaseModel):
         populate_by_name = True
 
 
-class IntentRequest(BaseModel):
+class IntentRequest(_IgnoresRequestCredentials):
     """Request for intent classification."""
 
     message: str = ""
