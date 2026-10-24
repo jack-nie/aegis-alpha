@@ -7,7 +7,7 @@ is never rewritten, so checkpoints keep the full tool results.
    replaced by a one-line marker that keeps the tool name, the original size and every evidence id.
 2. If the estimate still exceeds ``max_agent_tokens``, a deterministic compaction pass runs: every
    ToolMessage except the latest one is reduced to its marker and older AI texts are clipped.
-   (Adjusted from the review: no extra summarising LLM call — 待确认 whether an LLM summary is wanted.)
+   (Adjusted from the review: no extra summarising LLM call — decision D1: rule-based compaction kept.)
 3. A provider context-overflow error triggers one forced compaction and a single retry
    (``is_context_overflow`` + ``compact``), handled by ``LLMClient.invoke_agent_with_tools``.
 
@@ -47,7 +47,7 @@ class ContextPolicy:
 
     @classmethod
     def from_settings(cls, settings: Any, context_window: int | None = None) -> "ContextPolicy":
-        """Settings-driven policy (all defaults 待确认). A registry context window caps the budget at 60%."""
+        """Settings-driven policy (defaults kept, decision D1). A registry context window caps the budget at 60%."""
         keep = _int(getattr(settings, "agent_keep_recent_tool_results", 4), 4, minimum=1)
         budget = _int(getattr(settings, "agent_max_context_tokens", 12000), 12000, minimum=1000)
         if context_window:

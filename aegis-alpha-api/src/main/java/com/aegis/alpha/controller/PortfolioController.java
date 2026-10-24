@@ -47,7 +47,7 @@ public class PortfolioController {
 
     /**
      * P2-21: a delegated read is audited with the token subject (uid), run and portfolio.
-     * There is no portfolio ownership model yet, so the subject is logged, not enforced (待确认).
+     * There is no portfolio ownership model yet, so the subject is logged, not enforced (decision: kept; needs an ownership model first).
      */
     boolean isReadAuthorized(String authorization, String portfolioId) {
         if (authorization == null) {

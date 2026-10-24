@@ -76,7 +76,7 @@ class Settings(BaseSettings):
     tool_result_max_chars: int = Field(default=6000, alias="AEGIS_ALPHA_TOOL_RESULT_MAX_CHARS")
     tool_result_max_items: int = Field(default=20, alias="AEGIS_ALPHA_TOOL_RESULT_MAX_ITEMS")
 
-    # P4-8 agent-loop context transform (待确认): verbatim recent tool results and the per-call budget
+    # P4-8 agent-loop context transform (decision D1: kept): verbatim recent tool results and the per-call budget
     # (capped at 60% of the registry contextWindow when one is configured).
     agent_keep_recent_tool_results: int = Field(default=4, alias="AEGIS_ALPHA_AGENT_KEEP_RECENT_TOOL_RESULTS")
     agent_max_context_tokens: int = Field(default=12000, alias="AEGIS_ALPHA_AGENT_MAX_CONTEXT_TOKENS")
@@ -100,7 +100,7 @@ class Settings(BaseSettings):
         default="completed,cancelled,failed", alias="AEGIS_ALPHA_WORKFLOW_CLEANUP_OUTCOMES"
     )
     # Agent-loop message queue (steering / follow-up, modeled on pi-mono's dual loop).
-    # Defaults are 待确认 (pending product confirmation); see 消息排队实现说明.md.
+    # Defaults kept (decision D1); see 消息排队实现说明.md.
     # P4-16: backend selection (docs/多副本设计.md). Only sqlite/memory and memory are installed;
     # postgres/redis are recognised but fail at startup: decision D9 adds no new infra dependencies.
     checkpointer_backend: str = Field(default="sqlite", alias="AEGIS_ALPHA_CHECKPOINTER_BACKEND")
@@ -124,7 +124,7 @@ class Settings(BaseSettings):
         default=16, alias="AEGIS_ALPHA_MESSAGE_QUEUE_MAX_DELIVERIES"
     )
     # P4-11: default off (pi HEAD removed skipping; tool calls of one message run concurrently and
-    # steering is delivered after the batch). 待确认 with product.
+    # steering is delivered after the batch). Kept (decision D1).
     message_queue_skip_remaining_tools: bool = Field(
         default=False, alias="AEGIS_ALPHA_MESSAGE_QUEUE_SKIP_REMAINING_TOOLS"
     )

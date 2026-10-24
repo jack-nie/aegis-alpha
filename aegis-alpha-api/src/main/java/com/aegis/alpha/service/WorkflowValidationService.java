@@ -19,7 +19,7 @@ import java.util.Set;
 
 @Service
 public class WorkflowValidationService {
-    /** Max characters for user-authored data.prompt / data.systemPrompt (待确认: default 8000). */
+    /** Max characters for user-authored data.prompt / data.systemPrompt (decision D1, kept: default 8000). */
     @Value("${aegis.workflow.max-prompt-chars:8000}")
     private int maxPromptChars = 8000;
 

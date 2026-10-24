@@ -65,7 +65,7 @@ final class WorkflowApprovalService {
      *       so the orchestrator is resumed at most once; repeated submissions for an already
      *       decided run return its current state.</li>
      *   <li>Approval completes the run ({@code COMPLETED}); rejection ends it as {@code REJECTED}
-     *       (status name 待确认 with product) and the orchestrator skips the aggregate node.</li>
+     *       (status name kept: decision D1) and the orchestrator skips the aggregate node.</li>
      *   <li>A failed resume returns the run to {@code HUMAN_INTERRUPT} so it can be retried.</li>
      * </ul>
      *

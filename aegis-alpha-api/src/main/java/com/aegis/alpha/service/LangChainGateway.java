@@ -651,7 +651,7 @@ public class LangChainGateway {
     }
 
     /*
-     * P4-4 (plan B, 待确认): /execute-workflow and /resume-workflow run the whole graph synchronously, bounded
+     * P4-4 (plan B, decision D1: kept): /execute-workflow and /resume-workflow run the whole graph synchronously, bounded
      * by the orchestrator's AEGIS_ALPHA_WORKFLOW_TIMEOUT_SECONDS (900s). Their read timeout is that budget
      * plus 30s, instead of the per-node read-timeout-ms, so a long run is no longer abandoned (and left
      * running on the orchestrator) while Java marks it FAILED.

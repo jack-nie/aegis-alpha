@@ -719,7 +719,7 @@ public class ChatService {
      * Active-run message queue (steer / follow_up)
      * ================================================================ */
 
-    /** Default delivery for chat messages sent while the thread's run is RUNNING (待确认 with product). */
+    /** Default delivery for chat messages sent while the thread's run is RUNNING (decision D1: kept). */
     static final String DEFAULT_ACTIVE_RUN_DELIVERY = WorkflowService.QUEUE_KIND_FOLLOW_UP;
 
     private static final Set<String> QUEUE_FALLBACK_CODES = new HashSet<String>(Arrays.asList(
@@ -1019,7 +1019,7 @@ public class ChatService {
     }
 
     static final String COPILOT_CHAT_STATE_KEY = "copilotChat";
-    /** P4-12 (待确认): recent turns replayed verbatim; older ones are folded into a summary. */
+    /** P4-12 (decision D1: kept): recent turns replayed verbatim; older ones are folded into a summary. */
     static final int COPILOT_HISTORY_TURNS = 12;
     static final int COPILOT_HISTORY_SUMMARY_SCAN = 24;
     static final int COPILOT_HISTORY_TURN_MAX_CHARS = 1500;
@@ -1029,7 +1029,7 @@ public class ChatService {
     /**
      * P4-12: {@code {message, history:[{role,content}], historySummary}} for the copilot. The current
      * user message (already persisted at the start of the chat turn) is excluded from history. Older messages
-     * become a deterministic extractive summary (no extra LLM call; an LLM summary is 待确认).
+     * become a deterministic extractive summary (no extra LLM call; no LLM summary, decision D1).
      */
     Map<String, Object> copilotChat(String threadId, String message) {
         Map<String, Object> chat = new LinkedHashMap<String, Object>();

@@ -45,7 +45,7 @@ aegis:
     # When true, stale versioned layouts (research + digest keys, layoutVersion < 4) are async-written back to DB after read-path refresh.
     # Read-path version check always applies for research keys regardless of this flag.
     refresh-default-layouts: ${AEGIS_ALPHA_REFRESH_DEFAULT_LAYOUTS:false}
-    # Roles allowed to approve/reject runs paused at the approval gate (待确认: seed users only have
+    # Roles allowed to approve/reject runs paused at the approval gate (decision D1, kept: seed users only have
     # portfolio_manager/research_user; add e.g. portfolio_manager here if they should approve).
     approver-roles: ${AEGIS_ALPHA_APPROVER_ROLES:desk,admin}
     # User-authored layout limits: prompt/systemPrompt max length (decided: 8000).
@@ -53,7 +53,7 @@ aegis:
     # Decision D4: empty = use aegis.models.allowed-names (registry list); a value may only narrow it
     # (names outside it fail startup).
     allowed-model-names: ${AEGIS_ALPHA_WORKFLOW_ALLOWED_MODEL_NAMES:}
-    # 待确认: node retries allowed per run across all nodes (java-fallback node loop; the only retry layer).
+    # Decision D1 (kept): node retries allowed per run across all nodes (java-fallback node loop; the only retry layer).
     run-retry-budget: ${AEGIS_ALPHA_WORKFLOW_RUN_RETRY_BUDGET:4}
     # Bounded workflow executor (streaming runs, async starts).
     executor:
@@ -61,7 +61,7 @@ aegis:
       max-size: ${AEGIS_ALPHA_WORKFLOW_EXECUTOR_MAX:16}
       queue-capacity: ${AEGIS_ALPHA_WORKFLOW_EXECUTOR_QUEUE:200}
     stream:
-      # 待确认: when the browser disconnects, false = keep consuming the orchestrator stream so the run
+      # Decision D1 (kept): when the browser disconnects, false = keep consuming the orchestrator stream so the run
       # finishes and is recorded (CLIENT_DISCONNECTED event); true = stop reading and cancel the run.
       cancel-on-disconnect: ${AEGIS_ALPHA_WORKFLOW_STREAM_CANCEL_ON_DISCONNECT:false}
   models:
@@ -70,7 +70,7 @@ aegis:
     # (ModelRegistryConsistencyTest / test_model_registry_consistency.py enforce it).
     allowed-names: ${AEGIS_ALPHA_ALLOWED_MODEL_NAMES:deepseek-v4-flash,deepseek-v4-pro}
   agent:
-    # P3-16 (待确认): default model for agents / inline workflow agents without an explicit modelName.
+    # P3-16 (decision D1: kept): default model for agents / inline workflow agents without an explicit modelName.
     # Defaults to the orchestrator gateway model so one env var changes both.
     default-model: ${AEGIS_AGENT_DEFAULT_MODEL:${AEGIS_ALPHA_LANGCHAIN_MODEL:deepseek-v4-flash}}
   langchain:
@@ -82,7 +82,7 @@ aegis:
     base-url: ${AEGIS_ALPHA_LANGCHAIN_BASE_URL:${OPENAI_BASE_URL:}}
     connect-timeout-ms: ${AEGIS_ALPHA_LANGCHAIN_CONNECT_TIMEOUT_MS:5000}
     read-timeout-ms: ${AEGIS_ALPHA_LANGCHAIN_READ_TIMEOUT_MS:120000}
-    # P4-4 (待确认): read timeout of the synchronous whole-run calls (/execute-workflow, /resume-workflow);
+    # P4-4 (decision D1: kept): read timeout of the synchronous whole-run calls (/execute-workflow, /resume-workflow);
     # keep it at the orchestrator AEGIS_ALPHA_WORKFLOW_TIMEOUT_SECONDS (900s) + 30s.
     workflow-read-timeout-ms: ${AEGIS_ALPHA_LANGCHAIN_WORKFLOW_READ_TIMEOUT_MS:930000}
   router:
