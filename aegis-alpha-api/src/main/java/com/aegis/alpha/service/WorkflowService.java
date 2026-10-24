@@ -1767,7 +1767,10 @@ public class WorkflowService {
     private void execute(WorkflowRun run, Map<String, Object> inputs, Map<String, Object> layout) throws Exception {
         List<Map<String, Object>> nodes = castList(layout.get("nodes"));
         List<Map<String, Object>> edges = castList(layout.get("edges"));
+        /* P3-15: fail fast on graphs the Java fallback cannot run faithfully instead of silently skipping. */
+        validateFallbackNodes(nodes);
         List<Map<String, Object>> orderedNodes = executionOrder(nodes, edges);
+        recordUnevaluatedConditions(run, orderedNodes);
         Map<String, Object> state = new LinkedHashMap<>(inputs);
         state.put("workflowKey", run.getWorkflowKey());
         state.put("runId", run.getRunId());
@@ -2123,6 +2126,9 @@ public class WorkflowService {
             result.put("handler", handler);
             result.put("summary", simulatedNodeMessage(type, handler, run.getSubject()));
             result.put("message", result.get("summary"));
+            if ("condition".equals(type)) {
+                result.put("evaluated", false);
+            }
             result.put("ok", true);
             return result;
         }
@@ -2134,11 +2140,56 @@ public class WorkflowService {
         if ("start".equals(type) || "end".equals(type) || "condition".equals(type)) {
             return true;
         }
-        if (handler == null) {
-            return true;
+        // Only truly deterministic control-flow handlers skip LLM. handler(node) never returns null
+        // (it falls back to functionName/nodeType); nodes without any executable definition are
+        // rejected up front by validateFallbackNodes (P3-15) instead of being skipped here.
+        return "workflow.end".equals(handler) || "scheduler.manual".equals(handler) || "scheduler.daily".equals(handler);
+    }
+
+    static final String CONDITION_NOT_EVALUATED_MESSAGE =
+            "Condition not evaluated by the Java fallback engine; all downstream branches run.";
+
+    /**
+     * P3-15: a non start/end/condition node needs a handler, functionName, agentId or prompt; otherwise
+     * the Java fallback would send a bare node type to the gateway. Rejected as a validation error.
+     */
+    void validateFallbackNodes(List<Map<String, Object>> nodes) {
+        List<String> invalid = new ArrayList<>();
+        for (Map<String, Object> node : nodes) {
+            String type = nodeType(node);
+            if ("start".equals(type) || "end".equals(type) || "condition".equals(type)) {
+                continue;
+            }
+            Map<String, Object> data = data(node);
+            boolean executable = !text(data, "handler", "").isEmpty()
+                    || !text(data, "functionName", "").isEmpty()
+                    || !text(data, "agentId", "").isEmpty()
+                    || !text(data, "prompt", "").isEmpty()
+                    || !text(data, "systemPrompt", "").isEmpty();
+            if (!executable) {
+                invalid.add(nodeId(node));
+            }
         }
-        // Only truly deterministic control-flow handlers skip LLM
-        return handler.equals("workflow.end") || handler.equals("scheduler.manual") || handler.equals("scheduler.daily");
+        if (!invalid.isEmpty()) {
+            throw new IllegalArgumentException("Workflow validation failed: nodes without handler: " + invalid);
+        }
+    }
+
+    private void recordUnevaluatedConditions(WorkflowRun run, List<Map<String, Object>> orderedNodes) {
+        List<String> conditions = new ArrayList<>();
+        for (Map<String, Object> node : orderedNodes) {
+            if ("condition".equals(nodeType(node))) {
+                conditions.add(nodeId(node));
+            }
+        }
+        if (conditions.isEmpty()) {
+            return;
+        }
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("nodes", conditions);
+        payload.put("engine", ENGINE_JAVA_FALLBACK);
+        recordRunEvent(run, "CONDITION_NOT_EVALUATED", null, null, "RUNNING",
+                CONDITION_NOT_EVALUATED_MESSAGE, payload, 50);
     }
 
     private AgentTemplate resolveAgent(Map<String, Object> node) {
@@ -2164,7 +2215,7 @@ public class WorkflowService {
             return "Workflow started for " + subject;
         }
         if ("condition".equals(type)) {
-            return "Condition evaluated as pass.";
+            return CONDITION_NOT_EVALUATED_MESSAGE;
         }
         if ("end".equals(type)) {
             return "Workflow completed.";
@@ -2196,7 +2247,7 @@ public class WorkflowService {
         }
     }
 
-    private List<Map<String, Object>> executionOrder(List<Map<String, Object>> nodes, List<Map<String, Object>> edges) {
+    List<Map<String, Object>> executionOrder(List<Map<String, Object>> nodes, List<Map<String, Object>> edges) {
         if (nodes.isEmpty() || edges.isEmpty()) {
             return nodes;
         }
@@ -2239,7 +2290,8 @@ public class WorkflowService {
             }
         }
         if (ordered.size() != nodes.size()) {
-            return nodes;
+            /* P3-15: previously fell back to declaration order silently. */
+            throw new IllegalArgumentException("Workflow validation failed: graph contains a cycle.");
         }
         return ordered;
     }
