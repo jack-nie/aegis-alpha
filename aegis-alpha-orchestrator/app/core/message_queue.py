@@ -140,7 +140,7 @@ class MessageQueueSettings:
     max_pending_per_kind: int = 8
     max_message_chars: int = 4000
     max_deliveries_per_run: int = 16
-    skip_remaining_tools: bool = True
+    skip_remaining_tools: bool = False  # P4-11: pi HEAD batch semantics (待确认)
     max_threads: int = 1000
 
     def __post_init__(self) -> None:
@@ -160,7 +160,7 @@ class MessageQueueSettings:
             max_pending_per_kind=int(getattr(settings, "message_queue_max_pending", 8)),
             max_message_chars=int(getattr(settings, "message_queue_max_chars", 4000)),
             max_deliveries_per_run=int(getattr(settings, "message_queue_max_deliveries", 16)),
-            skip_remaining_tools=bool(getattr(settings, "message_queue_skip_remaining_tools", True)),
+            skip_remaining_tools=bool(getattr(settings, "message_queue_skip_remaining_tools", False)),
             max_threads=int(getattr(settings, "message_queue_max_threads", 1000)),
         )
 
@@ -185,6 +185,8 @@ class ThreadMessageQueue:
         self.state = STATE_ACTIVE
         self.delivered = 0
         self.skipped_tool_calls = 0
+        # P4-11: which agent took which queued message (lets Java write answers back to chat).
+        self.deliveries: list[dict[str, Any]] = []
         self.undelivered: list[QueuedMessage] = []
         self.close_reason: str | None = None
         # Agent node ids that can drain this run's messages (None = unknown, accept any).
@@ -336,6 +338,8 @@ class ThreadMessageQueue:
             q.clear()
             q.extend(kept)
             self.delivered += len(out)
+            for m in out:
+                self.deliveries.append({"id": m.id, "kind": m.kind, "nodeId": node_id})
             remaining = self._pending_counts_locked()
         self.emit(
             "message_dequeued",
@@ -390,6 +394,7 @@ class ThreadMessageQueue:
                 "pending": self._pending_counts_locked(),
                 "delivered": self.delivered,
                 "skippedToolCalls": self.skipped_tool_calls,
+                "deliveries": list(self.deliveries),
                 "undelivered": [m.to_dict() for m in self.undelivered],
                 "closeReason": self.close_reason,
                 "receivers": None if self._receivers is None

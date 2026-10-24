@@ -100,6 +100,16 @@ def _streaming_active() -> bool:
         return False
 
 
+def _current_run_queue() -> Any:
+    """The run's message queue inside a node, or None (no queue / outside a runnable context)."""
+    try:
+        from langgraph.config import get_config
+
+        return queue_from_config(get_config())
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _with_stream_v2(config: dict[str, Any]) -> dict[str, Any]:
     return {**config, "configurable": {**(config.get("configurable") or {}), CONFIG_STREAM_KEY: _STREAM_V2_ON}}
 # Max agent→tools→agent iterations per specialist node (avoids infinite tool loops).
@@ -1568,6 +1578,15 @@ class WorkflowEngine:
                 )
 
             delta_kwargs["on_delta"] = _on_delta
+        # P4-11 (pi runLoop L185): steering queued before the first LLM call is delivered to that
+        # first request instead of waiting for the first tool batch / inbox.
+        first_turn_steering: list[Any] = []
+        if not mid_tool_loop:
+            queue = _current_run_queue()
+            if queue is not None and queue.has_steering(node_id=node.id):
+                first_turn_steering = to_human_messages(queue.drain("steer", node_id=node.id))
+        if first_turn_steering:
+            delta_kwargs["leading_messages"] = first_turn_steering
         agent_result = await self._node_executor.invoke_agent_with_tools(
             node=node,
             state=final_state,
@@ -1577,6 +1596,8 @@ class WorkflowEngine:
             force_final=force_final,
             **delta_kwargs,
         )
+        if first_turn_steering:
+            agent_result.leading_messages = first_turn_steering
 
         if agent_result.has_tool_calls and not force_final:
             next_round = current_round + 1
@@ -1686,7 +1707,7 @@ class WorkflowEngine:
 
         # A turn shaped by queued user messages is user-specific: never write it to the
         # shared per-ticker cache.
-        steered = any(
+        steered = bool(first_turn_steering) or any(
             is_queued_human_message(m)
             for m in ((state.get("agent_messages") or {}).get(node.id) or [])
         )

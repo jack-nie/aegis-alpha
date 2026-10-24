@@ -102,7 +102,7 @@ async def test_steering_skips_remaining_tool_calls_and_injects_before_next_llm(m
         seen_prior.append(list(prior_messages))
         return _final("risk only")
 
-    engine = _engine(mock_node_executor, [quote, news, filings], fake)
+    engine = _engine(mock_node_executor, [quote, news, filings], fake, skip_remaining_tools=True)
     engine_ref["e"] = engine
     nodes, edges = _layout()
     events = await _collect(

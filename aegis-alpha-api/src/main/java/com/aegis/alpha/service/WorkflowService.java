@@ -79,6 +79,7 @@ public class WorkflowService {
      * Spring injects the bounded {@code workflowExecutor} bean through the setter below.
      */
     private Executor workflowExecutor = Runnable::run;
+    private QueueResultWriteback queueResultWriteback;
     /** P3-10: approval gate (decide / approver roles); plain collaborator so the constructor contract is unchanged. */
     private final WorkflowApprovalService approval;
 
@@ -2264,6 +2265,12 @@ public class WorkflowService {
         return ordered;
     }
 
+    /** P4-11: optional, so existing tests / constructors are unaffected. */
+    @Autowired(required = false)
+    public void setQueueResultWriteback(QueueResultWriteback queueResultWriteback) {
+        this.queueResultWriteback = queueResultWriteback;
+    }
+
     /** Optional setter injection keeps the existing constructor contract for tests. */
     @Autowired(required = false)
     public void setWorkflowExecutor(@Qualifier(AsyncConfig.WORKFLOW_EXECUTOR) Executor workflowExecutor) {
@@ -2381,6 +2388,17 @@ public class WorkflowService {
         event.setCreatedAt(now());
         event.setSortOrder(sortOrder);
         mapper.insertRunEvent(event);
+        if (queueResultWriteback != null && QueueResultWriteback.isTrigger(eventType)) {
+            /* P4-11: answer queued chat messages in their thread (never throws). */
+            queueResultWriteback.onRunEvent(run, eventType, payload);
+        }
+    }
+
+    /** P4-11: chat path bookkeeping — this thread queued a message into the run. */
+    public void recordChatQueuedMessage(String runId, String threadId, String kind, Object queueId) {
+        if (queueResultWriteback != null) {
+            queueResultWriteback.recordQueued(runId, threadId, kind, queueId);
+        }
     }
 
     private String normalizeIdempotencyKey(String idempotencyKey) {

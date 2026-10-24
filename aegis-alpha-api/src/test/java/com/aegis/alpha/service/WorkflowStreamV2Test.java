@@ -310,4 +310,19 @@ class WorkflowStreamV2Test {
         assertThat(storedRun.get().getStatus()).isEqualTo("PAUSED");
         assertThat(storedRun.get().getControlStatus()).isEqualTo("HUMAN_INTERRUPT");
     }
+
+    @Test
+    void terminalRunEventsTriggerQueueWritebackOthersDoNot() {
+        /* P4-11: one choke point (recordRunEvent) covers sync, streaming and approval completion. */
+        QueueResultWriteback writeback = org.mockito.Mockito.mock(QueueResultWriteback.class);
+        service.setQueueResultWriteback(writeback);
+        WorkflowRun run = new WorkflowRun();
+        run.setRunId("run-wb");
+        service.recordRunEvent(run, "NODE_COMPLETED", null, "agent", "COMPLETED", "n", null, 1);
+        service.recordRunEvent(run, "RUN_COMPLETED", null, null, "COMPLETED", "done", null, 1000000);
+        org.mockito.Mockito.verify(writeback).onRunEvent(run, "RUN_COMPLETED", null);
+        org.mockito.Mockito.verify(writeback, org.mockito.Mockito.never())
+                .onRunEvent(org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.eq("NODE_COMPLETED"),
+                        org.mockito.ArgumentMatchers.any());
+    }
 }

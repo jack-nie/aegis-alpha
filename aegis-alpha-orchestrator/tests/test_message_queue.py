@@ -30,7 +30,7 @@ def test_defaults_match_pi_one_at_a_time():
     s = MessageQueueSettings()
     assert s.steering_mode == "one-at-a-time"
     assert s.follow_up_mode == "one-at-a-time"
-    assert s.skip_remaining_tools is True
+    assert s.skip_remaining_tools is False  # P4-11
     assert s.max_pending_per_kind == 8
 
 

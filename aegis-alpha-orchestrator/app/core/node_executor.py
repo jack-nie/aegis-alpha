@@ -722,6 +722,7 @@ class NodeExecutor:
         agent: AgentTemplate | None = None,
         model: str | None = None,
         on_delta: Any = None,
+        leading_messages: list | None = None,
     ) -> AgentToolResult:
         """One general.agent turn with bound tools (true tool-calling loop).
 
@@ -817,6 +818,8 @@ class NodeExecutor:
                 stream_kwargs: dict[str, Any] = {}
                 if on_delta is not None:
                     stream_kwargs["on_delta"] = (lambda text, _a=attempt + 1: on_delta(text, _a))
+                if leading_messages:
+                    stream_kwargs["leading_messages"] = list(leading_messages)
                 agent_result = await self._llm_client.invoke_agent_with_tools(
                     system=system,
                     prompt=prompt,

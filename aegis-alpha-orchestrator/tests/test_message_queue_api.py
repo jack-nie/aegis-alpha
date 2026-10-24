@@ -47,7 +47,7 @@ def _parse_sse(text: str) -> list[tuple[str, dict]]:
 def wired(mock_node_executor):
     """App with a test engine/registry; lifespan side effects stubbed."""
     WorkflowEngine._graph_cache.clear()
-    registry = MessageQueueRegistry(MessageQueueSettings())
+    registry = MessageQueueRegistry(MessageQueueSettings(skip_remaining_tools=True))  # P4-11: default is now False
     ctx: dict = {"client": None, "responses": []}
 
     @tool

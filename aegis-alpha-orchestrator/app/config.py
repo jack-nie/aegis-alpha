@@ -105,8 +105,10 @@ class Settings(BaseSettings):
     message_queue_max_deliveries: int = Field(
         default=16, alias="AEGIS_ALPHA_MESSAGE_QUEUE_MAX_DELIVERIES"
     )
+    # P4-11: default off (pi HEAD removed skipping; tool calls of one message run concurrently and
+    # steering is delivered after the batch). 待确认 with product.
     message_queue_skip_remaining_tools: bool = Field(
-        default=True, alias="AEGIS_ALPHA_MESSAGE_QUEUE_SKIP_REMAINING_TOOLS"
+        default=False, alias="AEGIS_ALPHA_MESSAGE_QUEUE_SKIP_REMAINING_TOOLS"
     )
     message_queue_max_threads: int = Field(default=1000, alias="AEGIS_ALPHA_MESSAGE_QUEUE_MAX_THREADS")
 

@@ -30,6 +30,26 @@ public class ChatController {
         return ResponseEntity.ok(chatService.threads(principal));
     }
 
+    /** P4-11: recent messages of one of the caller's threads (chronological). */
+    @GetMapping("/api/chat/threads/{threadId}/messages")
+    public ResponseEntity<Object> threadMessages(@RequestHeader(value = "Authorization", required = false) String authorization,
+                                                 @PathVariable("threadId") String threadId,
+                                                 @RequestParam(value = "limit", required = false, defaultValue = "50") int limit) {
+        AuthenticatedPrincipal principal = authService.principal(authorization);
+        if (principal == null) {
+            return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build();
+        }
+        try {
+            Object messages = chatService.threadMessages(threadId, principal, limit);
+            if (messages == null) {
+                return ResponseEntity.status(HttpStatus.NOT_FOUND).build();
+            }
+            return ResponseEntity.ok(messages);
+        } catch (SecurityException ex) {
+            return ResponseEntity.status(HttpStatus.FORBIDDEN).build();
+        }
+    }
+
     @PostMapping("/chat/messages")
     public ResponseEntity<Map<String, Object>> reply(@RequestHeader(value = "Authorization", required = false) String authorization,
                                                      @RequestBody Map<String, Object> body) {

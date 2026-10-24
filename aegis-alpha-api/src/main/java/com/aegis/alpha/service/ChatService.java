@@ -17,6 +17,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.stereotype.Service;
 
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
@@ -126,6 +127,44 @@ public class ChatService {
         return mapper.threadsForPrincipal(principal.getUserId(), principal.getTenantId());
     }
 
+    /** Max messages returned by {@link #threadMessages}. */
+    static final int THREAD_MESSAGES_MAX = 200;
+
+    /**
+     * P4-11: a thread's recent messages in chronological order (e.g. queued-message answers written
+     * back after the run). Only the owner may read; legacy unowned threads are not readable here.
+     *
+     * @return null when the thread does not exist
+     * @throws SecurityException when the caller does not own the thread
+     */
+    public List<Map<String, Object>> threadMessages(String threadId, AuthenticatedPrincipal principal, int limit) {
+        Map<String, Object> owner = mapper.findThreadOwner(threadId);
+        if (owner == null) {
+            return null;
+        }
+        if (principal == null
+                || !sameOwner(ownerText(owner, "user_id", "userId"), principal.getUserId())
+                || !sameOwner(ownerText(owner, "tenant_id", "tenantId"), principal.getTenantId())) {
+            throw new SecurityException("thread belongs to another user");
+        }
+        int bounded = Math.max(1, Math.min(limit, THREAD_MESSAGES_MAX));
+        List<Map<String, Object>> rows = mapper.findRecentMessages(threadId, bounded);
+        List<Map<String, Object>> out = new ArrayList<Map<String, Object>>();
+        if (rows != null) {
+            for (int i = rows.size() - 1; i >= 0; i--) {
+                Map<String, Object> row = rows.get(i);
+                Map<String, Object> item = new LinkedHashMap<String, Object>();
+                item.put("messageId", ownerText(row, "message_id", "messageId"));
+                item.put("role", ownerText(row, "role"));
+                item.put("content", row.get("content") == null ? "" : String.valueOf(row.get("content")));
+                Object created = row.get("created_at") != null ? row.get("created_at") : row.get("createdAt");
+                item.put("createdAt", created == null ? null : String.valueOf(created));
+                out.add(item);
+            }
+        }
+        return out;
+    }
+
     /** Backward-compatible entry point for tests / internal callers without a principal. */
     public Map<String, Object> reply(Map<String, Object> body) {
         return reply(body, null);
@@ -134,7 +173,7 @@ public class ChatService {
     public Map<String, Object> reply(Map<String, Object> body, AuthenticatedPrincipal principal) {
         String message = text(body, "message", "");
         String threadId = resolveThreadId(body, message, principal);
-        mapper.insertMessage(UUID.randomUUID().toString(), threadId, "user", message);
+        mapper.insertMessage(ChatMessageIds.next(), threadId, "user", message);
 
         HelpTrace trace = helpTraceService == null
                 ? null
@@ -558,7 +597,7 @@ public class ChatService {
     }
 
     private void persistAssistant(String threadId, String content) {
-        mapper.insertMessage(UUID.randomUUID().toString(), threadId, "assistant",
+        mapper.insertMessage(ChatMessageIds.next(), threadId, "assistant",
                 content == null ? "" : content);
     }
 
@@ -681,6 +720,15 @@ public class ChatService {
             reply = String.format("\u6d88\u606f\u672a\u80fd\u6392\u961f\u5230\u8fd0\u884c\u4e2d\u7684\u5de5\u4f5c\u6d41\uff08%s\uff09\uff0c\u8bf7\u7a0d\u540e\u518d\u8bd5\u3002", code);
         }
         persistAssistant(threadId, reply);
+        if (ok) {
+            /* P4-11: the answer is written back to this thread when the run finishes. */
+            try {
+                workflowService.recordChatQueuedMessage(runId.trim(), threadId, kind,
+                        objectMap(result.get("message")).get("id"));
+            } catch (Exception ignored) {
+                /* bookkeeping only */
+            }
+        }
 
         Map<String, Object> response = new LinkedHashMap<String, Object>();
         response.put("threadId", threadId);
@@ -756,7 +804,7 @@ public class ChatService {
 
         String reply = String.format("\u5df2\u81ea\u52a8\u8def\u7531\u5230\u5de5\u4f5c\u6d41 [%s]\uff0c\u8fd0\u884c ID: %s\uff0c\u72b6\u6001: %s",
                 workflowKey, runId, "RUNNING");
-        mapper.insertMessage(UUID.randomUUID().toString(), threadId, "assistant", reply);
+        mapper.insertMessage(ChatMessageIds.next(), threadId, "assistant", reply);
 
         Map<String, Object> response = new LinkedHashMap<String, Object>();
         response.put("threadId", threadId);
@@ -814,7 +862,7 @@ public class ChatService {
             reply = "\u771f\u5b9e LLM \u672a\u8fd4\u56de\u5185\u5bb9\u3002";
             result.put("content", reply);
         }
-        mapper.insertMessage(UUID.randomUUID().toString(), threadId, "assistant", reply);
+        mapper.insertMessage(ChatMessageIds.next(), threadId, "assistant", reply);
 
         Map<String, Object> response = new LinkedHashMap<String, Object>(result);
         response.put("threadId", threadId);

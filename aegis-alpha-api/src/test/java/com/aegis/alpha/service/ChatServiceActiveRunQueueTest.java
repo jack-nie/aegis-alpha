@@ -92,6 +92,8 @@ class ChatServiceActiveRunQueueTest {
                 .containsEntry("runId", RUN_ID).containsEntry("provider", "agent-queue");
         verify(workflowService, never()).createRun(anyString(), anyString(), any(), any());
         verify(chatMapper).insertMessage(anyString(), eq("thread-1"), eq("assistant"), anyString());
+        /* P4-11: bookkeeping so the answer is written back to this thread when the run ends. */
+        verify(workflowService).recordChatQueuedMessage(RUN_ID, "thread-1", "follow_up", "q-1");
     }
 
     @Test

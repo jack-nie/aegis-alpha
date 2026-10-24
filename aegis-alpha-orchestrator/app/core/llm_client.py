@@ -63,6 +63,8 @@ class AgentToolResult:
         self.has_tool_calls = has_tool_calls
         self.llm_response = llm_response
         self.seed_human = seed_human
+        # P4-11: queued steering delivered before the first LLM call (appended after the seed).
+        self.leading_messages: list[Any] = []
         # P4-8: what transform_context did to the prior messages for this call (trace only).
         self.context_stats: dict[str, Any] | None = None
         # P4-6: set by the node executor (requested vs effective model) for the trace.
@@ -74,6 +76,7 @@ class AgentToolResult:
         out: list[Any] = []
         if self.seed_human is not None:
             out.append(self.seed_human)
+        out.extend(self.leading_messages or [])
         if self.ai_message is not None:
             out.append(self.ai_message)
         return out
@@ -292,6 +295,7 @@ class LLMClient:
         timeout_ms: int | None = None,
         force_final: bool = False,
         on_delta: Callable[[str], None] | None = None,
+        leading_messages: list | None = None,
     ) -> AgentToolResult:
         """One agent turn with optional tool binding.
 
@@ -334,6 +338,8 @@ class LLMClient:
         else:
             seed_human = HumanMessage(content=user_content)
             chat.append(seed_human)
+            # P4-11: steering queued before the first call reaches that first request.
+            chat.extend(list(leading_messages or []))
 
         # P4-8: transformContext — elide old tool results / compact over budget (graph state untouched).
         policy = self._context_policy(resolved_model)
