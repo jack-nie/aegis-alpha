@@ -114,7 +114,7 @@ def make_client():
 def test_default_service_token_is_empty():
     from app.config import Settings
 
-    assert Settings(_env_file=None).model_fields["node_execution_token"].default == ""
+    assert Settings.model_fields["node_execution_token"].default == ""
 
 
 def test_example_token_rejected_outside_dev_mode(make_client):

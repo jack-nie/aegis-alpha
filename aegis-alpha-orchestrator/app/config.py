@@ -3,7 +3,7 @@
 import os
 from pathlib import Path
 
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field
 from dotenv import load_dotenv
 
@@ -96,9 +96,7 @@ class Settings(BaseSettings):
     openai_api_key: str = Field(default="", alias="OPENAI_API_KEY")
     openai_base_url: str = Field(default="", alias="OPENAI_BASE_URL")
 
-    class Config:
-        populate_by_name = True
-        extra = "ignore"
+    model_config = SettingsConfigDict(populate_by_name=True, extra="ignore")
 
     @property
     def effective_api_key(self) -> str:

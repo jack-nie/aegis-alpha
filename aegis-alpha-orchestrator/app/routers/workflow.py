@@ -3,7 +3,7 @@
 from contextlib import nullcontext
 from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 from typing import Any
 
 from ..models.requests import WorkflowRequest, NodeRequest
@@ -19,8 +19,7 @@ class ResumeRequest(BaseModel):
     resume_value: dict[str, Any] | None = Field(default=None, alias="resumeValue")
     owner: dict[str, Any] | None = None
 
-    class Config:
-        populate_by_name = True
+    model_config = ConfigDict(populate_by_name=True)
 
 
 def _authorization_context(delegated_token: str | None):

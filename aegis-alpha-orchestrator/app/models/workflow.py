@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from typing import Any
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 
 
 class NodeData(BaseModel):
@@ -19,9 +19,7 @@ class NodeData(BaseModel):
     agent_id: str | None = Field(default="", alias="agentId")
     agent_name: str | None = Field(default="", alias="agentName")
 
-    class Config:
-        extra = "allow"
-        populate_by_name = True
+    model_config = ConfigDict(extra="allow", populate_by_name=True)
 
 
 class Node(BaseModel):
@@ -30,8 +28,7 @@ class Node(BaseModel):
     id: str
     data: NodeData = Field(default_factory=NodeData)
 
-    class Config:
-        extra = "allow"
+    model_config = ConfigDict(extra="allow")
 
 
 class Edge(BaseModel):
@@ -41,8 +38,7 @@ class Edge(BaseModel):
     target: str
     condition: dict[str, Any] | None = None
 
-    class Config:
-        extra = "allow"
+    model_config = ConfigDict(extra="allow")
 
 
 class AgentTemplate(BaseModel):
@@ -53,9 +49,7 @@ class AgentTemplate(BaseModel):
     model_name: str = ""
     prompt: str = ""
 
-    class Config:
-        extra = "allow"
-        populate_by_name = True
+    model_config = ConfigDict(extra="allow", populate_by_name=True)
 
 
 class Signal(BaseModel):
@@ -65,8 +59,7 @@ class Signal(BaseModel):
     value: Any = None
     weight: float = 0.5
 
-    class Config:
-        extra = "allow"
+    model_config = ConfigDict(extra="allow")
 
     def __init__(self, **data):
         # Normalize: use 'type' as 'name' if 'name' missing
@@ -100,6 +93,4 @@ class TraceEntry(BaseModel):
     completed_at: str = Field(default="", alias="completedAt")
     duration_ms: int = Field(default=0, alias="durationMs")
 
-    class Config:
-        extra = "allow"
-        populate_by_name = True
+    model_config = ConfigDict(extra="allow", populate_by_name=True)
