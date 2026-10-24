@@ -47,8 +47,7 @@ class WorkflowRequest(_IgnoresRequestCredentials):
     # Run owner ({userId, tenantId}) for message-queue ownership checks.
     owner: dict[str, Any] | None = None
 
-    class Config:
-        populate_by_name = True
+    model_config = ConfigDict(populate_by_name=True)
 
 
 class QueueMessageRequest(BaseModel):
@@ -81,8 +80,7 @@ class NodeRequest(_IgnoresRequestCredentials):
     model: str | None = None
     delegated_token: str | None = Field(default=None, alias="delegatedToken")
 
-    class Config:
-        populate_by_name = True
+    model_config = ConfigDict(populate_by_name=True)
 
 
 class IntentRequest(_IgnoresRequestCredentials):
@@ -94,5 +92,4 @@ class IntentRequest(_IgnoresRequestCredentials):
     base_url: str | None = Field(default=None, alias="baseUrl")
     model: str | None = None
 
-    class Config:
-        populate_by_name = True
+    model_config = ConfigDict(populate_by_name=True)

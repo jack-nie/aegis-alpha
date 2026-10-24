@@ -32,6 +32,7 @@ from langgraph.types import interrupt, Command
 
 from ..models.workflow import Node, Edge, TraceEntry
 from ..models.responses import NodeResult, WorkflowResult, SSEEvent
+from .log_safety import text_len
 from .checkpointer_lifecycle import ensure_async_checkpointer
 from .context_assembly import apply_trace_usage, memory_hit_count
 from .memory_selector import load_run_memory, read_store_value, ticker_namespace
@@ -1238,7 +1239,7 @@ class WorkflowEngine:
                 except Exception as cache_err:
                     logger.warning(f"[THINKING] Store read error for node {node.id}: {cache_err}")
 
-            logger.info(f"[THINKING] Workflow node starting: id={node.id} handler={handler} label={node_label} subject={subject}")
+            logger.info(f"[THINKING] Workflow node starting: id={node.id} handler={handler} label={node_label} subject_len={text_len(subject)}")
 
             # True tool-calling loop for general.agent when tools are bound.
             if agent_tools:
@@ -1527,7 +1528,8 @@ class WorkflowEngine:
         owner: Any = None,
     ) -> WorkflowResult:
         """Execute workflow non-streaming."""
-        logger.info(f"[THINKING] Workflow execution starting: subject={subject} nodes={[n.id for n in nodes]} require_approval={require_approval}")
+        logger.info(f"[THINKING] Workflow execution starting: subject_len={text_len(subject)} nodes={[n.id for n in nodes]} require_approval={require_approval}")
+        logger.debug("Workflow subject: %s", subject)
         graph, tid, config, queue = await self._start_thread(
             nodes, edges, require_approval, thread_id, owner=owner, state=state
         )
@@ -1537,7 +1539,7 @@ class WorkflowEngine:
         try:
             final_state = await self._ainvoke_guarded(graph, initial_state, config)
             node_ids = [n.id for n in nodes]
-            logger.info(f"[THINKING] Workflow execution completed: subject={subject} nodes={node_ids} ok=True")
+            logger.info(f"[THINKING] Workflow execution completed: subject_len={text_len(subject)} nodes={node_ids} ok=True")
             outcome = "paused" if _graph_output_interrupted(final_state) else "completed"
             self._finish_message_queue(queue, outcome)
             result = self._attach_queue_summary(self._result_from_graph_output(final_state), queue)
@@ -1559,7 +1561,7 @@ class WorkflowEngine:
             self._finish_message_queue(queue, outcome)
             return self._attach_queue_summary(WorkflowResult(ok=False, error=str(e), final_state=state), queue)
         except Exception as e:
-            logger.error(f"[THINKING] Workflow execution failed: subject={subject} error={e}")
+            logger.error(f"[THINKING] Workflow execution failed: subject_len={text_len(subject)} error={e}")
             outcome = "error"
             self._finish_message_queue(queue, outcome)
             return self._attach_queue_summary(WorkflowResult(ok=False, error=str(e), final_state=state), queue)
@@ -1761,7 +1763,8 @@ class WorkflowEngine:
         owner: Any = None,
     ) -> AsyncIterator[SSEEvent]:
         """Execute workflow with SSE streaming."""
-        logger.info(f"[THINKING] Workflow streaming starting: subject={subject} nodes={[n.id for n in nodes]} require_approval={require_approval}")
+        logger.info(f"[THINKING] Workflow streaming starting: subject_len={text_len(subject)} nodes={[n.id for n in nodes]} require_approval={require_approval}")
+        logger.debug("Workflow subject: %s", subject)
         graph, tid, config, queue = await self._start_thread(
             nodes, edges, require_approval, thread_id, owner=owner, state=state
         )
@@ -1913,7 +1916,11 @@ class WorkflowEngine:
 
     @staticmethod
     def topological_sort(nodes: list[Node], edges: list[Edge]) -> list[Node]:
-        """Sort nodes in topological order using Kahn's algorithm."""
+        """Sort nodes in topological order using Kahn's algorithm.
+
+        P3-9: not on the execution path (LangGraph compiles the graph); kept as a validation helper
+        and raises on cycles instead of silently dropping the nodes on the cycle.
+        """
         node_map = {n.id: n for n in nodes}
         in_degree: dict[str, int] = {n.id: 0 for n in nodes}
         adjacency: dict[str, list[str]] = defaultdict(list)
@@ -1934,4 +1941,7 @@ class WorkflowEngine:
                 if in_degree[neighbor] == 0:
                     queue.append(neighbor)
 
+        if len(result) != len(nodes):
+            remaining = sorted(nid for nid, deg in in_degree.items() if deg > 0)
+            raise ValueError(f"Workflow graph contains a cycle: {remaining}")
         return result

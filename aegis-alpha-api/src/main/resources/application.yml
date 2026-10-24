@@ -38,7 +38,7 @@ aegis:
   seed-enabled: ${AEGIS_ALPHA_SEED_ENABLED:true}
   token-secret: ${AEGIS_ALPHA_TOKEN_SECRET:local-aegis-demo-secret}
   workflow:
-    # When true, stale research layouts (layoutVersion < 2) are async-written back to DB after read-path refresh.
+    # When true, stale versioned layouts (research + digest keys, layoutVersion < 4) are async-written back to DB after read-path refresh.
     # Read-path version check always applies for research keys regardless of this flag.
     refresh-default-layouts: ${AEGIS_ALPHA_REFRESH_DEFAULT_LAYOUTS:false}
     # Roles allowed to approve/reject runs paused at the approval gate (待确认: seed users only have
@@ -58,6 +58,10 @@ aegis:
       # 待确认: when the browser disconnects, false = keep consuming the orchestrator stream so the run
       # finishes and is recorded (CLIENT_DISCONNECTED event); true = stop reading and cancel the run.
       cancel-on-disconnect: ${AEGIS_ALPHA_WORKFLOW_STREAM_CANCEL_ON_DISCONNECT:false}
+  agent:
+    # P3-16 (待确认): default model for agents / inline workflow agents without an explicit modelName.
+    # Defaults to the orchestrator gateway model so one env var changes both.
+    default-model: ${AEGIS_AGENT_DEFAULT_MODEL:${AEGIS_ALPHA_LANGCHAIN_MODEL:deepseek-v4-flash}}
   langchain:
     enabled: ${AEGIS_ALPHA_LANGCHAIN_ENABLED:true}
     engine-url: ${AEGIS_ALPHA_LANGCHAIN_ENGINE_URL:http://127.0.0.1:8787}
@@ -99,4 +103,5 @@ aegis:
     sec-companyfacts-url: ${AEGIS_ALPHA_SEC_COMPANYFACTS_URL:https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json}
     yahoo-news-rss-url: ${AEGIS_ALPHA_YAHOO_NEWS_RSS_URL:https://feeds.finance.yahoo.com/rss/2.0/headline?s={symbol}&region=US&lang=en-US}
     gdelt-news-url: ${AEGIS_ALPHA_GDELT_NEWS_URL:https://api.gdeltproject.org/api/v2/doc/doc?query={symbol}&mode=artlist&format=json&maxrecords=10}
-    http-timeout-ms: ${AEGIS_ALPHA_MARKET_DATA_HTTP_TIMEOUT_MS:4000}
+    # Values below 8000 are raised to 8000 (MarketDataService.MIN_HTTP_TIMEOUT_MS).
+    http-timeout-ms: ${AEGIS_ALPHA_MARKET_DATA_HTTP_TIMEOUT_MS:8000}

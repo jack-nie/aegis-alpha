@@ -23,6 +23,7 @@ from .context_assembly import (
 )
 from .prompt_safety import USER_INPUT_TAG, fence
 from .critique import critique_recommendation_draft
+from .log_safety import text_len
 from .llm_client import AgentToolResult, LLMClient, LLMResponse
 from .market_data import MarketDataService
 from .recommendation_policy import enforce_recommendation_policy
@@ -37,6 +38,19 @@ def _assemble_context(state: dict[str, Any], *, aggregate: bool = False) -> str:
 
 
 AGGREGATE_HANDLER = "finance.stock_recommendation_aggregate"
+# P3-16: closer for non-single-ticker workflows (daily / portfolio / exit / sector). Large context
+# budget like the aggregate, but no recommendation policy, critique or BUY/SELL label.
+DIGEST_HANDLER = "finance.digest_aggregate"
+
+
+def digest_system_prompt(agent_name: str) -> str:
+    return (
+        f"You are {agent_name}. Summarize the upstream workflow outputs into a digest. "
+        "Use only facts present in the context and state missing data explicitly. "
+        "Do not output a BUY/SELL/HOLD rating or target price. "
+        "Return only JSON. Do not use markdown. "
+        'The JSON shape is {"summary":"string","signals":[...],"sources":[...],"confidence":0.5,"data":{}}.'
+    )
 
 
 def render_prompt(template: str | None, *, subject: str, agent_name: str) -> str:
@@ -129,6 +143,7 @@ HANDLERS = {
     "general.web_search",
     "finance.financial_interpretation",
     "finance.stock_recommendation_aggregate",
+    "finance.digest_aggregate",
     "finance.fundamental_analysis",
     "finance.technical_analysis",
     "finance.valuation_analysis",
@@ -144,6 +159,28 @@ HANDLERS = {
 # Control flow handlers
 FALLBACK_HANDLERS = {"start", "end", "condition", "logic"}
 
+_LABEL_ALTERNATION = r"INSUFFICIENT[_ ]DATA|STRONG[_ ]BUY|STRONG[_ ]SELL|BUY|SELL|HOLD|WATCH"
+_JSON_RECOMMENDATION_RE = re.compile(
+    r'"recommendation"\s*:\s*"(' + _LABEL_ALTERNATION + r')"', re.IGNORECASE
+)
+_LABELED_RECOMMENDATION_RE = re.compile(
+    r"(?:recommendation|rating|建议|评级|结论)\s*[:：]\s*\**\s*(" + _LABEL_ALTERNATION + r")\b",
+    re.IGNORECASE,
+)
+# Bare tokens must be upper-case words: prose like "shareholder", "buyback" or "hold on" never matches.
+_BARE_LABEL_RE = re.compile(r"(?<![A-Za-z0-9_])(" + _LABEL_ALTERNATION + r")(?![A-Za-z0-9_])")
+
+
+_LABEL_PRIORITY = ("INSUFFICIENT_DATA", "BUY", "SELL", "HOLD", "WATCH")
+
+
+def _normalize_label(raw: str) -> str:
+    label = raw.strip().upper().replace(" ", "_")
+    if label == "STRONG_BUY":
+        return "BUY"
+    if label == "STRONG_SELL":
+        return "SELL"
+    return label
 
 class NodeExecutor:
     """Executes individual workflow nodes."""
@@ -191,7 +228,8 @@ class NodeExecutor:
         handler = self._resolve_handler(node)
         node_type = self._resolve_node_type(node)
         node_label = node.data.label or node.data.title or node.id
-        logger.info(f"[THINKING] Node started: id={node.id} handler={handler} label={node_label} subject={subject}")
+        logger.info(f"[THINKING] Node started: id={node.id} handler={handler} label={node_label} subject_len={text_len(subject)}")
+        logger.debug("Node subject: id=%s subject=%s", node.id, subject)
 
         effective_provider = provider or self._config.provider
         if effective_provider not in ("openai", "deepseek"):
@@ -343,11 +381,14 @@ class NodeExecutor:
 
         # Build context (budgeted assembly, not a JSON prefix cut).
         is_aggregate = handler == "finance.stock_recommendation_aggregate"
-        context = _assemble_context(state, aggregate=is_aggregate)
+        is_digest = handler == DIGEST_HANDLER
+        context = _assemble_context(state, aggregate=is_aggregate or is_digest)
 
         # Build system prompt
         if is_aggregate:
             system = aggregate_system_prompt(agent_name)
+        elif is_digest:
+            system = digest_system_prompt(agent_name)
         else:
             system = (
                 f"You are {agent_name}. "
@@ -356,7 +397,7 @@ class NodeExecutor:
             )
 
         # Invoke LLM
-        timeout_ms = max(self._config.timeout_ms, 60000) if is_aggregate else self._config.timeout_ms
+        timeout_ms = max(self._config.timeout_ms, 60000) if (is_aggregate or is_digest) else self._config.timeout_ms
         response = await self._llm_client.invoke(
             system=system,
             prompt=prompt,
@@ -370,7 +411,8 @@ class NodeExecutor:
 
         duration_ms = int((datetime.now(timezone.utc) - datetime.fromisoformat(started_at)).total_seconds() * 1000)
         logger.info(f"[THINKING] Node completed: id={node.id} handler={handler} label={node_label} duration={duration_ms}ms status=completed confidence={response.confidence}")
-        logger.info(f"[THINKING] Node output: id={node.id} summary={response.summary[:200] if response.summary else 'N/A'}")
+        logger.info(f"[THINKING] Node output: id={node.id} summary_len={text_len(response.summary)}")
+        logger.debug("Node output summary: id=%s summary=%s", node.id, (response.summary or "")[:200])
 
         sources = [self._normalize_source(s) for s in response.sources]
         # Prefer market hydration as a structured source when present
@@ -388,6 +430,10 @@ class NodeExecutor:
             ]
 
         result_data = _with_token_usage(response.data or {}, response)
+        if is_digest:
+            # A digest never carries an actionable label into stream summaries / Java materialization.
+            result_data.pop("recommendation", None)
+            result_data["digest"] = True
         if is_aggregate:
             trailer = parse_aggregate_trailer(response.content)
             for key in ("recommendation", "claims", "missingData", "conflicts"):
@@ -495,23 +541,24 @@ class NodeExecutor:
 
     @staticmethod
     def _extract_recommendation_label(text: str) -> str | None:
-        """Best-effort parse of recommendation enum from model text/JSON fence."""
+        """Best-effort parse of the recommendation enum from model text (P3-4).
+
+        Order: JSON ``"recommendation"`` field, then an explicit ``Recommendation:/Rating:/建议:/评级:``
+        line, then a standalone upper-case token with word boundaries (so ``SHAREHOLDER`` is not HOLD
+        and ``BUYBACK`` is not BUY). Structured response fields are preferred by the caller.
+        """
         if not text:
             return None
-        import re  # local import keeps module import surface small
-
-        # JSON fence recommendation field
-        match = re.search(
-            r'"recommendation"\s*:\s*"(BUY|HOLD|SELL|WATCH|INSUFFICIENT_DATA)"',
-            text,
-            re.IGNORECASE,
-        )
+        match = _JSON_RECOMMENDATION_RE.search(text)
         if match:
-            return match.group(1).upper()
-        upper = text.upper()
-        for label in ("INSUFFICIENT_DATA", "STRONG BUY", "BUY", "SELL", "HOLD", "WATCH"):
-            if label in upper:
-                return label.replace(" ", "_") if label != "STRONG BUY" else "BUY"
+            return _normalize_label(match.group(1))
+        match = _LABELED_RECOMMENDATION_RE.search(text)
+        if match:
+            return _normalize_label(match.group(1))
+        found = {_normalize_label(m.group(1)) for m in _BARE_LABEL_RE.finditer(text)}
+        for label in _LABEL_PRIORITY:  # same precedence as the previous substring scan
+            if label in found:
+                return label
         return None
 
     def _mock_result(

@@ -34,6 +34,20 @@ class BacktestServiceTest {
         service = new BacktestService(mapper, objectMapper, modelGovernanceService, evidenceService, recommendationService);
     }
 
+    // P3-16: digest runs keep model-call/evidence trace without a backtest row or recommendation.
+    @Test
+    void materializeRunTraceSkipsBacktestAndRecommendation() {
+        WorkflowRun workflowRun = new WorkflowRun();
+        workflowRun.setRunId("digest-run");
+
+        service.materializeRunTrace(workflowRun);
+        service.materializeRunTrace(null);
+
+        verify(modelGovernanceService).materializeCalls(workflowRun);
+        verify(evidenceService).materializeEvidence(workflowRun);
+        org.mockito.Mockito.verifyNoInteractions(mapper, recommendationService);
+    }
+
     @Test
     void findAllDelegatesToMapper() {
         when(mapper.findAll()).thenReturn(java.util.Collections.emptyList());

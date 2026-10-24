@@ -3,13 +3,20 @@
 import os
 from pathlib import Path
 
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field
 from dotenv import load_dotenv
 
 # Load .env from project root
 _env_path = Path(__file__).parent.parent.parent / ".env"
-load_dotenv(_env_path, override=True)
+
+
+def _load_env_file(path: Path) -> bool:
+    """P3-11: .env only fills gaps; real process env (deploy, CI, tests) always wins."""
+    return load_dotenv(path, override=False)
+
+
+_load_env_file(_env_path)
 
 
 # Documented sample value; never accepted outside explicit dev/mock mode.
@@ -96,9 +103,7 @@ class Settings(BaseSettings):
     openai_api_key: str = Field(default="", alias="OPENAI_API_KEY")
     openai_base_url: str = Field(default="", alias="OPENAI_BASE_URL")
 
-    class Config:
-        populate_by_name = True
-        extra = "ignore"
+    model_config = SettingsConfigDict(populate_by_name=True, extra="ignore")
 
     @property
     def effective_api_key(self) -> str:

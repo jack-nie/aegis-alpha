@@ -73,6 +73,20 @@ class AgentServiceTest {
     }
 
     @Test
+    void createUsesConfiguredDefaultModel() throws Exception {
+        when(mapper.nextSortOrder()).thenReturn(3);
+        service.setDefaultModelName("deepseek-v4-pro");
+
+        AgentTemplate result = service.create("bob", new HashMap<String, Object>());
+
+        assertThat(result.getModelName()).isEqualTo("deepseek-v4-pro");
+        org.springframework.beans.factory.annotation.Value value = AgentService.class
+                .getDeclaredField("defaultModelName")
+                .getAnnotation(org.springframework.beans.factory.annotation.Value.class);
+        assertThat(value.value()).startsWith("${aegis.agent.default-model:");
+    }
+
+    @Test
     void updateThrowsForReadonlyAgent() {
         AgentTemplate agent = new AgentTemplate();
         agent.setAgentId("ro-agent");

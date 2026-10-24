@@ -617,93 +617,19 @@ public class KnowledgeService {
         if (raw == null || raw.trim().isEmpty()) {
             return null;
         }
-        String content = raw.replace("\r\n", "\n");
-        Map<String, String> front = new LinkedHashMap<String, String>();
-        String body = content;
-        if (content.startsWith("---\n")) {
-            int end = content.indexOf("\n---\n", 4);
-            if (end > 0) {
-                parseFrontMatter(content.substring(4, end), front);
-                body = content.substring(end + 5);
-            }
-        }
+        FrontMatter front = FrontMatter.parse(raw, filename);
         KnowledgeDoc doc = new KnowledgeDoc();
-        String id = front.get("id");
-        if (id == null || id.isEmpty()) {
+        String id = front.string("id");
+        if (id == null) {
             id = filename == null ? null : filename.replace(".md", "");
         }
         doc.setId(id);
-        doc.setTitle(front.getOrDefault("title", id == null ? "doc" : id));
-        doc.setVisibility(front.getOrDefault("visibility", "public"));
-        doc.setKeywords(parseList(front.get("keywords")));
-        doc.setAllowedRoles(parseList(front.get("allowedRoles")));
-        doc.setBodyMarkdown(body.trim());
+        doc.setTitle(front.string("title", id == null ? "doc" : id));
+        doc.setVisibility(front.string("visibility", "public"));
+        doc.setKeywords(front.list("keywords"));
+        doc.setAllowedRoles(front.list("allowedRoles"));
+        doc.setBodyMarkdown(front.body().trim());
         return doc;
-    }
-
-    private static void parseFrontMatter(String yaml, Map<String, String> out) {
-        String currentKey = null;
-        StringBuilder listBuf = null;
-        for (String line : yaml.split("\n")) {
-            String trimmed = line.trim();
-            if (trimmed.isEmpty() || trimmed.startsWith("#")) {
-                continue;
-            }
-            if (trimmed.startsWith("- ") && currentKey != null) {
-                if (listBuf == null) {
-                    listBuf = new StringBuilder();
-                } else if (listBuf.length() > 0) {
-                    listBuf.append(",");
-                }
-                listBuf.append(trimmed.substring(2).trim());
-                continue;
-            }
-            if (listBuf != null && currentKey != null) {
-                out.put(currentKey, listBuf.toString());
-                listBuf = null;
-            }
-            int colon = trimmed.indexOf(':');
-            if (colon <= 0) {
-                continue;
-            }
-            currentKey = trimmed.substring(0, colon).trim();
-            String value = trimmed.substring(colon + 1).trim();
-            if (value.isEmpty()) {
-                listBuf = new StringBuilder();
-            } else {
-                if ((value.startsWith("\"") && value.endsWith("\""))
-                        || (value.startsWith("'") && value.endsWith("'"))) {
-                    value = value.substring(1, value.length() - 1);
-                }
-                out.put(currentKey, value);
-                currentKey = null;
-            }
-        }
-        if (listBuf != null && currentKey != null) {
-            out.put(currentKey, listBuf.toString());
-        }
-    }
-
-    private static List<String> parseList(String raw) {
-        List<String> list = new ArrayList<String>();
-        if (raw == null || raw.trim().isEmpty()) {
-            return list;
-        }
-        String cleaned = raw.trim();
-        if (cleaned.startsWith("[") && cleaned.endsWith("]")) {
-            cleaned = cleaned.substring(1, cleaned.length() - 1);
-        }
-        for (String part : cleaned.split(",")) {
-            String item = part.trim();
-            if ((item.startsWith("\"") && item.endsWith("\""))
-                    || (item.startsWith("'") && item.endsWith("'"))) {
-                item = item.substring(1, item.length() - 1);
-            }
-            if (!item.isEmpty()) {
-                list.add(item);
-            }
-        }
-        return list;
     }
 
     private static String readResource(Resource resource) throws Exception {

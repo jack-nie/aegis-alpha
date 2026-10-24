@@ -75,6 +75,7 @@ export const workflowCatalogGroups = [
         nodeType: "agent",
         handler: "finance.stock_recommendation_aggregate",
       },
+      { label: "摘要汇总", id: "finance.digest_aggregate", nodeType: "agent", handler: "finance.digest_aggregate" },
     ],
   },
   {

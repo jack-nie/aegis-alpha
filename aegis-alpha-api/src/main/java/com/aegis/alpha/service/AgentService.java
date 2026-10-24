@@ -2,6 +2,7 @@ package com.aegis.alpha.service;
 
 import com.aegis.alpha.domain.AgentTemplate;
 import com.aegis.alpha.mapper.AgentMapper;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.time.LocalDateTime;
@@ -15,10 +16,19 @@ import java.util.UUID;
 public class AgentService {
     private final AgentMapper mapper;
     private final LangChainGateway langChainGateway;
+    /** P3-16: default model for new agents without modelName (待确认: falls back to aegis.langchain.model). */
+    @Value("${aegis.agent.default-model:deepseek-v4-flash}")
+    private String defaultModelName = "deepseek-v4-flash";
 
     public AgentService(AgentMapper mapper, LangChainGateway langChainGateway) {
         this.mapper = mapper;
         this.langChainGateway = langChainGateway;
+    }
+
+    void setDefaultModelName(String defaultModelName) {
+        if (defaultModelName != null && !defaultModelName.trim().isEmpty()) {
+            this.defaultModelName = defaultModelName.trim();
+        }
     }
 
     public List<AgentTemplate> findAll() {
@@ -47,7 +57,7 @@ public class AgentService {
         agent.setCategory(text(body, "category", "analyst"));
         agent.setTags(text(body, "tags", "analyst,custom"));
         agent.setPrompt(text(body, "prompt", "You are an Aegis Alpha research agent. Return concise structured output."));
-        agent.setModelName(text(body, "modelName", "deepseek-v4-flash"));
+        agent.setModelName(text(body, "modelName", defaultModelName));
         agent.setToolsJson(text(body, "toolsJson", "[\"market-data\",\"portfolio\",\"news\"]"));
         agent.setStatus("IDLE");
         agent.setScheduleCron(text(body, "scheduleCron", ""));

@@ -136,6 +136,7 @@ CREATE TABLE workflow_run (
   queued_at VARCHAR(32),
   node_count INT NOT NULL DEFAULT 0
 );
+CREATE UNIQUE INDEX idx_workflow_run_idempotency ON workflow_run (workflow_key, subject, idempotency_key);
 CREATE TABLE workflow_node_run (
   node_run_id VARCHAR(64) PRIMARY KEY,
   run_id VARCHAR(64) NOT NULL,

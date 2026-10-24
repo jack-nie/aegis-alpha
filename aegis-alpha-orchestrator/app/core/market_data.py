@@ -17,7 +17,8 @@ from ..utils.symbol_normalize import try_normalize_symbol
 logger = logging.getLogger(__name__)
 
 # Handlers that don't need market data hydration
-SKIP_HYDRATION_HANDLERS = {"finance.stock_recommendation_aggregate"}
+# P3-16: the digest closer summarizes upstream outputs; it is not tied to one ticker.
+SKIP_HYDRATION_HANDLERS = {"finance.stock_recommendation_aggregate", "finance.digest_aggregate"}
 
 
 # P2-14: one quote fetch per symbol per workflow run. The engine opens a run scope; parallel
