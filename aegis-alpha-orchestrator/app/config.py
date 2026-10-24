@@ -9,7 +9,14 @@ from dotenv import load_dotenv
 
 # Load .env from project root
 _env_path = Path(__file__).parent.parent.parent / ".env"
-load_dotenv(_env_path, override=True)
+
+
+def _load_env_file(path: Path) -> bool:
+    """P3-11: .env only fills gaps; real process env (deploy, CI, tests) always wins."""
+    return load_dotenv(path, override=False)
+
+
+_load_env_file(_env_path)
 
 
 # Documented sample value; never accepted outside explicit dev/mock mode.
