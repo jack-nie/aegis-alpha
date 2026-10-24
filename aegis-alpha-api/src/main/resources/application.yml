@@ -103,4 +103,5 @@ aegis:
     sec-companyfacts-url: ${AEGIS_ALPHA_SEC_COMPANYFACTS_URL:https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json}
     yahoo-news-rss-url: ${AEGIS_ALPHA_YAHOO_NEWS_RSS_URL:https://feeds.finance.yahoo.com/rss/2.0/headline?s={symbol}&region=US&lang=en-US}
     gdelt-news-url: ${AEGIS_ALPHA_GDELT_NEWS_URL:https://api.gdeltproject.org/api/v2/doc/doc?query={symbol}&mode=artlist&format=json&maxrecords=10}
-    http-timeout-ms: ${AEGIS_ALPHA_MARKET_DATA_HTTP_TIMEOUT_MS:4000}
+    # Values below 8000 are raised to 8000 (MarketDataService.MIN_HTTP_TIMEOUT_MS).
+    http-timeout-ms: ${AEGIS_ALPHA_MARKET_DATA_HTTP_TIMEOUT_MS:8000}

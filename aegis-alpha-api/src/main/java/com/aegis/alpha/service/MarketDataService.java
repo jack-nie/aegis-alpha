@@ -103,16 +103,22 @@ public class MarketDataService {
                              @Value("${TWELVE_DATA_API_KEY:${AEGIS_ALPHA_TWELVE_DATA_API_KEY:}}") String twelveDataApiKey,
                              @Value("${MARKETSTACK_API_KEY:${AEGIS_ALPHA_MARKETSTACK_API_KEY:}}") String marketstackApiKey,
                              @Value("${POLYGON_API_KEY:${AEGIS_ALPHA_POLYGON_API_KEY:}}") String polygonApiKey,
-                             @Value("${aegis.market-data.http-timeout-ms:4000}") int httpTimeoutMs) {
+                             @Value("${aegis.market-data.http-timeout-ms:8000}") int httpTimeoutMs) {
         this(defaultRestTemplate(httpTimeoutMs), objectMapper, yahooChartUrl, stooqQuoteUrl, secTickerMapUrl, secCompanyFactsUrl,
                 yahooNewsRssUrl, gdeltNewsUrl, finnhubApiKey, alphaVantageApiKey, fmpApiKey, twelveDataApiKey,
                 marketstackApiKey, polygonApiKey);
     }
 
+    /** Market providers often need more than 4s through a local proxy, so the configured value is floored. */
+    static final int MIN_HTTP_TIMEOUT_MS = 8000;
+
+    static int effectiveTimeoutMs(int configuredMs) {
+        return Math.max(configuredMs, MIN_HTTP_TIMEOUT_MS);
+    }
+
     static RestTemplate defaultRestTemplate(int timeoutMs) {
         SimpleClientHttpRequestFactory factory = new SimpleClientHttpRequestFactory();
-        // Market providers often need more than 4s when going through a local proxy.
-        int effectiveTimeout = Math.max(timeoutMs, 8000);
+        int effectiveTimeout = effectiveTimeoutMs(timeoutMs);
         factory.setConnectTimeout(effectiveTimeout);
         factory.setReadTimeout(effectiveTimeout);
         java.net.Proxy proxy = resolveHttpProxy();
