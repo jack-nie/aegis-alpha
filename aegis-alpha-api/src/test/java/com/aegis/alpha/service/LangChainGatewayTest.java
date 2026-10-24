@@ -158,6 +158,26 @@ class LangChainGatewayTest {
     }
 
     @Test
+    void resumeWorkflowForwardsDelegatedTokenOnlyWhenPresent() throws Exception {
+        final java.util.List<String> bodies = new java.util.concurrent.CopyOnWriteArrayList<String>();
+        server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/resume-workflow", exchange -> {
+            bodies.add(new String(readAll(exchange), StandardCharsets.UTF_8));
+            respond(exchange, 200, "{\"ok\":true,\"final_state\":{}}");
+        });
+        server.start();
+        LangChainGateway gateway = gateway("http://127.0.0.1:" + server.getAddress().getPort(), true);
+
+        gateway.resumeWorkflow("run-1", true, LangChainGateway.runOwner("u-1", "t-1"), "deleg-run-1");
+        gateway.resumeWorkflow("run-1", true, LangChainGateway.runOwner("u-1", "t-1"), null);
+
+        Map<?, ?> withToken = new ObjectMapper().readValue(bodies.get(0), Map.class);
+        Map<?, ?> without = new ObjectMapper().readValue(bodies.get(1), Map.class);
+        assertThat(withToken.get("delegatedToken"), is((Object) "deleg-run-1"));
+        assertThat(without.containsKey("delegatedToken"), is(false));
+    }
+
+    @Test
     void resumeWorkflowReturnsOkFalseWhenDisabled() {
         LangChainGateway gateway = new LangChainGateway(
                 new ObjectMapper(),

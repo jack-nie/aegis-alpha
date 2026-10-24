@@ -19,6 +19,9 @@ class ResumeRequest(BaseModel):
     thread_id: str = Field(..., alias="threadId")
     resume_value: dict[str, Any] | None = Field(default=None, alias="resumeValue")
     owner: dict[str, Any] | None = None
+    # P4-5: run-scoped delegated token (issued by Java for the run owner, not the approver) so tool
+    # calls after the approval gate keep the same portfolio:read scope as the original run.
+    delegated_token: str | None = Field(default=None, alias="delegatedToken")
 
     model_config = ConfigDict(populate_by_name=True)
 
@@ -62,12 +65,13 @@ def _authorization_context(delegated_token: str | None):
 async def resume_workflow(body: ResumeRequest):
     """Resume a workflow that was interrupted by an approval gate."""
     try:
-        result = await workflow_engine.resume_workflow(
-            thread_id=body.thread_id,
-            # No default: a missing decision must never be treated as approval.
-            resume_value=body.resume_value,
-            owner=body.owner,
-        )
+        with _authorization_context(body.delegated_token):
+            result = await workflow_engine.resume_workflow(
+                thread_id=body.thread_id,
+                # No default: a missing decision must never be treated as approval.
+                resume_value=body.resume_value,
+                owner=body.owner,
+            )
         return result
     except Exception as e:
         return WorkflowResult(

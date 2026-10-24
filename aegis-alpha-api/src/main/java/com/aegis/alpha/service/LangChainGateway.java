@@ -274,8 +274,17 @@ public class LangChainGateway {
         return resumeWorkflow(threadId, approved, null);
     }
 
-    @SuppressWarnings("unchecked")
     public Map<String, Object> resumeWorkflow(String threadId, boolean approved, Map<String, String> owner) {
+        return resumeWorkflow(threadId, approved, owner, null);
+    }
+
+    /**
+     * P4-5: {@code delegatedToken} is the run-scoped portfolio:read delegation of the run owner, applied by
+     * the orchestrator (use_authorization) to tool calls made after the approval gate.
+     */
+    @SuppressWarnings("unchecked")
+    public Map<String, Object> resumeWorkflow(String threadId, boolean approved, Map<String, String> owner,
+                                              String delegatedToken) {
         Map<String, Object> failed = new LinkedHashMap<>();
         failed.put("ok", false);
         if (!enabled) {
@@ -290,6 +299,9 @@ public class LangChainGateway {
             body.put("resumeValue", resumeValue);
             if (owner != null && !owner.isEmpty()) {
                 body.put("owner", owner);
+            }
+            if (delegatedToken != null && !delegatedToken.trim().isEmpty()) {
+                body.put("delegatedToken", delegatedToken.trim());
             }
             HttpHeaders headers = new HttpHeaders();
             headers.setContentType(MediaType.APPLICATION_JSON);

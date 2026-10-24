@@ -92,8 +92,12 @@ final class WorkflowApprovalService {
         host.recordRunEvent(run, "RUN_APPROVAL_DECISION", null, null, "PAUSED",
                 approved ? "Approval submitted." : "Rejection submitted.", audit, 955000);
 
+        /* P4-5: fresh run-scoped delegation for the run owner (never the approver's identity). */
+        String delegatedToken = approved
+                ? host.issueDelegatedPortfolioReadToken(run.getRunId(), run.getUserId(), run.getTenantId(), null)
+                : null;
         Map<String, Object> resume = gateway.resumeWorkflow(run.getRunId(), approved,
-                LangChainGateway.runOwner(run.getUserId(), run.getTenantId()));
+                LangChainGateway.runOwner(run.getUserId(), run.getTenantId()), delegatedToken);
         if (isResumeOk(resume)) {
             /* P2-13 / Phase-1 leftover: nodes that ran after the approval gate are materialized
              * as node runs + NODE_* events (same for runs started streaming or non-streaming). */
