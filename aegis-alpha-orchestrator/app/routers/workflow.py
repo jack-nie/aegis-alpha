@@ -17,6 +17,7 @@ router = APIRouter(tags=["workflow"])
 class ResumeRequest(BaseModel):
     thread_id: str = Field(..., alias="threadId")
     resume_value: dict[str, Any] | None = Field(default=None, alias="resumeValue")
+    owner: dict[str, Any] | None = None
 
     class Config:
         populate_by_name = True
@@ -37,6 +38,7 @@ async def resume_workflow(body: ResumeRequest):
             thread_id=body.thread_id,
             # No default: a missing decision must never be treated as approval.
             resume_value=body.resume_value,
+            owner=body.owner,
         )
         return result
     except Exception as e:
@@ -62,6 +64,7 @@ async def stream_workflow(request: Request, body: WorkflowRequest):
                 subject=body.subject,
                 require_approval=body.require_approval,
                 thread_id=body.thread_id,
+                owner=body.owner,
             ):
                 yield f"event: {event.event}\ndata: {json.dumps(event.data)}\n\n"
 
@@ -89,6 +92,7 @@ async def stream_workflow_tokens(request: Request, body: WorkflowRequest):
                 subject=body.subject,
                 require_approval=body.require_approval,
                 thread_id=body.thread_id,
+                owner=body.owner,
             ):
                 yield f"event: {event.event}\ndata: {json.dumps(event.data)}\n\n"
 
@@ -115,6 +119,7 @@ async def execute_workflow(request: Request, body: WorkflowRequest) -> WorkflowR
                 subject=body.subject,
                 require_approval=body.require_approval,
                 thread_id=body.thread_id,
+                owner=body.owner,
             )
         return result
     except Exception as e:
