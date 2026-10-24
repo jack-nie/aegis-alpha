@@ -161,6 +161,12 @@ jobs:
     needs: [backend-test, frontend-build, orchestrator-test]
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    # Cold builds on the server (deps re-downloaded) can take a while; cached builds are fast.
+    timeout-minutes: 45
+    # Never run two production deploys at once; queue instead of cancelling a running one.
+    concurrency:
+      group: production-deploy
+      cancel-in-progress: false
     steps:
       - name: Deploy via SSH
         uses: appleboy/ssh-action@v1
@@ -168,10 +174,12 @@ jobs:
           host: ${{ secrets.DEPLOY_HOST }}
           username: ${{ secrets.DEPLOY_USER }}
           key: ${{ secrets.DEPLOY_SSH_KEY }}
+          # Default is 10m, which killed cold image builds mid-way ("Run Command Timeout").
+          command_timeout: 40m
           script: |
+            set -e
             cd /opt/aegis-alpha
             git fetch origin main
             git reset --hard origin/main
-            docker compose -f docker-compose.aegis-alpha.yml build --no-cache
-            docker compose -f docker-compose.aegis-alpha.yml up -d
-            echo "Deploy complete"
+            # Builds with layer cache + China mirrors, runs `up -d`, waits for health.
+            bash scripts/deploy-production.sh
