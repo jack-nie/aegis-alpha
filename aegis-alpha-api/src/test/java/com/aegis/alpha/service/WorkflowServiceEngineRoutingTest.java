@@ -69,7 +69,7 @@ class WorkflowServiceEngineRoutingTest {
         when(gateway.isEnabled()).thenReturn(true);
         Map<String, Object> finalState = new LinkedHashMap<>();
         finalState.put("interrupted", true);
-        when(gateway.executeWorkflow(anyMap(), anyString(), anyMap(), nullable(String.class), anyString(), anyBoolean()))
+        when(gateway.executeWorkflow(anyMap(), anyString(), anyMap(), nullable(String.class), anyString(), anyBoolean(), any()))
                 .thenReturn(response(true, finalState, trace("start")));
         Map<String, Object> inputs = new LinkedHashMap<>();
         inputs.put("requireApproval", true);
@@ -77,7 +77,7 @@ class WorkflowServiceEngineRoutingTest {
         WorkflowRun run = service.start("daily", "AAPL", inputs);
 
         ArgumentCaptor<String> threadId = ArgumentCaptor.forClass(String.class);
-        verify(gateway).executeWorkflow(anyMap(), eq("AAPL"), anyMap(), nullable(String.class), threadId.capture(), eq(true));
+        verify(gateway).executeWorkflow(anyMap(), eq("AAPL"), anyMap(), nullable(String.class), threadId.capture(), eq(true), any());
         assertThat(threadId.getValue()).isEqualTo(run.getRunId());
         verify(gateway, never()).executeNode(any(), anyMap(), anyMap(), anyString(), nullable(String.class));
         assertThat(run.getStatus()).isEqualTo("PAUSED");
@@ -90,7 +90,7 @@ class WorkflowServiceEngineRoutingTest {
         when(gateway.isEnabled()).thenReturn(true);
         Map<String, Object> finalState = new LinkedHashMap<>();
         finalState.put("summary", "done");
-        when(gateway.executeWorkflow(anyMap(), anyString(), anyMap(), nullable(String.class), anyString(), anyBoolean()))
+        when(gateway.executeWorkflow(anyMap(), anyString(), anyMap(), nullable(String.class), anyString(), anyBoolean(), any()))
                 .thenReturn(response(true, finalState, trace("start", "market", "end")));
 
         WorkflowRun run = service.start("daily", "AAPL", new LinkedHashMap<String, Object>());
@@ -109,7 +109,7 @@ class WorkflowServiceEngineRoutingTest {
         Map<String, Object> failed = new LinkedHashMap<>();
         failed.put("ok", false);
         failed.put("error", "boom");
-        when(gateway.executeWorkflow(anyMap(), anyString(), anyMap(), nullable(String.class), anyString(), anyBoolean()))
+        when(gateway.executeWorkflow(anyMap(), anyString(), anyMap(), nullable(String.class), anyString(), anyBoolean(), any()))
                 .thenReturn(failed);
 
         WorkflowRun run = service.start("daily", "AAPL", new LinkedHashMap<String, Object>());
@@ -121,7 +121,7 @@ class WorkflowServiceEngineRoutingTest {
     @Test
     void queuedDispatchAlsoUsesOrchestrator() {
         when(gateway.isEnabled()).thenReturn(true);
-        when(gateway.executeWorkflow(anyMap(), anyString(), anyMap(), nullable(String.class), anyString(), anyBoolean()))
+        when(gateway.executeWorkflow(anyMap(), anyString(), anyMap(), nullable(String.class), anyString(), anyBoolean(), any()))
                 .thenReturn(response(true, new LinkedHashMap<String, Object>(), trace("start")));
         WorkflowRun queued = service.queueStart("daily", "AAPL", new LinkedHashMap<String, Object>(), null);
 
@@ -129,7 +129,7 @@ class WorkflowServiceEngineRoutingTest {
 
         assertThat(dispatched.getStatus()).isEqualTo("COMPLETED");
         verify(gateway, atLeastOnce()).executeWorkflow(anyMap(), anyString(), anyMap(), nullable(String.class),
-                eq(queued.getRunId()), anyBoolean());
+                eq(queued.getRunId()), anyBoolean(), any());
     }
 
     @Test
@@ -142,7 +142,7 @@ class WorkflowServiceEngineRoutingTest {
 
         WorkflowRun run = service.start("daily", "AAPL", new LinkedHashMap<String, Object>());
 
-        verify(gateway, never()).executeWorkflow(anyMap(), anyString(), anyMap(), nullable(String.class), anyString(), anyBoolean());
+        verify(gateway, never()).executeWorkflow(anyMap(), anyString(), anyMap(), nullable(String.class), anyString(), anyBoolean(), any());
         assertThat(run.getStatus()).isEqualTo("COMPLETED");
         assertThat(run.getResultJson()).contains("\"engine\":\"java-fallback\"");
     }

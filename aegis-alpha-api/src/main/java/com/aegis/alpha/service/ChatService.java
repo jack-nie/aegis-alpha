@@ -171,6 +171,19 @@ public class ChatService {
 
         /* Explicit workflowKey override takes priority */
         String explicit = text(body, "workflowKey", "");
+
+        /*
+         * pi-style message queue: while the workflow run this thread dispatched is still RUNNING, a new
+         * chat message is queued into that agent loop ({"delivery": "follow_up"} by default, or "steer")
+         * instead of being routed again. Opt out per message with {"delivery": "new"} or a workflowKey.
+         */
+        if (explicit.isEmpty()) {
+            Map<String, Object> queued = tryQueueIntoActiveRun(body, principal, session, message, threadId, trace);
+            if (queued != null) {
+                return queued;
+            }
+        }
+
         if (!explicit.isEmpty()) {
             com.aegis.alpha.service.help.RoutingTelemetry.logRoute(trace == null ? null : trace.getTraceId(),
                     HelpIntent.Domain.RESEARCH.name(), HelpIntent.RouteAction.DISPATCH_WORKFLOW.name(),
@@ -584,6 +597,105 @@ public class ChatService {
         if (!response.containsKey("complexity")) {
             response.put("complexity", HelpIntent.Complexity.L0.name());
         }
+    }
+
+    /* ================================================================ *
+     * Active-run message queue (steer / follow_up)
+     * ================================================================ */
+
+    /** Default delivery for chat messages sent while the thread's run is RUNNING (待确认 with product). */
+    static final String DEFAULT_ACTIVE_RUN_DELIVERY = WorkflowService.QUEUE_KIND_FOLLOW_UP;
+
+    private static final Set<String> QUEUE_FALLBACK_CODES = new HashSet<String>(Arrays.asList(
+            "NOT_FOUND", "RUN_NOT_RUNNING", "NOT_ACTIVE", "RUN_PAUSED", "DISABLED", "OWNER_MISMATCH",
+            "ORCHESTRATOR_UNAVAILABLE", "ORCHESTRATOR_ERROR",
+            /* parallel fan-out: every agent already finished its turn → start a normal turn */
+            "NO_RECEIVER", "TARGET_FINISHED"));
+
+    /**
+     * Returns the chat response when the message was queued into (or rejected by) the active run,
+     * or null to continue with normal routing. Recoverable failures (run finished, paused at
+     * approval, orchestrator unavailable, ...) fall back to normal routing; hard rejections
+     * (queue full, delivery limit, message too long) are reported without starting a new run.
+     */
+    private Map<String, Object> tryQueueIntoActiveRun(Map<String, Object> body,
+                                                      AuthenticatedPrincipal principal,
+                                                      HelpSessionState session,
+                                                      String message,
+                                                      String threadId,
+                                                      HelpTrace trace) {
+        if (principal == null || session == null || workflowService == null
+                || langChainGateway == null || !langChainGateway.isEnabled()) {
+            return null;
+        }
+        String requested = text(body, "delivery", "").trim();
+        if ("new".equalsIgnoreCase(requested)) {
+            return null;
+        }
+        String kind = WorkflowService.normalizeQueueKind(requested);
+        if (kind == null) {
+            /*
+             * Implicit delivery only when this thread's last turn dispatched the run; a thread whose
+             * last turn diagnosed some run keeps normal routing (e.g. "它为什么失败？").
+             */
+            if (!HelpIntent.RouteAction.DISPATCH_WORKFLOW.name().equals(session.getLastRouteAction())) {
+                return null;
+            }
+            kind = DEFAULT_ACTIVE_RUN_DELIVERY;
+        }
+        String runId = session.getLastRunId();
+        if (runId == null || runId.trim().isEmpty() || message == null || message.trim().isEmpty()) {
+            return null;
+        }
+        Map<String, Object> result;
+        try {
+            result = workflowService.enqueueRunMessage(runId.trim(), principal, kind, message);
+        } catch (Exception ex) {
+            return null;
+        }
+        if (result == null) {
+            return null;
+        }
+        boolean ok = Boolean.TRUE.equals(result.get("ok"));
+        String code = text(result, "code", "");
+        if (!ok && (code.isEmpty() || QUEUE_FALLBACK_CODES.contains(code))) {
+            return null;
+        }
+        markTrace(trace, HelpIntent.Domain.RESEARCH, HelpIntent.RouteAction.DISPATCH_WORKFLOW,
+                "agent-queue", false, false);
+        String reply;
+        if (ok) {
+            reply = WorkflowService.QUEUE_KIND_STEER.equals(kind)
+                    ? String.format("\u5df2\u5c06\u6d88\u606f\u4f5c\u4e3a\u5f15\u5bfc\u6307\u4ee4\u6392\u961f\u5230\u8fd0\u884c\u4e2d\u7684\u5de5\u4f5c\u6d41\uff08\u8fd0\u884c ID: %s\uff09\uff0c\u5c06\u5728\u5f53\u524d\u5de5\u5177\u8c03\u7528\u7ed3\u675f\u540e\u9001\u8fbe\u3002", runId)
+                    : String.format("\u5df2\u5c06\u6d88\u606f\u4f5c\u4e3a\u540e\u7eed\u6d88\u606f\u6392\u961f\u5230\u8fd0\u884c\u4e2d\u7684\u5de5\u4f5c\u6d41\uff08\u8fd0\u884c ID: %s\uff09\uff0c\u5c06\u5728\u667a\u80fd\u4f53\u5b8c\u6210\u5f53\u524d\u56de\u7b54\u540e\u5904\u7406\u3002", runId);
+        } else {
+            reply = String.format("\u6d88\u606f\u672a\u80fd\u6392\u961f\u5230\u8fd0\u884c\u4e2d\u7684\u5de5\u4f5c\u6d41\uff08%s\uff09\uff0c\u8bf7\u7a0d\u540e\u518d\u8bd5\u3002", code);
+        }
+        persistAssistant(threadId, reply);
+
+        Map<String, Object> response = new LinkedHashMap<String, Object>();
+        response.put("threadId", threadId);
+        response.put("message", reply);
+        response.put("content", reply);
+        response.put("ok", ok);
+        response.put("queued", ok);
+        response.put("queueKind", kind);
+        if (ok) {
+            Map<String, Object> queuedMessage = objectMap(result.get("message"));
+            response.put("queueId", queuedMessage.get("id"));
+            response.put("queuePosition", result.get("position"));
+        } else {
+            response.put("queueError", code);
+        }
+        response.put("runId", runId.trim());
+        response.put("runStatus", "RUNNING");
+        response.put("domain", HelpIntent.Domain.RESEARCH.name());
+        response.put("routeAction", HelpIntent.RouteAction.DISPATCH_WORKFLOW.name());
+        response.put("provider", "agent-queue");
+        response.put("needsClarification", false);
+        response.put("escalateHuman", false);
+        response.put("cacheHit", false);
+        return response;
     }
 
     /* ================================================================ *
