@@ -11,7 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from .config import settings
-from .core.checkpointer_lifecycle import close_async_checkpointer, open_async_checkpointer
+from .core.run_backends import checkpointer_factory_from_settings, replica_safety_warnings
 from .dependencies import CHECKPOINT_DB_PATH, market_data, memory_store_manager, workflow_engine
 from .core.tools import get_backend_client
 from .routers import health, workflow, intent, help as help_router, message_queue
@@ -48,9 +48,14 @@ async def lifespan(app: FastAPI):
         )
     await market_data.start()
     await memory_store_manager.initialize()
+    # P4-16: checkpointer behind CheckpointerFactory (sqlite default; memory for demos).
+    checkpointer_factory = checkpointer_factory_from_settings(settings, CHECKPOINT_DB_PATH)
+    for warning in replica_safety_warnings(settings, checkpointer_factory):
+        logger.warning("[REPLICAS] %s", warning)
     try:
-        workflow_engine.attach_checkpointer(await open_async_checkpointer(CHECKPOINT_DB_PATH))
-        logger.info("Durable AsyncSqliteSaver checkpointer attached")
+        workflow_engine.attach_checkpointer(await checkpointer_factory.open())
+        logger.info("Checkpointer attached: backend=%s durable=%s", checkpointer_factory.name,
+                    checkpointer_factory.durable)
     except ImportError:
         logger.warning("langgraph-checkpoint-sqlite/aiosqlite missing; checkpoints stay in memory")
     yield
@@ -61,7 +66,7 @@ async def lifespan(app: FastAPI):
     from langgraph.checkpoint.memory import MemorySaver
 
     workflow_engine.attach_checkpointer(MemorySaver())
-    await close_async_checkpointer()
+    await checkpointer_factory.close()
     logger.info("Shutting down Aegis Alpha Orchestrator")
 
 

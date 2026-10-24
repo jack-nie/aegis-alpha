@@ -1,0 +1,14 @@
+name: usage_accounting
+description: usage of the tool-requesting turn and the final turn are both counted (P4-7).
+tools:
+  get_quote: {args: {symbol: str}, returns: {price: 1}}
+script:
+  - tool_calls: [{name: get_quote, args: {symbol: AAPL}}]
+    usage: {input: 100, output: 20}
+  - content: '{"summary": "done", "confidence": 0.5}'
+    usage: {input: 150, output: 30}
+expect:
+  status: workflow_complete
+  usage_total: 300
+  usage_total_max: 300
+  events_include: [usage]

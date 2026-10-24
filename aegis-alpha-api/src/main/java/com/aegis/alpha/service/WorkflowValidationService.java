@@ -24,6 +24,22 @@ public class WorkflowValidationService {
     @Value("${aegis.workflow.allowed-model-names:}")
     private String allowedModelNames = "";
 
+    /** P4-8: node-level data.maxToolRounds bounds (orchestrator clamps to the same range; default 3). */
+    static final int MIN_TOOL_ROUNDS = 1;
+    static final int MAX_TOOL_ROUNDS = 8;
+
+    private static boolean isToolRoundsInRange(Object value) {
+        long rounds;
+        if (value instanceof Integer || value instanceof Long || value instanceof Short) {
+            rounds = ((Number) value).longValue();
+        } else if (value instanceof String && ((String) value).trim().matches("\\d{1,3}")) {
+            rounds = Long.parseLong(((String) value).trim());
+        } else {
+            return false;
+        }
+        return rounds >= MIN_TOOL_ROUNDS && rounds <= MAX_TOOL_ROUNDS;
+    }
+
     void setMaxPromptChars(int maxPromptChars) {
         this.maxPromptChars = maxPromptChars;
     }
@@ -59,6 +75,11 @@ public class WorkflowValidationService {
                     throw new IllegalArgumentException("Workflow validation failed: node " + id + " " + key
                             + " exceeds " + maxPromptChars + " characters.");
                 }
+            }
+            Object rounds = data.get("maxToolRounds");
+            if (rounds != null && !isToolRoundsInRange(rounds)) {
+                throw new IllegalArgumentException("Workflow validation failed: node " + id
+                        + " maxToolRounds must be an integer between " + MIN_TOOL_ROUNDS + " and " + MAX_TOOL_ROUNDS + ".");
             }
             Object model = data.get("modelName");
             if (model != null && !text(model).isEmpty() && !allowedModels.isEmpty() && !allowedModels.contains(text(model))) {

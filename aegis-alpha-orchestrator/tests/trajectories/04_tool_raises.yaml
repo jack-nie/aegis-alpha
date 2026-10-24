@@ -1,0 +1,13 @@
+name: tool_raises
+description: an exception inside a tool is an error result, not a crashed run.
+tools:
+  get_financials: {args: {symbol: str}, raises: "db connection reset"}
+script:
+  - tool_calls: [{name: get_financials, args: {symbol: AAPL}}]
+  - content: '{"summary": "financials missing", "confidence": 0.2}'
+expect:
+  status: workflow_complete
+  tool_sequence: [get_financials]
+  tool_errors: [get_financials]
+  request_contains: [{call: 2, text: "Tool failed"}]
+  request_excludes: [{call: 2, text: "db connection reset"}]

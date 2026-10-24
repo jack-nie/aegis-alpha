@@ -17,6 +17,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.stereotype.Service;
 
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
@@ -55,6 +56,15 @@ public class ChatService {
     private final HelpSessionStateService helpSessionStateService;
     private final HelpTraceService helpTraceService;
     private final Executor workflowExecutor;
+
+    private ModelAllowlist modelAllowlist = ModelAllowlist.defaults();
+
+    @Autowired(required = false)
+    void setModelAllowlist(ModelAllowlist modelAllowlist) {
+        if (modelAllowlist != null) {
+            this.modelAllowlist = modelAllowlist;
+        }
+    }
 
     @Autowired
     public ChatService(ChatMapper mapper,
@@ -117,6 +127,44 @@ public class ChatService {
         return mapper.threadsForPrincipal(principal.getUserId(), principal.getTenantId());
     }
 
+    /** Max messages returned by {@link #threadMessages}. */
+    static final int THREAD_MESSAGES_MAX = 200;
+
+    /**
+     * P4-11: a thread's recent messages in chronological order (e.g. queued-message answers written
+     * back after the run). Only the owner may read; legacy unowned threads are not readable here.
+     *
+     * @return null when the thread does not exist
+     * @throws SecurityException when the caller does not own the thread
+     */
+    public List<Map<String, Object>> threadMessages(String threadId, AuthenticatedPrincipal principal, int limit) {
+        Map<String, Object> owner = mapper.findThreadOwner(threadId);
+        if (owner == null) {
+            return null;
+        }
+        if (principal == null
+                || !sameOwner(ownerText(owner, "user_id", "userId"), principal.getUserId())
+                || !sameOwner(ownerText(owner, "tenant_id", "tenantId"), principal.getTenantId())) {
+            throw new SecurityException("thread belongs to another user");
+        }
+        int bounded = Math.max(1, Math.min(limit, THREAD_MESSAGES_MAX));
+        List<Map<String, Object>> rows = mapper.findRecentMessages(threadId, bounded);
+        List<Map<String, Object>> out = new ArrayList<Map<String, Object>>();
+        if (rows != null) {
+            for (int i = rows.size() - 1; i >= 0; i--) {
+                Map<String, Object> row = rows.get(i);
+                Map<String, Object> item = new LinkedHashMap<String, Object>();
+                item.put("messageId", ownerText(row, "message_id", "messageId"));
+                item.put("role", ownerText(row, "role"));
+                item.put("content", row.get("content") == null ? "" : String.valueOf(row.get("content")));
+                Object created = row.get("created_at") != null ? row.get("created_at") : row.get("createdAt");
+                item.put("createdAt", created == null ? null : String.valueOf(created));
+                out.add(item);
+            }
+        }
+        return out;
+    }
+
     /** Backward-compatible entry point for tests / internal callers without a principal. */
     public Map<String, Object> reply(Map<String, Object> body) {
         return reply(body, null);
@@ -125,7 +173,7 @@ public class ChatService {
     public Map<String, Object> reply(Map<String, Object> body, AuthenticatedPrincipal principal) {
         String message = text(body, "message", "");
         String threadId = resolveThreadId(body, message, principal);
-        mapper.insertMessage(UUID.randomUUID().toString(), threadId, "user", message);
+        mapper.insertMessage(ChatMessageIds.next(), threadId, "user", message);
 
         HelpTrace trace = helpTraceService == null
                 ? null
@@ -549,7 +597,7 @@ public class ChatService {
     }
 
     private void persistAssistant(String threadId, String content) {
-        mapper.insertMessage(UUID.randomUUID().toString(), threadId, "assistant",
+        mapper.insertMessage(ChatMessageIds.next(), threadId, "assistant",
                 content == null ? "" : content);
     }
 
@@ -672,6 +720,15 @@ public class ChatService {
             reply = String.format("\u6d88\u606f\u672a\u80fd\u6392\u961f\u5230\u8fd0\u884c\u4e2d\u7684\u5de5\u4f5c\u6d41\uff08%s\uff09\uff0c\u8bf7\u7a0d\u540e\u518d\u8bd5\u3002", code);
         }
         persistAssistant(threadId, reply);
+        if (ok) {
+            /* P4-11: the answer is written back to this thread when the run finishes. */
+            try {
+                workflowService.recordChatQueuedMessage(runId.trim(), threadId, kind,
+                        objectMap(result.get("message")).get("id"));
+            } catch (Exception ignored) {
+                /* bookkeeping only */
+            }
+        }
 
         Map<String, Object> response = new LinkedHashMap<String, Object>();
         response.put("threadId", threadId);
@@ -747,7 +804,7 @@ public class ChatService {
 
         String reply = String.format("\u5df2\u81ea\u52a8\u8def\u7531\u5230\u5de5\u4f5c\u6d41 [%s]\uff0c\u8fd0\u884c ID: %s\uff0c\u72b6\u6001: %s",
                 workflowKey, runId, "RUNNING");
-        mapper.insertMessage(UUID.randomUUID().toString(), threadId, "assistant", reply);
+        mapper.insertMessage(ChatMessageIds.next(), threadId, "assistant", reply);
 
         Map<String, Object> response = new LinkedHashMap<String, Object>();
         response.put("threadId", threadId);
@@ -781,11 +838,17 @@ public class ChatService {
         copilot.setCategory("copilot");
         copilot.setTags("chat,copilot,research");
         copilot.setPrompt(COPILOT_SYSTEM_PROMPT);
-        copilot.setModelName(text(body, "modelName", ""));
+        // P4-6 (R5): body.modelName is client input; only allowlisted names are forwarded, others are
+        // ignored (empty = the gateway default model) rather than trusted.
+        String requestedModel = text(body, "modelName", "");
+        copilot.setModelName(modelAllowlist.isAllowed(requestedModel) ? requestedModel.trim() : "");
         copilot.setToolsJson("[\"market-data\",\"portfolio\",\"news\",\"workflow\"]");
 
         Map<String, Object> state = trustedState(body, principal);
         state.put("message", message);
+        // P4-12: server-built multi-turn context (overwrites any client-supplied copilotChat). The
+        // orchestrator renders it inside <chat_history>/<user_input> fences.
+        state.put(COPILOT_CHAT_STATE_KEY, copilotChat(threadId, message));
         String ticker = tickerFrom(body, state, message);
         if (!ticker.isEmpty()) {
             state.put("ticker", ticker);
@@ -802,7 +865,7 @@ public class ChatService {
             reply = "\u771f\u5b9e LLM \u672a\u8fd4\u56de\u5185\u5bb9\u3002";
             result.put("content", reply);
         }
-        mapper.insertMessage(UUID.randomUUID().toString(), threadId, "assistant", reply);
+        mapper.insertMessage(ChatMessageIds.next(), threadId, "assistant", reply);
 
         Map<String, Object> response = new LinkedHashMap<String, Object>(result);
         response.put("threadId", threadId);
@@ -885,6 +948,93 @@ public class ChatService {
             return new LinkedHashMap<String, Object>((Map<String, Object>) value);
         }
         return new LinkedHashMap<String, Object>();
+    }
+
+    static final String COPILOT_CHAT_STATE_KEY = "copilotChat";
+    /** P4-12 (待确认): recent turns replayed verbatim; older ones are folded into a summary. */
+    static final int COPILOT_HISTORY_TURNS = 12;
+    static final int COPILOT_HISTORY_SUMMARY_SCAN = 24;
+    static final int COPILOT_HISTORY_TURN_MAX_CHARS = 1500;
+    static final int COPILOT_HISTORY_SUMMARY_MAX_CHARS = 1200;
+    private static final int COPILOT_SUMMARY_LINE_CHARS = 100;
+
+    /**
+     * P4-12: {@code {message, history:[{role,content}], historySummary}} for the copilot. The current
+     * user message (already persisted at the start of the chat turn) is excluded from history. Older messages
+     * become a deterministic extractive summary (no extra LLM call; an LLM summary is 待确认).
+     */
+    Map<String, Object> copilotChat(String threadId, String message) {
+        Map<String, Object> chat = new LinkedHashMap<String, Object>();
+        chat.put("message", message == null ? "" : message);
+        List<Map<String, Object>> rows = null;
+        try {
+            rows = threadId == null ? null
+                    : mapper.findRecentMessages(threadId, COPILOT_HISTORY_TURNS + 1 + COPILOT_HISTORY_SUMMARY_SCAN);
+        } catch (RuntimeException ex) {
+            log.warn("[Chat] history unavailable for copilot, errorType={}", ex.getClass().getSimpleName());
+        }
+        List<Map<String, Object>> newestFirst = new ArrayList<Map<String, Object>>();
+        if (rows != null) {
+            for (Map<String, Object> row : rows) {
+                if (row != null) {
+                    newestFirst.add(row);
+                }
+            }
+        }
+        if (!newestFirst.isEmpty()) {
+            Map<String, Object> newest = newestFirst.get(0);
+            if ("user".equals(ownerText(newest, "role"))
+                    && String.valueOf(newest.get("content")).trim().equals(message == null ? "" : message.trim())) {
+                newestFirst.remove(0);
+            }
+        }
+        int recentCount = Math.min(COPILOT_HISTORY_TURNS, newestFirst.size());
+        List<Map<String, Object>> history = new ArrayList<Map<String, Object>>();
+        for (int i = recentCount - 1; i >= 0; i--) {
+            Map<String, Object> turn = historyTurn(newestFirst.get(i), COPILOT_HISTORY_TURN_MAX_CHARS);
+            if (turn != null) {
+                history.add(turn);
+            }
+        }
+        chat.put("history", history);
+        List<String> summaryLines = new ArrayList<String>();
+        for (int i = newestFirst.size() - 1; i >= recentCount; i--) {
+            Map<String, Object> turn = historyTurn(newestFirst.get(i), COPILOT_SUMMARY_LINE_CHARS);
+            if (turn != null) {
+                summaryLines.add(("user".equals(turn.get("role")) ? "用户: " : "助手: ") + turn.get("content"));
+            }
+        }
+        if (!summaryLines.isEmpty()) {
+            StringBuilder summary = new StringBuilder();
+            // keep the most recent of the older lines when over budget
+            for (int i = summaryLines.size() - 1; i >= 0; i--) {
+                String line = summaryLines.get(i);
+                if (summary.length() + line.length() + 1 > COPILOT_HISTORY_SUMMARY_MAX_CHARS) {
+                    break;
+                }
+                summary.insert(0, line + "\n");
+            }
+            chat.put("historySummary", summary.toString().trim());
+        }
+        return chat;
+    }
+
+    private Map<String, Object> historyTurn(Map<String, Object> row, int maxChars) {
+        String role = ownerText(row, "role");
+        if (!"user".equals(role) && !"assistant".equals(role)) {
+            return null;
+        }
+        String content = row.get("content") == null ? "" : String.valueOf(row.get("content")).trim();
+        if (content.isEmpty()) {
+            return null;
+        }
+        if (content.length() > maxChars) {
+            content = content.substring(0, maxChars) + "…";
+        }
+        Map<String, Object> turn = new LinkedHashMap<String, Object>();
+        turn.put("role", role);
+        turn.put("content", content);
+        return turn;
     }
 
     static final String COPILOT_HANDLER = "general.agent";

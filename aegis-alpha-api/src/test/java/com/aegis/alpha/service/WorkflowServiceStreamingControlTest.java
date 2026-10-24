@@ -319,6 +319,8 @@ class WorkflowServiceStreamingControlTest {
         copy.setControlStatus(source.getControlStatus());
         copy.setPauseRequested(source.getPauseRequested());
         copy.setCancelRequested(source.getCancelRequested());
+        copy.setUserId(source.getUserId());
+        copy.setTenantId(source.getTenantId());
         return copy;
     }
 

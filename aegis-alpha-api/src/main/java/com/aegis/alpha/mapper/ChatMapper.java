@@ -45,4 +45,9 @@ public interface ChatMapper {
     @Select("select thread_id, title from chat_thread where user_id = #{userId} and tenant_id = #{tenantId} order by thread_id")
     List<Map<String, Object>> threadsForPrincipal(@Param("userId") String userId,
                                                   @Param("tenantId") String tenantId);
+
+    /** P4-11/P4-12: newest messages of a thread (callers reverse to chronological order). */
+    @Select("select message_id, role, content, created_at from chat_message where thread_id = #{threadId}"
+            + " order by created_at desc, message_id desc limit #{limit}")
+    List<Map<String, Object>> findRecentMessages(@Param("threadId") String threadId, @Param("limit") int limit);
 }

@@ -10,3 +10,4 @@ httpx
 aiosqlite
 langgraph-checkpoint>=4.3
 langgraph-checkpoint-sqlite>=3.1
+pyyaml

@@ -36,6 +36,8 @@ class Settings(BaseSettings):
     api_key: str = Field(default="", alias="AEGIS_ALPHA_LANGCHAIN_API_KEY")
     base_url: str = Field(default="", alias="AEGIS_ALPHA_LANGCHAIN_BASE_URL")
     timeout_ms: int = Field(default=25000, alias="AEGIS_ALPHA_LANGCHAIN_TIMEOUT_MS")
+    # P4-6: model registry file (YAML). Empty = the packaged app/core/models.yaml.
+    models_file: str = Field(default="", alias="AEGIS_ALPHA_MODELS_FILE")
     mock_mode: bool = Field(default=False, alias="AEGIS_ALPHA_LANGCHAIN_MOCK")
 
     # Intent router (classification). Empty model -> fall back to the main model.
@@ -67,6 +69,15 @@ class Settings(BaseSettings):
     # Prefer contextvar authorization_override on ToolBackendClient for per-run use.
     delegated_token: str = Field(default="", alias="AEGIS_ALPHA_DELEGATED_TOKEN")
 
+    # P4-1 tool pipeline: per-call result caps (list items first, then characters).
+    tool_result_max_chars: int = Field(default=6000, alias="AEGIS_ALPHA_TOOL_RESULT_MAX_CHARS")
+    tool_result_max_items: int = Field(default=20, alias="AEGIS_ALPHA_TOOL_RESULT_MAX_ITEMS")
+
+    # P4-8 agent-loop context transform (待确认): verbatim recent tool results and the per-call budget
+    # (capped at 60% of the registry contextWindow when one is configured).
+    agent_keep_recent_tool_results: int = Field(default=4, alias="AEGIS_ALPHA_AGENT_KEEP_RECENT_TOOL_RESULTS")
+    agent_max_context_tokens: int = Field(default=12000, alias="AEGIS_ALPHA_AGENT_MAX_CONTEXT_TOKENS")
+
     # Market Data
     market_data_timeout_ms: int = Field(default=8000, alias="AEGIS_ALPHA_MARKET_DATA_TIMEOUT_MS")
 
@@ -82,6 +93,12 @@ class Settings(BaseSettings):
     workflow_cleanup_checkpoints: bool = Field(default=False, alias="AEGIS_ALPHA_WORKFLOW_CLEANUP_CHECKPOINTS")
     # Agent-loop message queue (steering / follow-up, modeled on pi-mono's dual loop).
     # Defaults are 待确认 (pending product confirmation); see 消息排队实现说明.md.
+    # P4-16: backend selection (docs/多副本设计.md). Only sqlite/memory and memory are installed;
+    # postgres/redis are recognised but fail at startup until their dependencies are approved (待确认).
+    checkpointer_backend: str = Field(default="sqlite", alias="AEGIS_ALPHA_CHECKPOINTER_BACKEND")
+    run_queue_backend: str = Field(default="memory", alias="AEGIS_ALPHA_RUN_QUEUE_BACKEND")
+    # Declared replica count; >1 with process-local backends logs a warning at startup.
+    replicas: int = Field(default=1, alias="AEGIS_ALPHA_REPLICAS")
     message_queue_enabled: bool = Field(default=True, alias="AEGIS_ALPHA_MESSAGE_QUEUE_ENABLED")
     message_queue_steering_mode: str = Field(
         default="one-at-a-time", alias="AEGIS_ALPHA_MESSAGE_QUEUE_STEERING_MODE"
@@ -94,8 +111,10 @@ class Settings(BaseSettings):
     message_queue_max_deliveries: int = Field(
         default=16, alias="AEGIS_ALPHA_MESSAGE_QUEUE_MAX_DELIVERIES"
     )
+    # P4-11: default off (pi HEAD removed skipping; tool calls of one message run concurrently and
+    # steering is delivered after the batch). 待确认 with product.
     message_queue_skip_remaining_tools: bool = Field(
-        default=True, alias="AEGIS_ALPHA_MESSAGE_QUEUE_SKIP_REMAINING_TOOLS"
+        default=False, alias="AEGIS_ALPHA_MESSAGE_QUEUE_SKIP_REMAINING_TOOLS"
     )
     message_queue_max_threads: int = Field(default=1000, alias="AEGIS_ALPHA_MESSAGE_QUEUE_MAX_THREADS")
 

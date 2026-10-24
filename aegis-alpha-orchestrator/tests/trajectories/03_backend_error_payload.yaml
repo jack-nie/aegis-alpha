@@ -1,0 +1,13 @@
+name: backend_error_payload
+description: a backend {"error","status":"unavailable"} dict becomes isError, and the model sees it as an error.
+tools:
+  get_quote: {args: {symbol: str}, returns: {error: upstream timeout, status: unavailable}}
+script:
+  - tool_calls: [{name: get_quote, args: {symbol: AAPL}}]
+  - content: '{"summary": "quote unavailable; data missing", "confidence": 0.2}'
+expect:
+  status: workflow_complete
+  tool_errors: [get_quote]
+  llm_calls: 2
+  request_contains: [{call: 2, text: "upstream timeout"}]
+  summary_contains: {agent: "unavailable"}

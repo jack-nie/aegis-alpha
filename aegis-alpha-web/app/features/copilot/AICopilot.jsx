@@ -9,6 +9,7 @@ import {
   summarizeWorkflowRunResult,
   waitForWorkflowRun,
 } from "../../lib/workflowRun";
+import { buildChatPayload, DELIVERY_OPTIONS, pickQueueResults, queueBadge } from "./queueDelivery";
 
 const NODE_LABELS = {
   start: "开始",
@@ -202,7 +203,16 @@ export function AICopilot({ setCopilotOpen, api, promptRequest, onPromptHandled,
   ];
   const [messages, setMessages] = useState(initialMessages);
   const [input, setInput] = useState("");
-  const [loading, setLoading] = useState(false);
+  // P4-11: several requests can be in flight (messages queued into a running workflow).
+  const [pendingRequests, setPendingRequests] = useState(0);
+  const loading = pendingRequests > 0;
+  const [delivery, setDelivery] = useState("auto");
+  const [activeRunId, setActiveRunId] = useState(null);
+  const threadIdRef = useRef(null);
+  const queuedCountRef = useRef(0);
+  const seenQueueResultIdsRef = useRef(new Set());
+  // While a dispatched run is in progress the input stays open so messages can be queued into it.
+  const busy = loading && !activeRunId;
   const [thinkingEvents, setThinkingEvents] = useState([]);
   const messagesEndRef = useRef(null);
   const handledPromptIdRef = useRef(null);
@@ -215,13 +225,34 @@ export function AICopilot({ setCopilotOpen, api, promptRequest, onPromptHandled,
       const text = (rawText || "").trim();
       if (!text) return;
       setMessages((prev) => [...prev, { role: "user", content: text }]);
-      setLoading(true);
+      setPendingRequests((n) => n + 1);
+      let startedRunId = null;
       try {
-        const payload = {
-          message: text,
+        const payload = buildChatPayload({
+          text,
           pageContext: buildPageContext(pageContext),
-        };
+          threadId: threadIdRef.current,
+          delivery,
+        });
         const result = await api("/chat/messages", { method: "POST", body: JSON.stringify(payload) });
+        if (result?.threadId) {
+          threadIdRef.current = result.threadId;
+        }
+        const badge = queueBadge(result);
+        if (badge) {
+          if (result?.queued) queuedCountRef.current += 1;
+          setMessages((prev) => [
+            ...prev,
+            {
+              role: "assistant",
+              content: result?.content || result?.message || "",
+              ok: result?.ok !== false,
+              provider: result?.provider,
+              queueBadge: badge,
+            },
+          ]);
+          return;
+        }
         let content = result?.content || result?.message || "后端没有返回内容。";
         if (result?.needsClarification && result?.clarificationPrompt) {
           content = result.clarificationPrompt;
@@ -240,6 +271,8 @@ export function AICopilot({ setCopilotOpen, api, promptRequest, onPromptHandled,
                 provider: "workflow-router",
               },
             ]);
+            startedRunId = result.runId;
+            setActiveRunId(result.runId);
             const run = await waitForWorkflowRun(api, result.runId, {
               onEvents: (events) => {
                 const nodeEvents = events.filter(
@@ -275,6 +308,27 @@ export function AICopilot({ setCopilotOpen, api, promptRequest, onPromptHandled,
               }
             }
             content = summarizeWorkflowRunResult(run, result, runResult);
+            if (queuedCountRef.current > 0 && threadIdRef.current) {
+              // P4-11: answers to messages queued during this run are written back to the thread.
+              const queuedAnswers = [];
+              for (let attempt = 0; attempt < 2 && queuedAnswers.length === 0; attempt += 1) {
+                if (attempt > 0) await new Promise((resolve) => setTimeout(resolve, 1000));
+                try {
+                  const thread = await api(`/api/chat/threads/${threadIdRef.current}/messages?limit=20`);
+                  queuedAnswers.push(...pickQueueResults(thread, seenQueueResultIdsRef.current));
+                } catch {
+                  /* thread read is best effort */
+                }
+              }
+              queuedAnswers.forEach((m) => seenQueueResultIdsRef.current.add(m.messageId));
+              queuedCountRef.current = 0;
+              if (queuedAnswers.length) {
+                setMessages((prev) => [
+                  ...prev,
+                  ...queuedAnswers.map((m) => ({ role: "assistant", content: m.content, ok: true, provider: "agent-queue-result" })),
+                ]);
+              }
+            }
             const st = String(run?.status || "").toUpperCase();
             replyOk = st === "COMPLETED" || st === "DEGRADED" || st === "COMPLETED_DEGRADED";
           } catch (fetchErr) {
@@ -292,9 +346,11 @@ export function AICopilot({ setCopilotOpen, api, promptRequest, onPromptHandled,
         setThinkingEvents([]);
         setMessages((prev) => {
           // Drop the temporary "等待结果" bubble if we added one
-          const withoutPending = prev.filter(
-            (m) => !(m.role === "assistant" && m.provider === "workflow-router" && String(m.content || "").includes("正在等待工作流")),
-          );
+          const withoutPending = startedRunId
+            ? prev.filter(
+                (m) => !(m.role === "assistant" && m.provider === "workflow-router" && String(m.content || "").includes("正在等待工作流")),
+              )
+            : prev;
           return [
             ...withoutPending,
             {
@@ -324,10 +380,11 @@ export function AICopilot({ setCopilotOpen, api, promptRequest, onPromptHandled,
           },
         ]);
       } finally {
-        setLoading(false);
+        if (startedRunId) setActiveRunId((current) => (current === startedRunId ? null : current));
+        setPendingRequests((n) => Math.max(0, n - 1));
       }
     },
-    [api, pageContext],
+    [api, pageContext, delivery],
   );
 
   useEffect(() => {
@@ -339,7 +396,7 @@ export function AICopilot({ setCopilotOpen, api, promptRequest, onPromptHandled,
   }, [promptRequest, sendMessage, onPromptHandled]);
 
   const handleSend = () => {
-    if (!input.trim() || loading) return;
+    if (!input.trim() || busy) return;
     const text = input.trim();
     setInput("");
     requestAnimationFrame(() => {
@@ -349,7 +406,7 @@ export function AICopilot({ setCopilotOpen, api, promptRequest, onPromptHandled,
     sendMessage(text);
   };
   const handleSuggestion = (text) => {
-    if (loading) return;
+    if (busy) return;
     sendMessage(text);
   };
 
@@ -493,6 +550,11 @@ export function AICopilot({ setCopilotOpen, api, promptRequest, onPromptHandled,
                   ))}
                 </div>
               )}
+              {msg.queueBadge && (
+                <div className="mt-1 inline-flex rounded-full border border-blue-200 bg-blue-50 px-2 py-0.5 text-[11px] text-blue-700" data-testid="queue-badge">
+                  {msg.queueBadge}
+                </div>
+              )}
               {msg.needsClarification && (
                 <div className="mt-1 text-[11px] font-medium text-amber-600">需要补充信息后继续</div>
               )}
@@ -540,6 +602,23 @@ export function AICopilot({ setCopilotOpen, api, promptRequest, onPromptHandled,
         )}
       </div>
       <div className="border-t border-gray-200 bg-white p-3">
+        {activeRunId && (
+          <div className="mb-2 flex items-center gap-2 text-[11px] text-gray-500" data-testid="queue-delivery">
+            <span>工作流运行中（{activeRunId}），新消息投递方式：</span>
+            <select
+              value={delivery}
+              onChange={(e) => setDelivery(e.target.value)}
+              className="rounded border border-gray-300 px-1.5 py-0.5 text-[11px]"
+              aria-label="排队消息投递方式"
+            >
+              {DELIVERY_OPTIONS.map((opt) => (
+                <option key={opt.value} value={opt.value}>
+                  {opt.label}
+                </option>
+              ))}
+            </select>
+          </div>
+        )}
         <div className="flex gap-2">
           <textarea
             value={input}
@@ -561,7 +640,7 @@ export function AICopilot({ setCopilotOpen, api, promptRequest, onPromptHandled,
           <button
             type="button"
             onClick={handleSend}
-            disabled={!input.trim() || loading}
+            disabled={!input.trim() || busy}
             className="rounded-lg bg-blue-600 px-3 py-2 text-white transition-colors hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-50"
             aria-label="发送 AI Copilot 消息"
           >

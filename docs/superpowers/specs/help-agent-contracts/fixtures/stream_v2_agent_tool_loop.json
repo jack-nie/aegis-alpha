@@ -1,0 +1,25 @@
+{
+  "description": "P4-9 event protocol v2: one general.agent node with a tool round whose tool fails (HTTP 503). Real model deltas arrive before the node_update; tool calls are reported as start/end pairs; usage events follow node updates.",
+  "requiredKeys": {
+    "node_start": ["nodeId", "nodeName", "handler", "turn"],
+    "message_delta": ["nodeId", "delta", "final"],
+    "tool_execution_start": ["toolCallId", "toolName", "nodeId", "args"],
+    "tool_execution_end": ["toolCallId", "toolName", "nodeId", "isError", "durationMs", "truncated"],
+    "usage": ["nodeId", "scope", "usage"],
+    "node_update": ["nodeId", "nodeName", "handler", "status", "ok", "degraded", "startedAt", "completedAt", "durationMs"]
+  },
+  "events": [
+    {"event": "node_start", "data": {"nodeId": "agent", "nodeName": "A", "handler": "general.agent", "turn": 1}},
+    {"event": "message_delta", "data": {"nodeId": "agent", "turn": 1, "attempt": 1, "delta": "Checking ", "final": false}},
+    {"event": "message_delta", "data": {"nodeId": "agent", "turn": 1, "attempt": 1, "delta": "the quote", "final": false}},
+    {"event": "node_update", "data": {"nodeId": "agent", "nodeName": "A", "handler": "general.agent", "status": "awaiting_tools", "ok": true, "degraded": false, "startedAt": "2026-10-24T00:00:00+00:00", "completedAt": "2026-10-24T00:00:01+00:00", "durationMs": 1000, "turnUsage": {"inputTokens": 10, "outputTokens": 5, "totalTokens": 15}}},
+    {"event": "usage", "data": {"nodeId": "agent", "scope": "turn", "usage": {"inputTokens": 10, "outputTokens": 5, "totalTokens": 15}}},
+    {"event": "tool_execution_start", "data": {"toolCallId": "call-1", "toolName": "get_stock_quote", "nodeId": "agent", "args": {"symbol": "AAPL"}}},
+    {"event": "tool_execution_end", "data": {"toolCallId": "call-1", "toolName": "get_stock_quote", "nodeId": "agent", "isError": true, "durationMs": 12, "truncated": false}},
+    {"event": "node_start", "data": {"nodeId": "agent", "nodeName": "A", "handler": "general.agent", "turn": 2}},
+    {"event": "message_delta", "data": {"nodeId": "agent", "turn": 2, "attempt": 1, "delta": "Quote unavailable.", "final": false}},
+    {"event": "node_update", "data": {"nodeId": "agent", "nodeName": "A", "handler": "general.agent", "status": "completed", "ok": true, "degraded": false, "startedAt": "2026-10-24T00:00:01+00:00", "completedAt": "2026-10-24T00:00:02+00:00", "durationMs": 1000, "tokenUsage": {"inputTokens": 30, "outputTokens": 12, "totalTokens": 42}}},
+    {"event": "usage", "data": {"nodeId": "agent", "scope": "node", "usage": {"inputTokens": 30, "outputTokens": 12, "totalTokens": 42}}},
+    {"event": "workflow_complete", "data": {"ok": true, "degraded": false, "final_state": {}}}
+  ]
+}

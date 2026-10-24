@@ -324,6 +324,43 @@ public class WorkflowController {
     }
 
     /**
+     * P4-10 (R11): streaming variant of {@code /approval}. Same 401/404/403/400 checks; the resumed graph's
+     * events (node_start, message_delta, tool_execution_*, usage, node_update, ...) are forwarded, then the
+     * terminal event and a {@code run_state} snapshot. A run not awaiting approval yields an {@code error}
+     * event with code NOT_AWAITING_APPROVAL; an already decided run yields only {@code run_state}.
+     */
+    @PostMapping("/workflow/runs/{runId}/approval/stream")
+    public ResponseEntity<SseEmitter> decideApprovalStream(
+            @RequestHeader(value = "Authorization", required = false) String authorization,
+            @PathVariable String runId,
+            @RequestBody(required = false) Map<String, Object> body) {
+        AuthenticatedPrincipal principal = authService.principal(authorization);
+        if (principal == null) {
+            return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build();
+        }
+        if (workflowService.runForPrincipal(runId, principal) == null) {
+            return ResponseEntity.notFound().build();
+        }
+        if (!workflowService.isApprover(principal)) {
+            return ResponseEntity.status(HttpStatus.FORBIDDEN).build();
+        }
+        Object approved = body == null ? null : body.get("approved");
+        if (!(approved instanceof Boolean)) {
+            return ResponseEntity.badRequest().build();
+        }
+        String comment = body.get("comment") == null ? null : String.valueOf(body.get("comment"));
+        SseEmitter emitter = new SseEmitter(300000L);
+        workflowExecutor.execute(() -> {
+            try {
+                workflowService.decideApprovalStreaming(runId, (Boolean) approved, comment, principal, emitter);
+            } catch (Exception ex) {
+                try { emitter.completeWithError(ex); } catch (Exception ignored) {}
+            }
+        });
+        return ResponseEntity.ok(emitter);
+    }
+
+    /**
      * Queue a user message into the caller's own running agent loop (pi-style steer / followUp):
      * body {@code {"kind": "steer"|"follow_up", "message": string}} (kind defaults to follow_up).
      * 401 unauthenticated, 404 run missing or not owned by the caller, 422 invalid body,

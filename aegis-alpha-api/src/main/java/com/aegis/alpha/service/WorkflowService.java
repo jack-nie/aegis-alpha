@@ -79,6 +79,7 @@ public class WorkflowService {
      * Spring injects the bounded {@code workflowExecutor} bean through the setter below.
      */
     private Executor workflowExecutor = Runnable::run;
+    private QueueResultWriteback queueResultWriteback;
     /** P3-10: approval gate (decide / approver roles); plain collaborator so the constructor contract is unchanged. */
     private final WorkflowApprovalService approval;
 
@@ -670,14 +671,56 @@ public class WorkflowService {
         return digest;
     }
 
-    /** P3-13: single FAILED write for the non-streaming paths (the seam for a conditional/CAS write later). */
+    /**
+     * P3-13 / P4-4: single FAILED write for the non-streaming paths. Conditional (CAS) on RUNNING/QUEUED and
+     * no cancel request, so a failure observed after a user cancel (e.g. the orchestrator stopped the
+     * graph) never overwrites CANCELLED; a cancel requested meanwhile ends the run as CANCELLED instead.
+     */
     private void markRunFailed(WorkflowRun run, Exception ex) {
         run.setStatus("FAILED");
         run.setCompletedAt(now());
         run.setErrorMessage(ex.getMessage());
         run.setControlStatus("FAILED");
-        mapper.updateRun(run);
-        recordRunEvent(run, "RUN_FAILED", null, null, "FAILED", ex.getMessage(), null, 1000000);
+        if (mapper.updateRunStatusIf(run, RUNNING_OR_QUEUED, true) > 0) {
+            recordRunEvent(run, "RUN_FAILED", null, null, "FAILED", ex.getMessage(), null, 1000000);
+            return;
+        }
+        WorkflowRun latest = mapper.findRun(run.getRunId());
+        if (isCancelRequested(latest)) {
+            finishSyncAsCancelled(latest, "Workflow run cancelled; the orchestrator run was stopped.");
+        }
+    }
+
+    static final List<String> RUNNING_OR_QUEUED = Arrays.asList("RUNNING", "QUEUED");
+
+    /**
+     * P4-4: terminal / paused writes of the synchronous orchestrator path only apply while the run is
+     * still RUNNING and not cancelled (CAS). Losing the race means the user cancelled (finish as
+     * CANCELLED) or something else moved the run on; either way the caller stops.
+     */
+    private void writeSyncRunIfRunning(WorkflowRun run) {
+        if (mapper.updateRunStatusIf(run, RUNNING_ONLY, true) > 0) {
+            return;
+        }
+        WorkflowRun latest = mapper.findRun(run.getRunId());
+        if (isCancelRequested(latest)) {
+            finishSyncAsCancelled(latest, "Workflow run cancelled while the orchestrator was running it.");
+            throw new WorkflowStoppedException("CANCELLED");
+        }
+        throw new WorkflowStoppedException(latest == null ? "UNKNOWN" : String.valueOf(latest.getStatus()));
+    }
+
+    private void finishSyncAsCancelled(WorkflowRun latest, String message) {
+        if (latest == null || "CANCELLED".equals(latest.getStatus())) {
+            return;
+        }
+        latest.setStatus("CANCELLED");
+        latest.setControlStatus("CANCELLED");
+        latest.setCancelRequested(1);
+        latest.setCompletedAt(now());
+        if (mapper.updateRunStatusIf(latest, Arrays.asList("RUNNING", "PAUSED", "QUEUED"), false) > 0) {
+            recordRunEvent(latest, "RUN_CANCELLED", null, null, "CANCELLED", message, null, 1000000);
+        }
     }
 
     public WorkflowRun startWithStreaming(String workflowKey, String subject, Map<String, Object> inputs,
@@ -766,8 +809,17 @@ public class WorkflowService {
                 }
             }
 
-            /* P2-17: re-read before acting; a cancel requested meanwhile ends the stream as CANCELLED. */
-            private boolean stopIfCancelled() {
+            /* P4-10: next time the cancel flag may be re-read (high-rate v2 events are throttled). */
+            private long nextCancelCheckAt = Long.MIN_VALUE;
+
+            /* P2-17: re-read before acting; a cancel requested meanwhile ends the stream as CANCELLED.
+             * P4-10: at most one DB read per cancel-check interval unless {@code force} (terminal events). */
+            private boolean stopIfCancelled(boolean force) {
+                long nowMs = cancelCheckClock.getAsLong();
+                if (!force && nowMs < nextCancelCheckAt) {
+                    return false;
+                }
+                nextCancelCheckAt = nowMs + streamCancelCheckIntervalMs;
                 WorkflowRun latest = mapper.findRun(runId);
                 if (!isCancelRequested(latest)) {
                     return false;
@@ -792,10 +844,21 @@ public class WorkflowService {
 
             @Override public void onEvent(String eventName, String data) {
                 try {
-                    if (stopIfCancelled()) {
+                    if (stopIfCancelled(isTerminalStreamEvent(eventName))) {
                         return;
                     }
-                    if ("node_update".equals(eventName)) {
+                    if (isStreamV2Event(eventName)) {
+                        /* P4-10: v2 progress events are forwarded, not persisted; only a finished tool call
+                         * leaves a run event (no args, no result body). */
+                        if ("tool_execution_end".equals(eventName)) {
+                            Map<String, Object> audit = toolExecutionEndAudit(parseJsonMap(data));
+                            recordRunEvent(run, "TOOL_EXECUTION_END", null,
+                                    hasText(string(audit.get("nodeId"))) ? string(audit.get("nodeId")) : null, "RUNNING",
+                                    toolExecutionEndMessage(audit), audit, streamSequence.incrementAndGet() * 100);
+                        }
+                        send(org.springframework.web.servlet.mvc.method.annotation.SseEmitter.event()
+                                .name(eventName).data(data == null ? "{}" : data));
+                    } else if ("node_update".equals(eventName)) {
                         Map<String, Object> nodePayload = parseJsonMap(data);
                         WorkflowNodeRun nodeRun = upsertStreamedNodeRun(run, nodePayload, streamedNodeRuns,
                                 streamLayoutNodes, streamSequence.incrementAndGet());
@@ -1255,6 +1318,48 @@ public class WorkflowService {
         return mapper.findRun(runId);
     }
 
+    /** P4-10 (待确认): minimum interval between cancel-flag DB reads while streaming (terminal events always check). */
+    @Value("${aegis.workflow.stream.cancel-check-interval-ms:500}")
+    private long streamCancelCheckIntervalMs = 500L;
+
+    private java.util.function.LongSupplier cancelCheckClock = System::currentTimeMillis;
+
+    void setStreamCancelCheckIntervalMs(long intervalMs) {
+        this.streamCancelCheckIntervalMs = Math.max(0L, intervalMs);
+    }
+
+    void setCancelCheckClock(java.util.function.LongSupplier clock) {
+        this.cancelCheckClock = clock == null ? System::currentTimeMillis : clock;
+    }
+
+    /** P4-10: orchestrator event protocol v2 events forwarded to the client (P4-9). */
+    static boolean isStreamV2Event(String eventName) {
+        return "node_start".equals(eventName) || "message_delta".equals(eventName) || "token".equals(eventName)
+                || "tool_execution_start".equals(eventName) || "tool_execution_end".equals(eventName)
+                || "usage".equals(eventName);
+    }
+
+    static boolean isTerminalStreamEvent(String eventName) {
+        return "workflow_complete".equals(eventName) || "error".equals(eventName)
+                || "human_interrupt".equals(eventName) || "cancelled".equals(eventName);
+    }
+
+    /** Persisted subset of a tool_execution_end event: identity, outcome and timing only. */
+    static Map<String, Object> toolExecutionEndAudit(Map<String, Object> payload) {
+        Map<String, Object> audit = new LinkedHashMap<>();
+        for (String key : new String[] {"toolCallId", "toolName", "nodeId", "isError", "durationMs", "truncated"}) {
+            if (payload != null && payload.get(key) != null) {
+                audit.put(key, payload.get(key));
+            }
+        }
+        return audit;
+    }
+
+    private static String toolExecutionEndMessage(Map<String, Object> audit) {
+        String name = audit.get("toolName") == null ? "tool" : String.valueOf(audit.get("toolName"));
+        return (Boolean.TRUE.equals(audit.get("isError")) ? "Tool failed: " : "Tool completed: ") + name;
+    }
+
     /** P2-19 (待确认): stop reading and cancel the run when the SSE client goes away. */
     @Value("${aegis.workflow.stream.cancel-on-disconnect:false}")
     private boolean cancelStreamOnDisconnect = false;
@@ -1287,6 +1392,12 @@ public class WorkflowService {
         return approval.decideApproval(runId, approved, comment, approver);
     }
 
+    /** P4-10 (R11): streaming approval; see {@link WorkflowApprovalService#decideApprovalStreaming}. */
+    public void decideApprovalStreaming(String runId, boolean approved, String comment, AuthenticatedPrincipal approver,
+                                        org.springframework.web.servlet.mvc.method.annotation.SseEmitter emitter) {
+        approval.decideApprovalStreaming(runId, approved, comment, approver, emitter);
+    }
+
     boolean isHumanInterrupt(WorkflowRun run) {
         return run != null && "HUMAN_INTERRUPT".equals(run.getControlStatus());
     }
@@ -1307,11 +1418,34 @@ public class WorkflowService {
         } else if ("RUNNING".equals(run.getStatus())) {
             run.setCancelRequested(1);
             run.setControlStatus("CANCEL_REQUESTED");
-            mapper.updateRun(run);
-            recordRunEvent(run, "RUN_CANCEL_REQUESTED", null, null, "RUNNING", "Workflow run cancellation requested.", null, 4);
-            clearQueuedRunMessages(run);
+            /* P4-4: CAS so a run that completed meanwhile is not rewritten to RUNNING/CANCEL_REQUESTED. */
+            if (mapper.updateRunStatusIf(run, RUNNING_ONLY, false) > 0) {
+                recordRunEvent(run, "RUN_CANCEL_REQUESTED", null, null, "RUNNING", "Workflow run cancellation requested.", null, 4);
+                clearQueuedRunMessages(run);
+                requestOrchestratorCancel(run);
+            }
         }
         return mapper.findRun(runId);
+    }
+
+    /**
+     * P4-4: ask the orchestrator to stop the graph of a RUNNING run (best effort). The orchestrator answers
+     * the in-flight execute/stream call with a cancelled outcome; Java records CANCELLED via its CAS writes.
+     */
+    private void requestOrchestratorCancel(WorkflowRun run) {
+        if (langChainGateway == null || !langChainGateway.isEnabled()) {
+            return;
+        }
+        try {
+            Map<String, Object> response = langChainGateway.cancelRun(run.getRunId(), run.getUserId(), run.getTenantId());
+            if (response != null && !Boolean.TRUE.equals(response.get("ok"))) {
+                log.info("[WorkflowService] orchestrator cancel not applied runId={} code={}", run.getRunId(),
+                        response.get("code"));
+            }
+        } catch (RuntimeException ex) {
+            log.warn("[WorkflowService] orchestrator cancel failed runId={} type={}", run.getRunId(),
+                    ex.getClass().getSimpleName());
+        }
     }
 
     /** Cancelling a running / approval-paused run also drops its pending steering / follow-up messages (best effort). */
@@ -1483,6 +1617,12 @@ public class WorkflowService {
                 layout, run.getSubject(), state, delegatedToken, run.getRunId(), requireApproval,
                 LangChainGateway.runOwner(run.getUserId(), run.getTenantId()));
         if (response == null || Boolean.FALSE.equals(response.get("ok"))) {
+            /* P4-4: the orchestrator stopped the graph because the user cancelled -> CANCELLED, not FAILED. */
+            WorkflowRun latest = mapper.findRun(run.getRunId());
+            if (isCancelRequested(latest)) {
+                finishSyncAsCancelled(latest, "Workflow run cancelled; the orchestrator run was stopped.");
+                throw new WorkflowStoppedException("CANCELLED");
+            }
             String error = response == null ? "" : string(response.get("error"));
             throw new IllegalStateException(error == null || error.trim().isEmpty()
                     ? "Orchestrator workflow failed" : "Orchestrator workflow failed: " + error);
@@ -1510,7 +1650,7 @@ public class WorkflowService {
             run.setStatus("PAUSED");
             run.setControlStatus("HUMAN_INTERRUPT");
             run.setPauseRequested(1);
-            mapper.updateRun(run);
+            writeSyncRunIfRunning(run);
             recordRunEvent(run, "RUN_PAUSED", null, null, "PAUSED",
                     "Workflow paused for human approval.", null, 950000);
             return;
@@ -1523,7 +1663,7 @@ public class WorkflowService {
         if (degraded && (run.getErrorMessage() == null || run.getErrorMessage().trim().isEmpty())) {
             run.setErrorMessage("DEGRADED");
         }
-        mapper.updateRun(run);
+        writeSyncRunIfRunning(run);
         if (degraded) {
             recordRunEvent(run, "RUN_DEGRADED", null, null, "COMPLETED",
                     "Workflow completed with degraded nodes.", null, 999999);
@@ -2125,6 +2265,12 @@ public class WorkflowService {
         return ordered;
     }
 
+    /** P4-11: optional, so existing tests / constructors are unaffected. */
+    @Autowired(required = false)
+    public void setQueueResultWriteback(QueueResultWriteback queueResultWriteback) {
+        this.queueResultWriteback = queueResultWriteback;
+    }
+
     /** Optional setter injection keeps the existing constructor contract for tests. */
     @Autowired(required = false)
     public void setWorkflowExecutor(@Qualifier(AsyncConfig.WORKFLOW_EXECUTOR) Executor workflowExecutor) {
@@ -2242,6 +2388,17 @@ public class WorkflowService {
         event.setCreatedAt(now());
         event.setSortOrder(sortOrder);
         mapper.insertRunEvent(event);
+        if (queueResultWriteback != null && QueueResultWriteback.isTrigger(eventType)) {
+            /* P4-11: answer queued chat messages in their thread (never throws). */
+            queueResultWriteback.onRunEvent(run, eventType, payload);
+        }
+    }
+
+    /** P4-11: chat path bookkeeping — this thread queued a message into the run. */
+    public void recordChatQueuedMessage(String runId, String threadId, String kind, Object queueId) {
+        if (queueResultWriteback != null) {
+            queueResultWriteback.recordQueued(runId, threadId, kind, queueId);
+        }
     }
 
     private String normalizeIdempotencyKey(String idempotencyKey) {

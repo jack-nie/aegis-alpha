@@ -16,6 +16,7 @@ import {
 import { DegradedBanner } from "../../components/DegradedBanner";
 import { Icon, WorkflowPreviewGlyph } from "../../components/ui";
 import { API_BASE } from "../../lib/request";
+import { applyStreamEvent, emptyLiveStream, isStreamV2Event } from "./streamEvents";
 import {
   defaultWorkflowLayouts,
   workflowCatalogGroups,
@@ -53,6 +54,7 @@ export function WorkflowComposer({ api, token }) {
   const [toast, setToast] = useState("");
   const [runStatuses, setRunStatuses] = useState({});
   const [runDegradedReasons, setRunDegradedReasons] = useState([]);
+  const [liveStream, setLiveStream] = useState(emptyLiveStream);
   const [runForm, setRunForm] = useState({
     ticker: "AAPL",
     industry: "AI Infrastructure",
@@ -210,6 +212,7 @@ export function WorkflowComposer({ api, token }) {
     if (!workflow.readonlyFlag) await saveLayout();
     setRunStatuses({});
     setRunDegradedReasons([]);
+    setLiveStream(emptyLiveStream());
     const inputs = {
       ticker: runForm.ticker.trim() || "AAPL",
       industry: runForm.industry.trim() || "AI Infrastructure",
@@ -253,7 +256,18 @@ export function WorkflowComposer({ api, token }) {
             const raw = part.slice(5).trim();
             try {
               const data = JSON.parse(raw);
-              if (currentEvent === "node_update") {
+              if (isStreamV2Event(currentEvent)) {
+                // P4-10: v2 progress events (live text, tool calls, usage) — display only.
+                const eventName = currentEvent;
+                setLiveStream((prev) => applyStreamEvent(prev, eventName, data));
+                if (eventName === "node_start" && data.nodeId) {
+                  const nid = data.nodeId;
+                  setRunStatuses((prev) => ({ ...prev, [nid]: "running" }));
+                  setNodes((cur) =>
+                    cur.map((n) => (n.id === nid ? { ...n, data: { ...n.data, runStatus: "running" } } : n)),
+                  );
+                }
+              } else if (currentEvent === "node_update") {
                 const nid = data.nodeId;
                 const status = data.event === "node_failed" || data.ok === false ? "error" : "success";
                 setRunStatuses((prev) => ({ ...prev, [nid]: "running" }));
@@ -493,6 +507,39 @@ export function WorkflowComposer({ api, token }) {
         {toast && (
           <div className="mt-3 inline-flex rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-700">
             {toast}
+          </div>
+        )}
+        {(liveStream.tools.length > 0 || liveStream.final || Object.values(liveStream.text).some(Boolean)) && (
+          <div className="mt-3 rounded-lg border border-gray-200 bg-white px-3 py-2 text-xs text-gray-700" data-testid="live-stream">
+            {liveStream.tools.length > 0 && (
+              <div className="mb-1 flex flex-wrap gap-2">
+                {liveStream.tools.map((tool) => (
+                  <span
+                    key={tool.toolCallId || tool.toolName}
+                    className={`rounded px-2 py-0.5 ${tool.status === "error" ? "bg-red-50 text-red-700" : tool.status === "running" ? "bg-amber-50 text-amber-700" : "bg-emerald-50 text-emerald-700"}`}
+                  >
+                    {tool.toolName} · {tool.status === "running" ? "执行中" : tool.status === "error" ? "失败" : "完成"}
+                    {typeof tool.durationMs === "number" ? ` · ${tool.durationMs}ms` : ""}
+                  </span>
+                ))}
+              </div>
+            )}
+            {liveStream.final ? (
+              <div className="whitespace-pre-wrap">
+                {liveStream.final.withheld && <span className="mr-1 font-semibold text-amber-700">[未通过证据闸门，仅显示结论]</span>}
+                {liveStream.final.text}
+              </div>
+            ) : (
+              Object.entries(liveStream.text)
+                .filter(([, text]) => text)
+                .slice(-1)
+                .map(([nid, text]) => (
+                  <div key={nid} className="whitespace-pre-wrap">
+                    <span className="mr-1 font-semibold">{nid}:</span>
+                    {text}
+                  </div>
+                ))
+            )}
           </div>
         )}
         {runDegradedReasons.length > 0 && (

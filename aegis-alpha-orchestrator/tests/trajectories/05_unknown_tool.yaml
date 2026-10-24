@@ -1,0 +1,12 @@
+name: unknown_tool
+description: a hallucinated tool name is answered with an error result; nothing executes.
+tools:
+  get_quote: {args: {symbol: str}, returns: {price: 1}}
+script:
+  - tool_calls: [{name: get_insider_secrets, args: {symbol: AAPL}}]
+  - content: '{"summary": "no such tool; answered without it", "confidence": 0.3}'
+expect:
+  status: workflow_complete
+  tools_not_executed: [get_quote]
+  llm_calls: 2
+  request_contains: [{call: 2, text: "get_insider_secrets"}]
