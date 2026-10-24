@@ -74,6 +74,16 @@ class ChatThreadMessagesTest {
     }
 
     @Test
+    void legacyThreadMessagesAreAdminOnly() {
+        when(mapper.findThreadOwner("legacy")).thenReturn(new LinkedHashMap<String, Object>());
+        assertThatThrownBy(() -> service.threadMessages("legacy", alice, 10)).isInstanceOf(SecurityException.class);
+        AuthenticatedPrincipal admin = new AuthenticatedPrincipal("a-1", "admin", "tenant-1",
+                Collections.singletonList("admin"));
+        when(mapper.findRecentMessages("legacy", 10)).thenReturn(Collections.singletonList(row("m1", "user", "hi")));
+        assertThat(service.threadMessages("legacy", admin, 10)).hasSize(1);
+    }
+
+    @Test
     void messageIdsAreTimeOrderedAndFitTheColumn() {
         Set<String> seen = new HashSet<String>();
         String prev = "";

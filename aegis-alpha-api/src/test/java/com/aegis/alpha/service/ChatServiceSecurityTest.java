@@ -185,36 +185,66 @@ class ChatServiceSecurityTest {
     }
 
     @Test
-    void legacyThreadWithoutOwnerIsClaimedByTheCaller() {
+    void legacyThreadWithoutOwnerIsNotClaimableByFirstCaller() {
+        /* Decision D2: first caller no longer wins; non-admins are refused and nothing is written. */
         when(chatMapper.findThreadOwner("thread-legacy")).thenReturn(new LinkedHashMap<String, Object>());
-        when(chatMapper.updateThreadOwner("thread-legacy", "u-1", "tenant-1")).thenReturn(1);
+
+        Map<String, Object> body = body("继续这个会话");
+        body.put("threadId", "thread-legacy");
+
+        assertThatThrownBy(() -> chatService.reply(body, principal("u-1", "tenant-1")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage(ChatService.LEGACY_THREAD_UNASSIGNED);
+        verify(chatMapper, never()).updateThreadOwner(anyString(), anyString(), anyString());
+        verify(chatMapper, never()).insertMessage(anyString(), eq("thread-legacy"), anyString(), anyString());
+    }
+
+    @Test
+    void adminMayContinueLegacyThreadWithoutTakingOwnership() {
+        when(chatMapper.findThreadOwner("thread-legacy")).thenReturn(new LinkedHashMap<String, Object>());
         when(helpRoutingService.classifyExtended(anyString(), any())).thenReturn(intent(HelpIntent.RouteAction.COPILOT));
 
         Map<String, Object> body = body("继续这个会话");
         body.put("threadId", "thread-legacy");
 
-        Map<String, Object> response = chatService.reply(body, principal("u-1", "tenant-1"));
+        Map<String, Object> response = chatService.reply(body, admin("admin-1", "tenant-1"));
 
         assertThat(response.get("threadId")).isEqualTo("thread-legacy");
-        verify(chatMapper).updateThreadOwner("thread-legacy", "u-1", "tenant-1");
+        verify(chatMapper, never()).updateThreadOwner(anyString(), anyString(), anyString());
     }
 
     @Test
-    void legacyClaimLostToAnotherUserIsRejected() {
-        Map<String, Object> winner = new LinkedHashMap<String, Object>();
-        winner.put("user_id", "u-2");
-        winner.put("tenant_id", "tenant-1");
-        when(chatMapper.findThreadOwner("thread-race"))
-                .thenReturn(new LinkedHashMap<String, Object>())
-                .thenReturn(winner);
-        when(chatMapper.updateThreadOwner("thread-race", "u-1", "tenant-1")).thenReturn(0);
+    void onlyAdminsCanAssignLegacyThreadsAndNeverReassign() {
+        when(chatMapper.findThreadOwner("thread-legacy")).thenReturn(new LinkedHashMap<String, Object>());
+        when(chatMapper.updateThreadOwner("thread-legacy", "u-9", "tenant-1")).thenReturn(1).thenReturn(0);
 
-        Map<String, Object> body = body("继续这个会话");
-        body.put("threadId", "thread-race");
+        assertThatThrownBy(() -> chatService.assignLegacyThread("thread-legacy", "u-9", "tenant-1",
+                principal("u-1", "tenant-1"))).isInstanceOf(SecurityException.class);
+        assertThatThrownBy(() -> chatService.assignLegacyThread("thread-legacy", " ", "tenant-1",
+                admin("admin-1", "tenant-1"))).isInstanceOf(IllegalArgumentException.class);
+        assertThat(chatService.assignLegacyThread("thread-legacy", "u-9", "tenant-1", admin("admin-1", "tenant-1")))
+                .isEqualTo(ChatService.AssignOutcome.ASSIGNED);
+        assertThat(chatService.assignLegacyThread("thread-legacy", "u-9", "tenant-1", admin("admin-1", "tenant-1")))
+                .isEqualTo(ChatService.AssignOutcome.ALREADY_OWNED);
+        when(chatMapper.findThreadOwner("missing")).thenReturn(null);
+        assertThat(chatService.assignLegacyThread("missing", "u-9", "tenant-1", admin("admin-1", "tenant-1")))
+                .isEqualTo(ChatService.AssignOutcome.NOT_FOUND);
+    }
 
-        assertThatThrownBy(() -> chatService.reply(body, principal("u-1", "tenant-1")))
-                .isInstanceOf(IllegalArgumentException.class);
-        verify(chatMapper, never()).insertMessage(anyString(), eq("thread-race"), anyString(), anyString());
+    @Test
+    void adminThreadListIncludesFlaggedLegacyThreads() {
+        Map<String, Object> legacy = new LinkedHashMap<String, Object>();
+        legacy.put("thread_id", "thread-legacy");
+        when(chatMapper.threadsForPrincipal("admin-1", "tenant-1")).thenReturn(Collections.<Map<String, Object>>emptyList());
+        when(chatMapper.unownedThreads()).thenReturn(Collections.singletonList(legacy));
+
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> adminView = (List<Map<String, Object>>) chatService.threads(admin("admin-1", "tenant-1"));
+        assertThat(adminView).hasSize(1);
+        assertThat(adminView.get(0)).containsEntry("legacyUnassigned", Boolean.TRUE);
+
+        chatService.threads(principal("u-1", "tenant-1"));
+        verify(chatMapper, org.mockito.Mockito.times(1)).unownedThreads();
     }
 
     @Test
@@ -376,6 +406,10 @@ class ChatServiceSecurityTest {
     }
 
     /* ============================ helpers ============================ */
+
+    private static AuthenticatedPrincipal admin(String userId, String tenantId) {
+        return new AuthenticatedPrincipal(userId, userId, tenantId, Collections.singletonList("admin"));
+    }
 
     private static AuthenticatedPrincipal principal(String userId, String tenantId) {
         return new AuthenticatedPrincipal(userId, userId, tenantId, Collections.<String>emptyList());

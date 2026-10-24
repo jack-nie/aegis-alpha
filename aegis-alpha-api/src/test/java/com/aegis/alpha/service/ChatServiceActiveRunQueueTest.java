@@ -46,7 +46,11 @@ class ChatServiceActiveRunQueueTest {
     @BeforeEach
     void setUp() {
         chatMapper = mock(ChatMapper.class);
-        when(chatMapper.updateThreadOwner(anyString(), anyString(), anyString())).thenReturn(1);
+        /* D2: legacy threads are no longer claimable, so every thread is owned by the caller. */
+        java.util.Map<String, Object> owned = new java.util.LinkedHashMap<String, Object>();
+        owned.put("user_id", "u-1");
+        owned.put("tenant_id", "tenant-1");
+        when(chatMapper.findThreadOwner(anyString())).thenReturn(owned);
         langChainGateway = mock(LangChainGateway.class);
         when(langChainGateway.isEnabled()).thenReturn(true);
         workflowService = mock(WorkflowService.class);

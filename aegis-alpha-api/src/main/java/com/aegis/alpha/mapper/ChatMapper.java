@@ -22,8 +22,8 @@ public interface ChatMapper {
 
     /* ================================================================ *
      * Thread ownership (P0): a thread belongs to one user + tenant.
-     * Legacy rows created before ownership tracking have null owners and
-     * are claimed by the first authenticated user that continues them.
+     * Legacy rows created before ownership tracking have null owners; only
+     * admins may access them and assign an owner (decision D2).
      * ================================================================ */
 
     @Select("select user_id, tenant_id from chat_thread where thread_id = #{threadId}")
@@ -35,12 +35,16 @@ public interface ChatMapper {
                            @Param("userId") String userId,
                            @Param("tenantId") String tenantId);
 
-    /** Claims a legacy (unowned) thread; returns 0 when another caller already owns it (lost race). */
+    /** Assigns a legacy (unowned) thread (admin only, D2); returns 0 when it already has an owner. */
     @Update("update chat_thread set user_id = #{userId}, tenant_id = #{tenantId} where thread_id = #{threadId}"
             + " and (user_id is null or user_id = '') and (tenant_id is null or tenant_id = '')")
     int updateThreadOwner(@Param("threadId") String threadId,
                            @Param("userId") String userId,
                            @Param("tenantId") String tenantId);
+
+    /** D2: legacy threads without an owner (admin listing for assignment). */
+    @Select("select thread_id, title from chat_thread where (user_id is null or user_id = '') and (tenant_id is null or tenant_id = '') order by thread_id")
+    List<Map<String, Object>> unownedThreads();
 
     @Select("select thread_id, title from chat_thread where user_id = #{userId} and tenant_id = #{tenantId} order by thread_id")
     List<Map<String, Object>> threadsForPrincipal(@Param("userId") String userId,
