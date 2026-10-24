@@ -132,6 +132,12 @@ final class WorkflowApprovalService {
     private WorkflowRun applyResumeOutcome(WorkflowRun run, boolean approved, Map<String, Object> audit,
                                            Map<String, Object> resume) {
         String runId = run.getRunId();
+        if (host.isCancelRequestedNow(runId)) {
+            /* D10a: a cancel that landed during the resume wins; never overwrite CANCELLED. */
+            host.recordRunEvent(run, "RUN_RESUME_DISCARDED", null, null, "CANCELLED",
+                    "Approval resume finished after the run was cancelled; outcome discarded.", null, 960500);
+            return mapper.findRun(runId);
+        }
         if (isResumeOk(resume)) {
             /* P2-13 / Phase-1 leftover: nodes that ran after the approval gate are materialized
              * as node runs + NODE_* events (same for runs started streaming or non-streaming). */
@@ -216,6 +222,10 @@ final class WorkflowApprovalService {
         final AtomicReference<Map<String, Object>> outcome = new AtomicReference<>();
         final String[] terminal = new String[2];
         final AtomicInteger sequence = new AtomicInteger(0);
+        /* D10a: cancel checks while the resume stream is open (throttled like the workflow stream). */
+        final SseStreamReader.Handle readerHandle = new SseStreamReader.Handle();
+        final java.util.concurrent.atomic.AtomicBoolean cancelled = new java.util.concurrent.atomic.AtomicBoolean(false);
+        final long[] nextCancelCheckAt = {Long.MIN_VALUE};
         Map<String, Object> resume;
         if (!gateway.isEnabled()) {
             resume = new LinkedHashMap<>();
@@ -226,8 +236,26 @@ final class WorkflowApprovalService {
                     LangChainGateway.runOwner(run.getUserId(), run.getTenantId()), claim.delegatedToken);
             SseStreamReader.readSse(gateway.resumeWorkflowStreamUrl(), body, gateway.serviceAuthorizationHeader(),
                     new SseStreamReader.SseEventHandler() {
+                        private boolean stopIfCancelled(boolean force) {
+                            long nowMs = host.cancelCheckNow();
+                            if (!force && nowMs < nextCancelCheckAt[0]) {
+                                return false;
+                            }
+                            nextCancelCheckAt[0] = nowMs + host.streamCancelCheckIntervalMs();
+                            if (!host.isCancelRequestedNow(runId)) {
+                                return false;
+                            }
+                            cancelled.set(true);
+                            outcome.set(resumeOutcome(false, trace, null, "cancelled"));
+                            readerHandle.cancel();
+                            return true;
+                        }
+
                         @Override public void onEvent(String eventName, String data) {
                             if (outcome.get() != null) {
+                                return;
+                            }
+                            if (stopIfCancelled(isTerminalResumeEvent(eventName))) {
                                 return;
                             }
                             String payloadJson = data == null ? "{}" : data;
@@ -269,6 +297,9 @@ final class WorkflowApprovalService {
                         }
 
                         @Override public void onError(Exception ex) {
+                            if (outcome.get() == null && stopIfCancelled(true)) {
+                                return;
+                            }
                             if (outcome.get() == null) {
                                 outcome.set(resumeOutcome(false, trace, null, "Stream error: " + ex.getMessage()));
                             }
@@ -277,9 +308,13 @@ final class WorkflowApprovalService {
                         @Override public void onComplete() {
                             // terminal handling happens after the reader returns
                         }
-                    });
+                    }, readerHandle);
             resume = outcome.get() != null ? outcome.get()
                     : resumeOutcome(false, trace, null, "resume stream ended without a terminal event");
+        }
+        if (cancelled.get() || host.isCancelRequestedNow(runId)) {
+            finishApprovalAsCancelled(run, emitter);
+            return;
         }
         WorkflowRun updated = applyResumeOutcome(run, approved, claim.audit, resume);
         if (terminal[0] != null) {
@@ -291,6 +326,35 @@ final class WorkflowApprovalService {
             sendQuietly(emitter, "error", host.toJson(error));
         }
         sendQuietly(emitter, "run_state", host.toJson(updated));
+        completeQuietly(emitter);
+    }
+
+    private static boolean isTerminalResumeEvent(String eventName) {
+        return "human_interrupt".equals(eventName) || "workflow_complete".equals(eventName)
+                || "error".equals(eventName) || "cancelled".equals(eventName);
+    }
+
+    /**
+     * D10a: the run was cancelled while its approval resume was streaming. The cancel wins: the run ends
+     * CANCELLED (never overwritten by the resume outcome), the orchestrator is asked to stop the resumed
+     * graph (best effort), and the client gets {@code workflow_cancelled} + {@code run_state}.
+     */
+    private void finishApprovalAsCancelled(WorkflowRun run, SseEmitter emitter) {
+        WorkflowRun latest = mapper.findRun(run.getRunId());
+        if (latest != null && !"CANCELLED".equals(latest.getStatus())) {
+            latest.setStatus("CANCELLED");
+            latest.setControlStatus("CANCELLED");
+            latest.setCancelRequested(1);
+            latest.setPauseRequested(0);
+            latest.setCompletedAt(host.now());
+            if (mapper.updateRunStatusIf(latest, java.util.Arrays.asList("PAUSED", "RUNNING"), false) > 0) {
+                host.recordRunEvent(latest, "RUN_CANCELLED", null, null, "CANCELLED",
+                        "Workflow run cancelled during approval resume.", null, 1000000);
+            }
+        }
+        host.requestOrchestratorCancel(run);
+        sendQuietly(emitter, "workflow_cancelled", "{\"ok\":false,\"cancelled\":true}");
+        sendQuietly(emitter, "run_state", host.toJson(mapper.findRun(run.getRunId())));
         completeQuietly(emitter);
     }
 

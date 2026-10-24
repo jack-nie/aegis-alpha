@@ -1332,6 +1332,20 @@ public class WorkflowService {
         this.cancelCheckClock = clock == null ? System::currentTimeMillis : clock;
     }
 
+    /* D10a: the streaming approval endpoint shares the cancel-check interval and clock. */
+    long streamCancelCheckIntervalMs() {
+        return streamCancelCheckIntervalMs;
+    }
+
+    long cancelCheckNow() {
+        return cancelCheckClock.getAsLong();
+    }
+
+    /** D10a: fresh read of the run's cancel flag (cancel requested, CANCEL_REQUESTED or CANCELLED). */
+    boolean isCancelRequestedNow(String runId) {
+        return isCancelRequested(mapper.findRun(runId));
+    }
+
     /** P4-10: orchestrator event protocol v2 events forwarded to the client (P4-9). */
     static boolean isStreamV2Event(String eventName) {
         return "node_start".equals(eventName) || "message_delta".equals(eventName) || "token".equals(eventName)
@@ -1415,6 +1429,10 @@ public class WorkflowService {
             if (pausedAtApproval) {
                 clearQueuedRunMessages(run);
             }
+            if (WorkflowApprovalService.APPROVAL_IN_PROGRESS.equals(run.getControlStatus())) {
+                /* D10a: an approval is resuming the graph right now; stop it on the orchestrator too. */
+                requestOrchestratorCancel(run);
+            }
         } else if ("RUNNING".equals(run.getStatus())) {
             run.setCancelRequested(1);
             run.setControlStatus("CANCEL_REQUESTED");
@@ -1432,7 +1450,7 @@ public class WorkflowService {
      * P4-4: ask the orchestrator to stop the graph of a RUNNING run (best effort). The orchestrator answers
      * the in-flight execute/stream call with a cancelled outcome; Java records CANCELLED via its CAS writes.
      */
-    private void requestOrchestratorCancel(WorkflowRun run) {
+    void requestOrchestratorCancel(WorkflowRun run) {
         if (langChainGateway == null || !langChainGateway.isEnabled()) {
             return;
         }
