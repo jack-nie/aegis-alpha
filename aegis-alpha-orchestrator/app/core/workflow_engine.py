@@ -1916,7 +1916,11 @@ class WorkflowEngine:
 
     @staticmethod
     def topological_sort(nodes: list[Node], edges: list[Edge]) -> list[Node]:
-        """Sort nodes in topological order using Kahn's algorithm."""
+        """Sort nodes in topological order using Kahn's algorithm.
+
+        P3-9: not on the execution path (LangGraph compiles the graph); kept as a validation helper
+        and raises on cycles instead of silently dropping the nodes on the cycle.
+        """
         node_map = {n.id: n for n in nodes}
         in_degree: dict[str, int] = {n.id: 0 for n in nodes}
         adjacency: dict[str, list[str]] = defaultdict(list)
@@ -1937,4 +1941,7 @@ class WorkflowEngine:
                 if in_degree[neighbor] == 0:
                     queue.append(neighbor)
 
+        if len(result) != len(nodes):
+            remaining = sorted(nid for nid, deg in in_degree.items() if deg > 0)
+            raise ValueError(f"Workflow graph contains a cycle: {remaining}")
         return result

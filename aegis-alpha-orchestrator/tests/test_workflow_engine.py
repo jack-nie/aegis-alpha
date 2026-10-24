@@ -275,6 +275,23 @@ def test_topological_sort(mock_node_executor):
     assert ids.index("market") < ids.index("end")
 
 
+def test_topological_sort_raises_on_cycle():
+    """P3-9: a cycle used to silently drop the cyclic nodes from the result."""
+    from app.core.workflow_engine import WorkflowEngine
+    nodes = [
+        Node(id="start", data=NodeData(handler="start")),
+        Node(id="a", data=NodeData(handler="general.agent")),
+        Node(id="b", data=NodeData(handler="general.agent")),
+    ]
+    edges = [
+        Edge(source="start", target="a"),
+        Edge(source="a", target="b"),
+        Edge(source="b", target="a"),
+    ]
+    with pytest.raises(ValueError, match="cycle"):
+        WorkflowEngine.topological_sort(nodes, edges)
+
+
 def test_deep_merge():
     from app.core.workflow_engine import deep_merge
     result = deep_merge({"a": 1}, {"b": 2})
