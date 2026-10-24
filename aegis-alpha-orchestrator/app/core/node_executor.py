@@ -22,6 +22,7 @@ from .context_assembly import (
     assemble_model_context,
     with_estimated_cost,
 )
+from .prompt_builder import agent_tools_prompt, aggregate_prompt, analyst_prompt, digest_prompt
 from .prompt_safety import USER_INPUT_TAG, append_chat_turn, fence
 from .critique import critique_recommendation_draft
 from .log_safety import text_len
@@ -46,13 +47,7 @@ DIGEST_HANDLER = "finance.digest_aggregate"
 
 
 def digest_system_prompt(agent_name: str) -> str:
-    return (
-        f"You are {agent_name}. Summarize the upstream workflow outputs into a digest. "
-        "Use only facts present in the context and state missing data explicitly. "
-        "Do not output a BUY/SELL/HOLD rating or target price. "
-        "Return only JSON. Do not use markdown. "
-        'The JSON shape is {"summary":"string","signals":[...],"sources":[...],"confidence":0.5,"data":{}}.'
-    )
+    return digest_prompt(agent_name).text
 
 
 def render_prompt(template: str | None, *, subject: str, agent_name: str) -> str:
@@ -73,17 +68,7 @@ def aggregate_system_prompt(agent_name: str) -> str:
 
     Markdown report followed by one fenced ``json`` trailer the policy layer can parse.
     """
-    return (
-        f"You are {agent_name}. Generate an evidence-based investment research report. "
-        "Use markdown formatting with clear sections. "
-        "Use only numbers present in marketDataContext / tool outputs. "
-        "If critical market or financial data is missing, recommend INSUFFICIENT_DATA "
-        "and list missing fields. Never invent prices, multiples, or target prices. "
-        "End the report with exactly one fenced ```json block of the shape "
-        '{"recommendation":"BUY|HOLD|SELL|WATCH|INSUFFICIENT_DATA","confidence":0.0,'
-        '"claims":[{"text":"...","evidenceId":"..."}],"missingData":["..."]} '
-        "where every evidenceId is copied from the context."
-    )
+    return aggregate_prompt(agent_name).text
 
 
 _JSON_TRAILER = re.compile(r"```json\s*(\{.*?\})\s*```", re.DOTALL | re.IGNORECASE)
@@ -445,17 +430,14 @@ class NodeExecutor:
         is_digest = handler == DIGEST_HANDLER
         context = _assemble_context(state, aggregate=is_aggregate or is_digest)
 
-        # Build system prompt
+        # Build system prompt (P4-14: sectioned, stable prefix, versioned).
         if is_aggregate:
-            system = aggregate_system_prompt(agent_name)
+            built = aggregate_prompt(agent_name)
         elif is_digest:
-            system = digest_system_prompt(agent_name)
+            built = digest_prompt(agent_name)
         else:
-            system = (
-                f"You are {agent_name}. "
-                "Return only JSON. Do not use markdown. "
-                'The JSON shape is {"summary":"string","signals":[...],"sources":[...],"confidence":0.5,"data":{}}.'
-            )
+            built = analyst_prompt(agent_name)
+        system = built.text
 
         # Invoke LLM
         timeout_ms = max(self._config.timeout_ms, 60000) if (is_aggregate or is_digest) else self._config.timeout_ms
@@ -496,6 +478,7 @@ class NodeExecutor:
         result_data = _with_token_usage(
             response.data or {}, response, model or self._config.model, getattr(self._config, "models_file", "")
         )
+        result_data["promptVersion"] = built.version  # P4-14
         if is_digest:
             # A digest never carries an actionable label into stream summaries / Java materialization.
             result_data.pop("recommendation", None)
@@ -790,17 +773,8 @@ class NodeExecutor:
 
         context = _assemble_context(state, aggregate=False)
 
-        system = (
-            f"You are {agent_name}. "
-            "You may call tools when you need live market, financial, news, or portfolio data. "
-            "When you have enough evidence, return only JSON (no markdown) with shape "
-            '{"summary":"string","signals":[...],"sources":[...],"confidence":0.5,"data":{}}.'
-        )
-        if force_final:
-            system += (
-                " You have reached the tool-call limit. Do not call tools. "
-                "Answer now using the tool results already in the conversation."
-            )
+        built = agent_tools_prompt(agent_name, force_final=force_final)
+        system = built.text
 
         logger.info(
             f"[THINKING] Agent tool-loop turn: id={node.id} label={node_label} "
@@ -838,6 +812,7 @@ class NodeExecutor:
                 )
                 try:
                     agent_result.model_resolution = resolution
+                    agent_result.prompt_version = built.version
                 except AttributeError:
                     pass
                 return agent_result
@@ -925,6 +900,9 @@ class NodeExecutor:
             result_data["toolErrors"] = int(tool_errors)
         if isinstance(resolution, ModelResolution):
             result_data["modelResolution"] = resolution.as_trace()
+        prompt_version = getattr(agent_result, "prompt_version", None)
+        if isinstance(prompt_version, str) and prompt_version:
+            result_data["promptVersion"] = prompt_version
         return NodeResult(
             ok=True,
             status="completed",

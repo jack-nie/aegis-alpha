@@ -1011,6 +1011,9 @@ class WorkflowEngine:
             for key in ("requestedModel", "effectiveModel", "modelFallbackReason"):
                 if resolution.get(key) is not None:
                     traced[key] = resolution[key]
+        prompt_version = (result_data or {}).get("promptVersion") if isinstance(result_data, dict) else None
+        if isinstance(prompt_version, str) and prompt_version:
+            traced["promptVersion"] = prompt_version  # P4-14
         return traced
 
     def _agent_turn_usage(self, agent_result: Any) -> dict | None:

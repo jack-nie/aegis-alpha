@@ -114,10 +114,13 @@ class ScriptedChatModel:
         if usage:
             i, o = int(usage.get("input", 0)), int(usage.get("output", 0))
             kwargs["usage_metadata"] = {"input_tokens": i, "output_tokens": o, "total_tokens": i + o}
+            if usage.get("cache_read") is not None:
+                kwargs["usage_metadata"]["input_token_details"] = {"cache_read": int(usage["cache_read"])}
         return AIMessage(**kwargs)
 
 
-async def run_case(case: dict[str, Any]) -> TrajectoryResult:
+def build_engine(case: dict[str, Any]):
+    """Engine wired with the scripted model; returns (engine, nodes, edges, thread_id, fake, executed)."""
     thread_id = f"traj-{case['name']}"
     settings = Settings(
         AEGIS_ALPHA_LANGCHAIN_API_KEY="trajectory-fake-key",
@@ -154,6 +157,11 @@ async def run_case(case: dict[str, Any]) -> TrajectoryResult:
 
     WorkflowEngine._graph_cache.clear()
     engine = WorkflowEngine(executor, tools=tools, message_queues=queues, run_registry=runs)
+    return engine, nodes, edges, thread_id, fake, executed
+
+
+async def run_case(case: dict[str, Any]) -> TrajectoryResult:
+    engine, nodes, edges, thread_id, fake, executed = build_engine(case)
     events = [
         e async for e in engine.stream_workflow(
             nodes, edges, dict(case.get("state") or {}), str(case.get("subject", "AAPL")),
@@ -161,6 +169,16 @@ async def run_case(case: dict[str, Any]) -> TrajectoryResult:
         )
     ]
     return TrajectoryResult(events=events, requests=fake.requests, executed=executed)
+
+
+async def run_case_sync(case: dict[str, Any]):
+    """Non-streaming ``execute_workflow`` (returns the WorkflowResult with its trace)."""
+    engine, nodes, edges, thread_id, fake, _ = build_engine(case)
+    result = await engine.execute_workflow(
+        nodes, edges, dict(case.get("state") or {}), str(case.get("subject", "AAPL")),
+        thread_id=thread_id, owner=OWNER,
+    )
+    return result, fake.requests
 
 
 def _text(message: Any) -> str:
