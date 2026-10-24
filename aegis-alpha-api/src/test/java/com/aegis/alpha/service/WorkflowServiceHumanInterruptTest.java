@@ -136,7 +136,7 @@ class WorkflowServiceHumanInterruptTest {
         String runId = inserted.getValue().getRunId();
         assertThat(runId).isNotBlank();
         verify(langChainGateway, times(1)).buildStreamBody(
-                any(), eq("needs approval"), any(), any(), eq(runId), eq(true));
+                any(), eq("needs approval"), any(), any(), eq(runId), eq(true), any());
     }
 
     @Test
@@ -156,7 +156,7 @@ class WorkflowServiceHumanInterruptTest {
         server.start();
         when(langChainGateway.streamWorkflowUrl())
                 .thenReturn("http://127.0.0.1:" + server.getAddress().getPort() + "/stream");
-        when(langChainGateway.buildStreamBody(any(), any(), any(), nullable(String.class), nullable(String.class), anyBoolean()))
+        when(langChainGateway.buildStreamBody(any(), any(), any(), nullable(String.class), nullable(String.class), anyBoolean(), any()))
                 .thenReturn("{}");
         when(langChainGateway.serviceAuthorizationHeader()).thenReturn(null);
 
@@ -187,18 +187,18 @@ class WorkflowServiceHumanInterruptTest {
         Map<String, Object> resume = new LinkedHashMap<>();
         resume.put("ok", true);
         resume.put("final_state", new LinkedHashMap<String, Object>());
-        when(langChainGateway.resumeWorkflow("run-hitl", true)).thenReturn(resume);
+        when(langChainGateway.resumeWorkflow(eq("run-hitl"), eq(true), any())).thenReturn(resume);
 
         WorkflowRun completed = service.decideApproval("run-hitl", true);
 
         assertThat(completed.getStatus()).isEqualTo("COMPLETED");
         assertThat(completed.getControlStatus()).isEqualTo("COMPLETED");
-        verify(langChainGateway, times(1)).resumeWorkflow("run-hitl", true);
+        verify(langChainGateway, times(1)).resumeWorkflow(eq("run-hitl"), eq(true), any());
         verify(langChainGateway, never()).streamWorkflowUrl();
         verify(langChainGateway, never()).buildStreamBody(any(), any(), any());
         verify(langChainGateway, never()).buildStreamBody(any(), any(), any(), nullable(String.class));
         verify(langChainGateway, never()).buildStreamBody(
-                any(), any(), any(), nullable(String.class), nullable(String.class), anyBoolean());
+                any(), any(), any(), nullable(String.class), nullable(String.class), anyBoolean(), any());
     }
 
     @Test
@@ -211,7 +211,7 @@ class WorkflowServiceHumanInterruptTest {
 
         assertThatThrownBy(() -> service.decideApproval("run-queued", true))
                 .isInstanceOf(IllegalStateException.class);
-        verify(langChainGateway, never()).resumeWorkflow(anyString(), anyBoolean());
+        verify(langChainGateway, never()).resumeWorkflow(anyString(), anyBoolean(), any());
     }
 
     @Test
@@ -230,7 +230,7 @@ class WorkflowServiceHumanInterruptTest {
         WorkflowRun resumed = service.resumeRun("run-op");
         assertThat(resumed.getStatus()).isEqualTo("QUEUED");
         assertThat(resumed.getControlStatus()).isEqualTo("QUEUED");
-        verify(langChainGateway, never()).resumeWorkflow(anyString(), anyBoolean());
+        verify(langChainGateway, never()).resumeWorkflow(anyString(), anyBoolean(), any());
     }
 
     @Test
@@ -245,7 +245,46 @@ class WorkflowServiceHumanInterruptTest {
 
         assertThat(stayed.getStatus()).isEqualTo("PAUSED");
         assertThat(stayed.getControlStatus()).isEqualTo("HUMAN_INTERRUPT");
-        verify(langChainGateway, never()).resumeWorkflow(anyString(), anyBoolean());
+        verify(langChainGateway, never()).resumeWorkflow(anyString(), anyBoolean(), any());
+    }
+
+    @Test
+    void streamedMessageQueueEventsArePersistedAndOwnerIsSent() throws Exception {
+        server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        String sseResponse = "event: message_queued\ndata: {\"kind\":\"steer\"}\n\n"
+                + "event: tool_skipped\ndata: {\"nodeId\":\"researcher\",\"toolName\":\"quote\"}\n\n"
+                + "event: message_dequeued\ndata: {\"kind\":\"steer\",\"nodeId\":\"researcher\"}\n\n"
+                + "event: message_queue_closed\ndata: {\"reason\":\"completed\",\"undelivered\":[]}\n\n"
+                + "event: workflow_complete\ndata: {\"ok\":true}\n\n";
+        byte[] responseBytes = sseResponse.getBytes(StandardCharsets.UTF_8);
+        server.createContext("/stream", exchange -> {
+            exchange.getResponseHeaders().set("Content-Type", "text/event-stream");
+            exchange.sendResponseHeaders(200, responseBytes.length);
+            try (OutputStream os = exchange.getResponseBody()) {
+                os.write(responseBytes);
+            }
+        });
+        server.start();
+        when(langChainGateway.streamWorkflowUrl())
+                .thenReturn("http://127.0.0.1:" + server.getAddress().getPort() + "/stream");
+        when(langChainGateway.buildStreamBody(any(), any(), any(), nullable(String.class), nullable(String.class), anyBoolean(), any()))
+                .thenReturn("{}");
+
+        WorkflowRun run = service.startWithStreaming("daily", "queued", new HashMap<>(), new SseEmitter(30_000L), "u-7", "t-7");
+
+        assertThat(run.getStatus()).isEqualTo("COMPLETED");
+        verify(langChainGateway).buildStreamBody(any(), eq("queued"), any(), nullable(String.class), eq(run.getRunId()),
+                anyBoolean(), org.mockito.ArgumentMatchers.argThat(owner -> owner != null
+                        && "u-7".equals(owner.get("userId")) && "t-7".equals(owner.get("tenantId"))));
+        ArgumentCaptor<WorkflowRunEvent> events = ArgumentCaptor.forClass(WorkflowRunEvent.class);
+        verify(mapper, atLeastOnce()).insertRunEvent(events.capture());
+        java.util.List<String> types = new java.util.ArrayList<>();
+        for (WorkflowRunEvent event : events.getAllValues()) {
+            types.add(event.getEventType());
+        }
+        assertThat(types).contains("TOOL_SKIPPED", "MESSAGE_DELIVERED", "MESSAGE_QUEUE_CLOSED")
+                .doesNotContain("MESSAGE_QUEUED");
+        assertThat(types.indexOf("TOOL_SKIPPED")).isLessThan(types.indexOf("MESSAGE_DELIVERED"));
     }
 
     private void stubCompletedStream() throws Exception {
@@ -262,7 +301,7 @@ class WorkflowServiceHumanInterruptTest {
         server.start();
         when(langChainGateway.streamWorkflowUrl())
                 .thenReturn("http://127.0.0.1:" + server.getAddress().getPort() + "/stream");
-        when(langChainGateway.buildStreamBody(any(), any(), any(), nullable(String.class), nullable(String.class), anyBoolean()))
+        when(langChainGateway.buildStreamBody(any(), any(), any(), nullable(String.class), nullable(String.class), anyBoolean(), any()))
                 .thenReturn("{}");
         when(langChainGateway.serviceAuthorizationHeader()).thenReturn(null);
     }
@@ -304,7 +343,7 @@ class WorkflowServiceHumanInterruptTest {
         storedRun.set(paused);
         Map<String, Object> resume = new LinkedHashMap<>();
         resume.put("ok", true);
-        when(langChainGateway.resumeWorkflow("run-reject", false)).thenReturn(resume);
+        when(langChainGateway.resumeWorkflow(eq("run-reject"), eq(false), any())).thenReturn(resume);
         com.aegis.alpha.security.AuthenticatedPrincipal desk = new com.aegis.alpha.security.AuthenticatedPrincipal(
                 "u-desk", "desk.lead", "t-1", java.util.Collections.singletonList("desk"));
 
@@ -322,14 +361,14 @@ class WorkflowServiceHumanInterruptTest {
         storedRun.set(pausedRun("run-twice"));
         Map<String, Object> resume = new LinkedHashMap<>();
         resume.put("ok", true);
-        when(langChainGateway.resumeWorkflow("run-twice", true)).thenReturn(resume);
+        when(langChainGateway.resumeWorkflow(eq("run-twice"), eq(true), any())).thenReturn(resume);
 
         WorkflowRun first = service.decideApproval("run-twice", true);
         WorkflowRun second = service.decideApproval("run-twice", true);
 
         assertThat(first.getStatus()).isEqualTo("COMPLETED");
         assertThat(second.getStatus()).isEqualTo("COMPLETED");
-        verify(langChainGateway, times(1)).resumeWorkflow(anyString(), anyBoolean());
+        verify(langChainGateway, times(1)).resumeWorkflow(anyString(), anyBoolean(), any());
     }
 
     @Test
@@ -339,7 +378,7 @@ class WorkflowServiceHumanInterruptTest {
 
         service.decideApproval("run-race", true);
 
-        verify(langChainGateway, never()).resumeWorkflow(anyString(), anyBoolean());
+        verify(langChainGateway, never()).resumeWorkflow(anyString(), anyBoolean(), any());
     }
 
     @Test
@@ -348,7 +387,7 @@ class WorkflowServiceHumanInterruptTest {
         Map<String, Object> resume = new LinkedHashMap<>();
         resume.put("ok", false);
         resume.put("error", "orchestrator down");
-        when(langChainGateway.resumeWorkflow("run-fail", true)).thenReturn(resume);
+        when(langChainGateway.resumeWorkflow(eq("run-fail"), eq(true), any())).thenReturn(resume);
 
         WorkflowRun after = service.decideApproval("run-fail", true);
 
@@ -412,7 +451,7 @@ class WorkflowServiceHumanInterruptTest {
         when(mapper.findNodeRuns("run-mat")).thenReturn(java.util.Arrays.asList(
                 recordedNode("start", 100), recordedNode("market", 200)));
         /* The orchestrator returns the cumulative trace, including pre-pause nodes. */
-        when(langChainGateway.resumeWorkflow("run-mat", true))
+        when(langChainGateway.resumeWorkflow(eq("run-mat"), eq(true), any()))
                 .thenReturn(resumeWithTrace("start", "market", "approval_gate", "aggregate", "aggregate"));
 
         WorkflowRun completed = service.decideApproval("run-mat", true);
@@ -433,7 +472,7 @@ class WorkflowServiceHumanInterruptTest {
     void rejectionAlsoMaterializesResumedNodesWithoutDuplicates() {
         storedRun.set(pausedRun("run-mat-r"));
         when(mapper.findNodeRuns("run-mat-r")).thenReturn(java.util.Arrays.asList(recordedNode("start", 100)));
-        when(langChainGateway.resumeWorkflow("run-mat-r", false)).thenReturn(resumeWithTrace("start", "approval_gate"));
+        when(langChainGateway.resumeWorkflow(eq("run-mat-r"), eq(false), any())).thenReturn(resumeWithTrace("start", "approval_gate"));
 
         service.decideApproval("run-mat-r", false);
 
@@ -450,7 +489,7 @@ class WorkflowServiceHumanInterruptTest {
         Map<String, Object> finalState = new LinkedHashMap<>();
         finalState.put("interrupted", true);
         resume.put("final_state", finalState);
-        when(langChainGateway.resumeWorkflow("run-again", true)).thenReturn(resume);
+        when(langChainGateway.resumeWorkflow(eq("run-again"), eq(true), any())).thenReturn(resume);
 
         WorkflowRun after = service.decideApproval("run-again", true);
 

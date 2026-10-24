@@ -323,6 +323,58 @@ public class WorkflowController {
         }
     }
 
+    /**
+     * Queue a user message into the caller's own running agent loop (pi-style steer / followUp):
+     * body {@code {"kind": "steer"|"follow_up", "message": string}} (kind defaults to follow_up).
+     * 401 unauthenticated, 404 run missing or not owned by the caller, 422 invalid body,
+     * 409 run not running / paused at approval, 429 queue full, 202 queued.
+     */
+    @PostMapping("/workflow/runs/{runId}/messages")
+    public ResponseEntity<Map<String, Object>> queueRunMessage(
+            @RequestHeader(value = "Authorization", required = false) String authorization,
+            @PathVariable String runId,
+            @RequestBody(required = false) Map<String, Object> body) {
+        AuthenticatedPrincipal principal = authService.principal(authorization);
+        if (principal == null) {
+            return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build();
+        }
+        Object message = body == null ? null : body.get("message");
+        if (!(message instanceof String) || ((String) message).trim().isEmpty()) {
+            if (workflowService.runForPrincipal(runId, principal) == null) {
+                return ResponseEntity.notFound().build();
+            }
+            return ResponseEntity.unprocessableEntity().body(approvalError("'message' must be a non-empty string"));
+        }
+        Object kind = body.get("kind");
+        Object agentId = body.get("agentId");
+        if (agentId != null && !(agentId instanceof String)) {
+            if (workflowService.runForPrincipal(runId, principal) == null) {
+                return ResponseEntity.notFound().build();
+            }
+            return ResponseEntity.unprocessableEntity().body(approvalError("'agentId' must be a string"));
+        }
+        Map<String, Object> result = workflowService.enqueueRunMessage(
+                runId, principal, kind == null ? WorkflowService.QUEUE_KIND_FOLLOW_UP : String.valueOf(kind),
+                (String) message, (String) agentId);
+        if (Boolean.TRUE.equals(result.get("ok"))) {
+            return ResponseEntity.status(HttpStatus.ACCEPTED).body(result);
+        }
+        if ("NOT_FOUND".equals(result.get("code"))) {
+            return ResponseEntity.notFound().build();
+        }
+        return ResponseEntity.status(queueHttpStatus(result)).body(result);
+    }
+
+    static int queueHttpStatus(Map<String, Object> result) {
+        Object status = result.get("httpStatus");
+        int code = status instanceof Number ? ((Number) status).intValue() : 502;
+        if (code == 401) {
+            /* orchestrator service-auth failure is not the caller's fault */
+            return 502;
+        }
+        return code >= 400 && code < 600 ? code : 502;
+    }
+
     private static Map<String, Object> approvalError(String message) {
         Map<String, Object> error = new LinkedHashMap<String, Object>();
         error.put("ok", false);

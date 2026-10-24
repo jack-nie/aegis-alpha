@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from typing import Any
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .workflow import Node, Edge, AgentTemplate
 
@@ -44,9 +44,28 @@ class WorkflowRequest(_IgnoresRequestCredentials):
     model: str | None = None
     # Short-lived portfolio:read delegation from Java (camelCase wire name).
     delegated_token: str | None = Field(default=None, alias="delegatedToken")
+    # Run owner ({userId, tenantId}) for message-queue ownership checks.
+    owner: dict[str, Any] | None = None
 
     class Config:
         populate_by_name = True
+
+
+class QueueMessageRequest(BaseModel):
+    """Enqueue a steering / follow-up user message into an active run."""
+
+    kind: str = "follow_up"
+    message: str = ""
+    message_id: str | None = Field(default=None, alias="messageId")
+    owner: dict[str, Any] | None = None
+    # Optional agent node id: pin the message to one agent of a parallel fan-out.
+    agent_id: str | None = Field(default=None, alias="agentId")
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class QueueOwnerRequest(BaseModel):
+    owner: dict[str, Any] | None = None
 
 
 class NodeRequest(_IgnoresRequestCredentials):

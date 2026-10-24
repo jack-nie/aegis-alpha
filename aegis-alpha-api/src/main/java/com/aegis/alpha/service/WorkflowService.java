@@ -635,7 +635,8 @@ public class WorkflowService {
         String delegatedToken = delegatedTokenFor(run, safeInputs);
         boolean requireApproval = requireApprovalRequested(safeInputs, runLayout);
         String streamBody = langChainGateway.buildStreamBody(
-                runLayout, subject, safeInputs, delegatedToken, run.getRunId(), requireApproval);
+                runLayout, subject, safeInputs, delegatedToken, run.getRunId(), requireApproval,
+                LangChainGateway.runOwner(run.getUserId(), run.getTenantId()));
         final String runId = run.getRunId();
         // P1-16: monotonic sort order for streamed node events; node_update upserts workflow_node_run.
         final AtomicInteger streamSequence = new AtomicInteger(0);
@@ -724,6 +725,17 @@ public class WorkflowService {
                                 nodePayload, nodeRun.getSortOrder() + 1);
                         recordStreamedNodeSpan(run, nodeRun, nodePayload);
                         send(org.springframework.web.servlet.mvc.method.annotation.SseEmitter.event().name("node_update").data(data));
+                    } else if (isMessageQueueEvent(eventName)) {
+                        Map<String, Object> payload = parseJsonMap(data);
+                        String eventType = messageQueueRunEventType(eventName);
+                        if (eventType != null) {
+                            recordRunEvent(run, eventType, null,
+                                    hasText(string(payload.get("nodeId"))) ? string(payload.get("nodeId")) : null, "RUNNING",
+                                    messageQueueEventMessage(eventName, payload), payload,
+                                    streamSequence.incrementAndGet() * 100);
+                        }
+                        send(org.springframework.web.servlet.mvc.method.annotation.SseEmitter.event()
+                                .name(eventName).data(data == null ? "{}" : data));
                     } else if ("degraded".equals(eventName)) {
                         Map<String, Object> payload = parseJsonMap(data);
                         recordRunEvent(run, "RUN_DEGRADED", null, null, "RUNNING",
@@ -1270,7 +1282,8 @@ public class WorkflowService {
         recordRunEvent(run, "RUN_APPROVAL_DECISION", null, null, "PAUSED",
                 approved ? "Approval submitted." : "Rejection submitted.", audit, 955000);
 
-        Map<String, Object> resume = langChainGateway.resumeWorkflow(run.getRunId(), approved);
+        Map<String, Object> resume = langChainGateway.resumeWorkflow(run.getRunId(), approved,
+                LangChainGateway.runOwner(run.getUserId(), run.getTenantId()));
         if (isResumeOk(resume)) {
             /* P2-13 / Phase-1 leftover: nodes that ran after the approval gate are materialized
              * as node runs + NODE_* events (same for runs started streaming or non-streaming). */
@@ -1419,6 +1432,7 @@ public class WorkflowService {
 
     public WorkflowRun cancelRun(String runId) {
         WorkflowRun run = requireRun(runId);
+        boolean pausedAtApproval = isHumanInterrupt(run);
         if ("QUEUED".equals(run.getStatus()) || "PAUSED".equals(run.getStatus())) {
             run.setStatus("CANCELLED");
             run.setControlStatus("CANCELLED");
@@ -1426,13 +1440,145 @@ public class WorkflowService {
             run.setCompletedAt(now());
             mapper.updateRun(run);
             recordRunEvent(run, "RUN_CANCELLED", null, null, "CANCELLED", "Workflow run cancelled before dispatch.", null, 4);
+            if (pausedAtApproval) {
+                clearQueuedRunMessages(run);
+            }
         } else if ("RUNNING".equals(run.getStatus())) {
             run.setCancelRequested(1);
             run.setControlStatus("CANCEL_REQUESTED");
             mapper.updateRun(run);
             recordRunEvent(run, "RUN_CANCEL_REQUESTED", null, null, "RUNNING", "Workflow run cancellation requested.", null, 4);
+            clearQueuedRunMessages(run);
         }
         return mapper.findRun(runId);
+    }
+
+    /** Cancelling a running / approval-paused run also drops its pending steering / follow-up messages (best effort). */
+    private void clearQueuedRunMessages(WorkflowRun run) {
+        if (langChainGateway == null || !langChainGateway.isEnabled()) {
+            return;
+        }
+        try {
+            langChainGateway.clearRunMessageQueue(run.getRunId(), run.getUserId(), run.getTenantId());
+        } catch (RuntimeException ex) {
+            log.warn("[WorkflowService] clear message queue failed runId={} type={}", run.getRunId(),
+                    ex.getClass().getSimpleName());
+        }
+    }
+
+    /** Orchestrator message-queue kinds accepted from clients (pi steer / followUp). */
+    public static final String QUEUE_KIND_STEER = "steer";
+    public static final String QUEUE_KIND_FOLLOW_UP = "follow_up";
+
+    /** Normalize a client delivery/kind value; null when it is not a queue kind. */
+    public static String normalizeQueueKind(String value) {
+        if (value == null) {
+            return null;
+        }
+        String v = value.trim().toLowerCase(java.util.Locale.ROOT).replace('-', '_');
+        if ("steer".equals(v) || "steering".equals(v)) {
+            return QUEUE_KIND_STEER;
+        }
+        if ("follow_up".equals(v) || "followup".equals(v)) {
+            return QUEUE_KIND_FOLLOW_UP;
+        }
+        return null;
+    }
+
+    /**
+     * Queue a user message into the caller's own RUNNING orchestrator run.
+     * Only the run owner (same userId + tenantId) may steer it; admins can read but not steer.
+     * Always returns a map with {@code ok}; failures carry {@code code} + {@code httpStatus}:
+     * NOT_FOUND (404, missing or not owned), RUN_NOT_RUNNING (409), INVALID_KIND (422) or the
+     * orchestrator codes (NOT_ACTIVE / RUN_PAUSED 409, QUEUE_FULL / DELIVERY_LIMIT 429, ...).
+     */
+    public Map<String, Object> enqueueRunMessage(String runId, AuthenticatedPrincipal principal,
+                                                 String kind, String message) {
+        return enqueueRunMessage(runId, principal, kind, message, null);
+    }
+
+    /** {@code agentId} (optional) targets one agent of a parallel fan-out; null = first ready agent. */
+    public Map<String, Object> enqueueRunMessage(String runId, AuthenticatedPrincipal principal,
+                                                 String kind, String message, String agentId) {
+        WorkflowRun run = runForPrincipal(runId, principal);
+        if (run == null || !isRunOwner(run, principal)) {
+            return queueFailure("NOT_FOUND", 404, "Run not found");
+        }
+        String normalized = normalizeQueueKind(kind);
+        if (normalized == null) {
+            return queueFailure("INVALID_KIND", 422, "kind must be steer or follow_up");
+        }
+        if (!"RUNNING".equals(run.getStatus()) || "CANCEL_REQUESTED".equals(run.getControlStatus())) {
+            return queueFailure("RUN_NOT_RUNNING", 409, "Run is not running");
+        }
+        if (langChainGateway == null || !langChainGateway.isEnabled()) {
+            return queueFailure("DISABLED", 409, "Orchestrator disabled");
+        }
+        Map<String, Object> result = langChainGateway.enqueueRunMessage(
+                run.getRunId(), normalized, message, agentId, run.getUserId(), run.getTenantId());
+        Map<String, Object> out = result == null ? queueFailure("ORCHESTRATOR_UNAVAILABLE", 502, null)
+                : new LinkedHashMap<String, Object>(result);
+        out.put("runId", run.getRunId());
+        out.put("kind", normalized);
+        if (agentId != null && !agentId.trim().isEmpty()) {
+            out.put("agentId", agentId.trim());
+        }
+        return out;
+    }
+
+    private static boolean isRunOwner(WorkflowRun run, AuthenticatedPrincipal principal) {
+        return run != null && principal != null
+                && run.getUserId() != null && run.getUserId().equals(principal.getUserId())
+                && run.getTenantId() != null && run.getTenantId().equals(principal.getTenantId());
+    }
+
+    private static Map<String, Object> queueFailure(String code, int httpStatus, String error) {
+        Map<String, Object> failed = new LinkedHashMap<>();
+        failed.put("ok", false);
+        failed.put("code", code);
+        failed.put("httpStatus", httpStatus);
+        if (error != null) {
+            failed.put("error", error);
+        }
+        return failed;
+    }
+
+    static boolean isMessageQueueEvent(String eventName) {
+        return "message_queued".equals(eventName) || "message_dequeued".equals(eventName)
+                || "tool_skipped".equals(eventName) || "message_queue_closed".equals(eventName)
+                || "message_queue_cleared".equals(eventName);
+    }
+
+    /** Run-event type persisted for a streamed queue event (message_queued is not persisted: it carries no new state). */
+    static String messageQueueRunEventType(String eventName) {
+        if ("message_dequeued".equals(eventName)) {
+            return "MESSAGE_DELIVERED";
+        }
+        if ("tool_skipped".equals(eventName)) {
+            return "TOOL_SKIPPED";
+        }
+        if ("message_queue_closed".equals(eventName)) {
+            return "MESSAGE_QUEUE_CLOSED";
+        }
+        if ("message_queue_cleared".equals(eventName)) {
+            return "MESSAGE_QUEUE_CLEARED";
+        }
+        return null;
+    }
+
+    private String messageQueueEventMessage(String eventName, Map<String, Object> payload) {
+        if ("message_dequeued".equals(eventName)) {
+            return "Queued " + string(payload.get("kind")) + " message delivered to " + string(payload.get("nodeId")) + ".";
+        }
+        if ("tool_skipped".equals(eventName)) {
+            return "Tool call " + string(payload.get("toolName")) + " skipped due to queued user message.";
+        }
+        if ("message_queue_closed".equals(eventName)) {
+            Object undelivered = payload.get("undelivered");
+            int n = undelivered instanceof List ? ((List<?>) undelivered).size() : 0;
+            return "Message queue closed (" + string(payload.get("reason")) + "), undelivered=" + n + ".";
+        }
+        return "Message queue cleared.";
     }
 
     public WorkflowRun findIdempotentRun(String workflowKey, String subject, String idempotencyKey) {
@@ -1473,7 +1619,8 @@ public class WorkflowService {
         String delegatedToken = delegatedTokenFor(run, inputs);
         boolean requireApproval = requireApprovalRequested(inputs == null ? new LinkedHashMap<String, Object>() : inputs, layout);
         Map<String, Object> response = langChainGateway.executeWorkflow(
-                layout, run.getSubject(), state, delegatedToken, run.getRunId(), requireApproval);
+                layout, run.getSubject(), state, delegatedToken, run.getRunId(), requireApproval,
+                LangChainGateway.runOwner(run.getUserId(), run.getTenantId()));
         if (response == null || Boolean.FALSE.equals(response.get("ok"))) {
             String error = response == null ? "" : string(response.get("error"));
             throw new IllegalStateException(error == null || error.trim().isEmpty()

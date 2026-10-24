@@ -14,7 +14,7 @@ from .config import settings
 from .core.checkpointer_lifecycle import close_async_checkpointer, open_async_checkpointer
 from .dependencies import CHECKPOINT_DB_PATH, market_data, memory_store_manager, workflow_engine
 from .core.tools import get_backend_client
-from .routers import health, workflow, intent, help as help_router
+from .routers import health, workflow, intent, help as help_router, message_queue
 
 # Paths that do not require service token (health/docs only)
 _PUBLIC_PATH_PREFIXES = (
@@ -146,6 +146,7 @@ app.include_router(health.router)
 app.include_router(workflow.router)
 app.include_router(intent.router)
 app.include_router(help_router.router)
+app.include_router(message_queue.router)
 
 
 def start():

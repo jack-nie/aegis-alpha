@@ -80,7 +80,7 @@ class WorkflowServiceStreamingControlTest {
                         return 1;
                     }
                 });
-        when(langChainGateway.buildStreamBody(any(), any(), any(), nullable(String.class), nullable(String.class), anyBoolean()))
+        when(langChainGateway.buildStreamBody(any(), any(), any(), nullable(String.class), nullable(String.class), anyBoolean(), any()))
                 .thenReturn("{}");
         when(langChainGateway.serviceAuthorizationHeader()).thenReturn(null);
     }

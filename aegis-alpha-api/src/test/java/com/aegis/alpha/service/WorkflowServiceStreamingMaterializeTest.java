@@ -143,7 +143,7 @@ class WorkflowServiceStreamingMaterializeTest {
 
         String streamUrl = "http://127.0.0.1:" + server.getAddress().getPort() + "/stream";
         when(langChainGateway.streamWorkflowUrl()).thenReturn(streamUrl);
-        when(langChainGateway.buildStreamBody(any(), any(), any(), nullable(String.class), nullable(String.class), anyBoolean())).thenReturn("{}");
+        when(langChainGateway.buildStreamBody(any(), any(), any(), nullable(String.class), nullable(String.class), anyBoolean(), any())).thenReturn("{}");
         when(langChainGateway.serviceAuthorizationHeader()).thenReturn(null);
 
         Map<String, Object> inputs = new HashMap<>();
@@ -183,7 +183,7 @@ class WorkflowServiceStreamingMaterializeTest {
 
         String streamUrl = "http://127.0.0.1:" + server.getAddress().getPort() + "/stream";
         when(langChainGateway.streamWorkflowUrl()).thenReturn(streamUrl);
-        when(langChainGateway.buildStreamBody(any(), any(), any(), nullable(String.class), nullable(String.class), anyBoolean())).thenReturn("{}");
+        when(langChainGateway.buildStreamBody(any(), any(), any(), nullable(String.class), nullable(String.class), anyBoolean(), any())).thenReturn("{}");
         when(langChainGateway.serviceAuthorizationHeader()).thenReturn(null);
 
         SseEmitter emitter = new SseEmitter(30_000L);
@@ -212,7 +212,7 @@ class WorkflowServiceStreamingMaterializeTest {
 
         String streamUrl = "http://127.0.0.1:" + server.getAddress().getPort() + "/stream";
         when(langChainGateway.streamWorkflowUrl()).thenReturn(streamUrl);
-        when(langChainGateway.buildStreamBody(any(), any(), any(), nullable(String.class), nullable(String.class), anyBoolean())).thenReturn("{}");
+        when(langChainGateway.buildStreamBody(any(), any(), any(), nullable(String.class), nullable(String.class), anyBoolean(), any())).thenReturn("{}");
         when(langChainGateway.serviceAuthorizationHeader()).thenReturn(null);
         when(backtestService.createFromWorkflowRun(any(), any()))
                 .thenThrow(new RuntimeException("materialize boom"));
@@ -243,7 +243,7 @@ class WorkflowServiceStreamingMaterializeTest {
 
         String streamUrl = "http://127.0.0.1:" + server.getAddress().getPort() + "/stream";
         when(langChainGateway.streamWorkflowUrl()).thenReturn(streamUrl);
-        when(langChainGateway.buildStreamBody(any(), any(), any(), nullable(String.class), nullable(String.class), anyBoolean())).thenReturn("{}");
+        when(langChainGateway.buildStreamBody(any(), any(), any(), nullable(String.class), nullable(String.class), anyBoolean(), any())).thenReturn("{}");
         when(langChainGateway.serviceAuthorizationHeader()).thenReturn(null);
 
         SseEmitter emitter = new SseEmitter(30_000L);
@@ -271,7 +271,7 @@ class WorkflowServiceStreamingMaterializeTest {
 
         String streamUrl = "http://127.0.0.1:" + server.getAddress().getPort() + "/stream";
         when(langChainGateway.streamWorkflowUrl()).thenReturn(streamUrl);
-        when(langChainGateway.buildStreamBody(any(), any(), any(), any(), any(), anyBoolean())).thenReturn("{}");
+        when(langChainGateway.buildStreamBody(any(), any(), any(), any(), any(), anyBoolean(), any())).thenReturn("{}");
         when(langChainGateway.serviceAuthorizationHeader()).thenReturn(null);
 
         SseEmitter emitter = new SseEmitter(30_000L);
@@ -291,7 +291,9 @@ class WorkflowServiceStreamingMaterializeTest {
                 argThat(state -> state != null && "user-42".equals(state.get("userId")) && !state.containsKey("user_id")),
                 eq("delegated-test-token"),
                 eq(result.getRunId()),
-                eq(false));
+                eq(false),
+                argThat(owner -> owner != null && "user-42".equals(owner.get("userId"))
+                        && "tenant-a".equals(owner.get("tenantId"))));
     }
 
     @Test
@@ -314,7 +316,7 @@ class WorkflowServiceStreamingMaterializeTest {
                 .thenThrow(new IllegalStateException("cannot issue"));
         String streamUrl = "http://127.0.0.1:" + server.getAddress().getPort() + "/stream";
         when(langChainGateway.streamWorkflowUrl()).thenReturn(streamUrl);
-        when(langChainGateway.buildStreamBody(any(), any(), any(), nullable(String.class), nullable(String.class), anyBoolean())).thenReturn("{}");
+        when(langChainGateway.buildStreamBody(any(), any(), any(), nullable(String.class), nullable(String.class), anyBoolean(), any())).thenReturn("{}");
         when(langChainGateway.serviceAuthorizationHeader()).thenReturn(null);
 
         SseEmitter emitter = new SseEmitter(30_000L);
@@ -322,7 +324,7 @@ class WorkflowServiceStreamingMaterializeTest {
 
         assertThat(result.getStatus()).isEqualTo("COMPLETED");
         verify(langChainGateway, times(1)).buildStreamBody(
-                any(), eq("soft-fail"), any(), isNull(), eq(result.getRunId()), eq(false));
+                any(), eq("soft-fail"), any(), isNull(), eq(result.getRunId()), eq(false), any());
     }
 
     /** P1-16: replays the SSE contract fixture shared with the Python orchestrator tests. */
@@ -350,7 +352,7 @@ class WorkflowServiceStreamingMaterializeTest {
         });
         server.start();
         when(langChainGateway.streamWorkflowUrl()).thenReturn("http://127.0.0.1:" + server.getAddress().getPort() + "/stream");
-        when(langChainGateway.buildStreamBody(any(), any(), any(), nullable(String.class), nullable(String.class), anyBoolean())).thenReturn("{}");
+        when(langChainGateway.buildStreamBody(any(), any(), any(), nullable(String.class), nullable(String.class), anyBoolean(), any())).thenReturn("{}");
         when(langChainGateway.serviceAuthorizationHeader()).thenReturn(null);
 
         Map<String, Object> inputs = new HashMap<>();
