@@ -2,6 +2,8 @@ package com.aegis.alpha.service;
 
 import com.aegis.alpha.domain.AgentTemplate;
 import com.aegis.alpha.mapper.AgentMapper;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.time.LocalDateTime;
@@ -15,10 +17,40 @@ import java.util.UUID;
 public class AgentService {
     private final AgentMapper mapper;
     private final LangChainGateway langChainGateway;
+    /** P3-16: default model for new agents without modelName (decision D1, kept: falls back to aegis.langchain.model). */
+    @Value("${aegis.agent.default-model:deepseek-v4-flash}")
+    private String defaultModelName = "deepseek-v4-flash";
+
+    private ModelAllowlist modelAllowlist = ModelAllowlist.defaults();
 
     public AgentService(AgentMapper mapper, LangChainGateway langChainGateway) {
         this.mapper = mapper;
         this.langChainGateway = langChainGateway;
+    }
+
+    void setDefaultModelName(String defaultModelName) {
+        if (defaultModelName != null && !defaultModelName.trim().isEmpty()) {
+            this.defaultModelName = defaultModelName.trim();
+        }
+    }
+
+    @Autowired(required = false)
+    void setModelAllowlist(ModelAllowlist modelAllowlist) {
+        if (modelAllowlist != null) {
+            this.modelAllowlist = modelAllowlist;
+        }
+    }
+
+    /** P4-6 (R5): a user-supplied modelName must be allowlisted; unchanged stored values are left alone. */
+    private String checkedModelName(Map<String, Object> body, String current) {
+        String requested = text(body, "modelName", current);
+        if (requested == null || requested.equals(current)) {
+            return requested;
+        }
+        if (!modelAllowlist.isAllowed(requested)) {
+            throw new IllegalArgumentException("Model is not allowed: " + requested);
+        }
+        return requested.trim();
     }
 
     public List<AgentTemplate> findAll() {
@@ -47,7 +79,7 @@ public class AgentService {
         agent.setCategory(text(body, "category", "analyst"));
         agent.setTags(text(body, "tags", "analyst,custom"));
         agent.setPrompt(text(body, "prompt", "You are an Aegis Alpha research agent. Return concise structured output."));
-        agent.setModelName(text(body, "modelName", "deepseek-v4-flash"));
+        agent.setModelName(checkedModelName(body, defaultModelName));
         agent.setToolsJson(text(body, "toolsJson", "[\"market-data\",\"portfolio\",\"news\"]"));
         agent.setStatus("IDLE");
         agent.setScheduleCron(text(body, "scheduleCron", ""));
@@ -76,7 +108,7 @@ public class AgentService {
         agent.setCategory(text(body, "category", agent.getCategory()));
         agent.setTags(text(body, "tags", agent.getTags()));
         agent.setPrompt(text(body, "prompt", agent.getPrompt()));
-        agent.setModelName(text(body, "modelName", agent.getModelName()));
+        agent.setModelName(checkedModelName(body, agent.getModelName()));
         agent.setToolsJson(text(body, "toolsJson", agent.getToolsJson()));
         agent.setStatus(text(body, "status", agent.getStatus() == null ? "IDLE" : agent.getStatus()));
         agent.setScheduleCron(text(body, "scheduleCron", agent.getScheduleCron()));

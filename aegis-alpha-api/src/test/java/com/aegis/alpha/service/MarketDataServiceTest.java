@@ -36,6 +36,19 @@ class MarketDataServiceTest {
             "",
             "");
 
+    // P3-12: the implementation floors the configured timeout at 8000 ms; the test pins that contract.
+    @Test
+    void configuredTimeoutIsFlooredAtMinimum() {
+        assertThat(MarketDataService.effectiveTimeoutMs(4000)).isEqualTo(8000);
+        assertThat(MarketDataService.effectiveTimeoutMs(0)).isEqualTo(8000);
+        assertThat(MarketDataService.effectiveTimeoutMs(12000)).isEqualTo(12000);
+        Object low = MarketDataService.defaultRestTemplate(4000).getRequestFactory();
+        assertThat(ReflectionTestUtils.getField(low, "readTimeout")).isEqualTo(8000);
+        Object high = MarketDataService.defaultRestTemplate(15000).getRequestFactory();
+        assertThat(ReflectionTestUtils.getField(high, "connectTimeout")).isEqualTo(15000);
+        assertThat(ReflectionTestUtils.getField(high, "readTimeout")).isEqualTo(15000);
+    }
+
     @Test
     void defaultConstructorConfiguresFiniteHttpTimeouts() {
         MarketDataService defaultService = new MarketDataService(

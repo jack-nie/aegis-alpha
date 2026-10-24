@@ -118,5 +118,7 @@ def test_guardrails_from_settings():
     from app.config import Settings
 
     g = GraphGuardrails.from_settings(Settings())
+    # Decision D5: terminal-state cleanup is on by default.
     assert g == GraphGuardrails(recursion_limit=100, timeout_seconds=900.0, thread_meta_max=1000,
-                                cleanup_checkpoints=False)
+                                cleanup_checkpoints=True,
+                                cleanup_outcomes=frozenset({"completed", "cancelled", "failed"}))

@@ -1,0 +1,15 @@
+name: parallel_batch
+description: two tool calls in one assistant message run as one batch (P4-11 default); one model round-trip.
+tools:
+  get_quote: {args: {symbol: str}, returns: {price: 10}, sleep: 0.2}
+  get_news: {args: {symbol: str}, returns: {headlines: [earnings beat]}, sleep: 0.2}
+script:
+  - tool_calls: [{name: get_quote, args: {symbol: AAPL}}, {name: get_news, args: {symbol: AAPL}}]
+  - content: '{"summary": "price 10, earnings beat", "confidence": 0.6}'
+expect:
+  status: workflow_complete
+  tool_sequence: [get_quote, get_news]
+  tool_order_free: true
+  llm_calls: 2
+  events_exclude: [tool_skipped]
+  request_contains: [{call: 2, text: "earnings beat"}]

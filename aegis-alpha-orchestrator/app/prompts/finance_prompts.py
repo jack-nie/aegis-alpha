@@ -53,6 +53,15 @@ class PromptManager:
             "debt levels, working capital, and key financial ratios. "
             "Use actual numbers from the context. Output in Chinese."
         ),
+        # P3-16: closing node of non-single-ticker workflows (daily briefing, portfolio/position
+        # summary, exit decision, sector view). A digest of upstream outputs, never a BUY/SELL call.
+        "finance.digest_aggregate": (
+            "Write a concise digest for {subject} from the upstream workflow outputs in the context. "
+            "Summarize the key findings of each upstream node, the main risks and the open questions, "
+            "and list concrete follow-up items. Use only facts and numbers present in the context; "
+            "say explicitly when data is missing. Do not issue a single-stock BUY/SELL/HOLD rating "
+            "or a target price. Output in Chinese."
+        ),
         "finance.stock_recommendation_aggregate": (
             "Generate an investment research report for {subject}.\n\n"
             "## Required Sections\n\n"

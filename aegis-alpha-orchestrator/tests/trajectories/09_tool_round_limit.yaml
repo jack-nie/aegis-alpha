@@ -1,0 +1,15 @@
+name: tool_round_limit
+description: a model that keeps calling tools is forced to answer after maxToolRounds.
+nodes:
+  - {id: agent, maxToolRounds: 1}
+tools:
+  get_quote: {args: {symbol: str}, returns: {price: 1}}
+script:
+  - tool_calls: [{name: get_quote, args: {symbol: AAPL}}]
+  - content: '{"summary": "final after limit", "confidence": 0.5}'
+expect:
+  status: workflow_complete
+  tool_sequence: [get_quote]
+  max_llm_calls: 2
+  request_contains: [{call: 2, text: "tool-call limit"}]
+  summary_contains: {agent: "final after limit"}

@@ -158,6 +158,26 @@ class LangChainGatewayTest {
     }
 
     @Test
+    void resumeWorkflowForwardsDelegatedTokenOnlyWhenPresent() throws Exception {
+        final java.util.List<String> bodies = new java.util.concurrent.CopyOnWriteArrayList<String>();
+        server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/resume-workflow", exchange -> {
+            bodies.add(new String(readAll(exchange), StandardCharsets.UTF_8));
+            respond(exchange, 200, "{\"ok\":true,\"final_state\":{}}");
+        });
+        server.start();
+        LangChainGateway gateway = gateway("http://127.0.0.1:" + server.getAddress().getPort(), true);
+
+        gateway.resumeWorkflow("run-1", true, LangChainGateway.runOwner("u-1", "t-1"), "deleg-run-1");
+        gateway.resumeWorkflow("run-1", true, LangChainGateway.runOwner("u-1", "t-1"), null);
+
+        Map<?, ?> withToken = new ObjectMapper().readValue(bodies.get(0), Map.class);
+        Map<?, ?> without = new ObjectMapper().readValue(bodies.get(1), Map.class);
+        assertThat(withToken.get("delegatedToken"), is((Object) "deleg-run-1"));
+        assertThat(without.containsKey("delegatedToken"), is(false));
+    }
+
+    @Test
     void resumeWorkflowReturnsOkFalseWhenDisabled() {
         LangChainGateway gateway = new LangChainGateway(
                 new ObjectMapper(),
@@ -226,6 +246,193 @@ class LangChainGatewayTest {
                 .getBytes(StandardCharsets.UTF_8);
         exchange.getResponseHeaders().set("Content-Type", "application/json");
         exchange.sendResponseHeaders(200, response.length);
+        try (OutputStream output = exchange.getResponseBody()) {
+            output.write(response);
+        }
+    }
+
+    @Test
+    void buildStreamBodyCarriesRunOwnerOnlyWhenPresent() throws Exception {
+        LangChainGateway gateway = gateway("http://127.0.0.1:8787", false);
+        Map<String, Object> layout = new LinkedHashMap<String, Object>();
+        layout.put("nodes", java.util.Collections.emptyList());
+        layout.put("edges", java.util.Collections.emptyList());
+
+        String withOwner = gateway.buildStreamBody(layout, "s", new LinkedHashMap<String, Object>(), null, "run-1", false,
+                LangChainGateway.runOwner("u-1", "t-1"));
+        Map<?, ?> parsed = new ObjectMapper().readValue(withOwner, Map.class);
+        assertThat(((Map<?, ?>) parsed.get("owner")).get("userId"), is((Object) "u-1"));
+        assertThat(((Map<?, ?>) parsed.get("owner")).get("tenantId"), is((Object) "t-1"));
+
+        String legacy = gateway.buildStreamBody(layout, "s", new LinkedHashMap<String, Object>(), null, "run-1", false);
+        assertThat(new ObjectMapper().readValue(legacy, Map.class).containsKey("owner"), is(false));
+        assertThat(LangChainGateway.runOwner(" ", "t-1") == null, is(true));
+    }
+
+    @Test
+    void enqueueRunMessagePostsKindMessageAndOwnerToThreadQueue() throws Exception {
+        final java.util.concurrent.atomic.AtomicReference<String> path = new java.util.concurrent.atomic.AtomicReference<String>();
+        final java.util.concurrent.atomic.AtomicReference<String> body = new java.util.concurrent.atomic.AtomicReference<String>();
+        server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/message-queue/", exchange -> {
+            path.set(exchange.getRequestURI().getRawPath());
+            body.set(new String(readAll(exchange), StandardCharsets.UTF_8));
+            respond(exchange, 202, "{\"ok\":true,\"threadId\":\"run-1\",\"position\":1,\"message\":{\"id\":\"m-1\"}}");
+        });
+        server.start();
+        LangChainGateway gateway = gateway("http://127.0.0.1:" + server.getAddress().getPort(), true);
+
+        Map<String, Object> result = gateway.enqueueRunMessage("run-1", "steer", "use MSFT", null, "u-1", "t-1");
+
+        assertThat(result.get("ok"), is((Object) true));
+        assertThat(result.get("position"), is((Object) 1));
+        assertThat(path.get(), is("/message-queue/run-1/messages"));
+        Map<?, ?> sent = new ObjectMapper().readValue(body.get(), Map.class);
+        assertThat(sent.get("kind"), is((Object) "steer"));
+        assertThat(sent.get("message"), is((Object) "use MSFT"));
+        assertThat(((Map<?, ?>) sent.get("owner")).get("userId"), is((Object) "u-1"));
+        assertThat(sent.containsKey("agentId"), is(false));
+    }
+
+    @Test
+    void cancelRunPostsThreadAndOwnerAndMapsNotActive() throws Exception {
+        final java.util.concurrent.atomic.AtomicReference<String> body = new java.util.concurrent.atomic.AtomicReference<String>();
+        final java.util.concurrent.atomic.AtomicInteger calls = new java.util.concurrent.atomic.AtomicInteger();
+        server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/cancel-run", exchange -> {
+            body.set(new String(readAll(exchange), StandardCharsets.UTF_8));
+            if (calls.incrementAndGet() == 1) {
+                respond(exchange, 200, "{\"ok\":true,\"threadId\":\"run-1\",\"cancelled\":true}");
+            } else {
+                respond(exchange, 404, "{\"ok\":false,\"code\":\"NOT_ACTIVE\",\"error\":\"no active run\"}");
+            }
+        });
+        server.start();
+        LangChainGateway gateway = gateway("http://127.0.0.1:" + server.getAddress().getPort(), true);
+
+        Map<String, Object> first = gateway.cancelRun("run-1", "u-1", "t-1");
+        Map<String, Object> second = gateway.cancelRun("run-1", "u-1", "t-1");
+
+        assertThat(first.get("ok"), is((Object) true));
+        Map<?, ?> sent = new ObjectMapper().readValue(body.get(), Map.class);
+        assertThat(sent.get("threadId"), is((Object) "run-1"));
+        assertThat(((Map<?, ?>) sent.get("owner")).get("userId"), is((Object) "u-1"));
+        assertThat(second.get("ok"), is((Object) false));
+        assertThat(second.get("code"), is((Object) "NOT_ACTIVE"));
+    }
+
+    @Test
+    void cancelRunNeverThrowsWhenOrchestratorIsUnreachable() {
+        LangChainGateway gateway = gateway("http://127.0.0.1:1", true);
+
+        Map<String, Object> result = gateway.cancelRun("run-1", "u-1", "t-1");
+
+        assertThat(result.get("ok"), is((Object) false));
+        assertThat(result.get("code"), is((Object) "ORCHESTRATOR_UNAVAILABLE"));
+    }
+
+    @Test
+    void workflowCallsUseTheirOwnReadTimeout() {
+        LangChainGateway gateway = gateway("http://127.0.0.1:1", true);
+        assertThat(gateway.workflowReadTimeoutMs(), is(LangChainGateway.DEFAULT_WORKFLOW_READ_TIMEOUT_MS));
+
+        gateway.configureWorkflowTimeouts(1000, 45000);
+
+        assertThat(gateway.workflowReadTimeoutMs(), is(45000));
+    }
+
+    @Test
+    void enqueueRunMessageForwardsOptionalAgentTarget() throws Exception {
+        final java.util.concurrent.atomic.AtomicReference<String> body = new java.util.concurrent.atomic.AtomicReference<String>();
+        server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/message-queue/", exchange -> {
+            body.set(new String(readAll(exchange), StandardCharsets.UTF_8));
+            respond(exchange, 202, "{\"ok\":true,\"message\":{\"id\":\"m-1\",\"target\":\"val\"}}");
+        });
+        server.start();
+        LangChainGateway gateway = gateway("http://127.0.0.1:" + server.getAddress().getPort(), true);
+
+        Map<String, Object> result = gateway.enqueueRunMessage("run-1", "follow_up", "x", " val ", "u-1", "t-1");
+
+        assertThat(result.get("ok"), is((Object) true));
+        Map<?, ?> sent = new ObjectMapper().readValue(body.get(), Map.class);
+        assertThat(sent.get("agentId"), is((Object) "val"));
+    }
+
+    @Test
+    void enqueueRunMessageMapsOrchestratorErrorCodes() throws Exception {
+        server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/message-queue/", exchange -> {
+            readAll(exchange);
+            respond(exchange, 429, "{\"ok\":false,\"code\":\"QUEUE_FULL\",\"error\":\"full\"}");
+        });
+        server.start();
+        LangChainGateway gateway = gateway("http://127.0.0.1:" + server.getAddress().getPort(), true);
+
+        Map<String, Object> result = gateway.enqueueRunMessage("run-1", "follow_up", "x", null, "u-1", "t-1");
+
+        assertThat(result.get("ok"), is((Object) false));
+        assertThat(result.get("code"), is((Object) "QUEUE_FULL"));
+        assertThat(result.get("httpStatus"), is((Object) 429));
+    }
+
+    @Test
+    void enqueueRunMessageNeverThrowsWhenDisabledOrUnreachable() {
+        Map<String, Object> disabled = gateway("http://127.0.0.1:1", false)
+                .enqueueRunMessage("run-1", "steer", "x", null, "u-1", "t-1");
+        assertThat(disabled.get("code"), is((Object) "DISABLED"));
+
+        Map<String, Object> down = gateway("http://127.0.0.1:1", true)
+                .enqueueRunMessage("run-1", "steer", "x", null, "u-1", "t-1");
+        assertThat(down.get("ok"), is((Object) false));
+        assertThat(down.get("code"), is((Object) "ORCHESTRATOR_UNAVAILABLE"));
+
+        Map<String, Object> cleared = gateway("http://127.0.0.1:1", true).clearRunMessageQueue("run-1", "u-1", "t-1");
+        assertThat(cleared.get("ok"), is((Object) false));
+    }
+
+    @Test
+    void agentModelIsForwardedWithoutSilentRewrite() {
+        LangChainGateway gw = gateway("http://127.0.0.1:1", false);
+        AgentTemplate agent = new AgentTemplate();
+        agent.setAgentId("a-1");
+        agent.setModelName("deepseek-v4-pro");
+        Map<String, Object> node = new LinkedHashMap<String, Object>();
+        node.put("id", "n1");
+        assertThat(gw.runAgent(agent, new LinkedHashMap<String, Object>(), node, "AAPL").get("model"),
+                is((Object) "deepseek-v4-pro"));
+
+        /* P4-6: proxy-hosted names are no longer rewritten to deepseek-v4-flash by Java; the orchestrator
+         * registry resolves them and records modelFallbackReason when it falls back. */
+        agent.setModelName("proxy-model-x");
+        assertThat(gw.runAgent(agent, new LinkedHashMap<String, Object>(), node, "AAPL").get("model"),
+                is((Object) "proxy-model-x"));
+
+        agent.setModelName(" ");
+        assertThat(gw.runAgent(agent, new LinkedHashMap<String, Object>(), node, "AAPL").get("model"),
+                is((Object) "deepseek-v4-flash"));
+    }
+
+    private static LangChainGateway gateway(String url, boolean enabled) {
+        return new LangChainGateway(new ObjectMapper(), enabled, url, "openai", "deepseek-v4-flash",
+                "test-key", "http://example.test/v1");
+    }
+
+    private static byte[] readAll(HttpExchange exchange) throws IOException {
+        java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+        byte[] buf = new byte[4096];
+        int n;
+        java.io.InputStream in = exchange.getRequestBody();
+        while ((n = in.read(buf)) > 0) {
+            out.write(buf, 0, n);
+        }
+        return out.toByteArray();
+    }
+
+    private static void respond(HttpExchange exchange, int status, String json) throws IOException {
+        byte[] response = json.getBytes(StandardCharsets.UTF_8);
+        exchange.getResponseHeaders().set("Content-Type", "application/json");
+        exchange.sendResponseHeaders(status, response.length);
         try (OutputStream output = exchange.getResponseBody()) {
             output.write(response);
         }

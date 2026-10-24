@@ -411,7 +411,9 @@ class ApiContractTest {
                                 "{\"id\":\"start\",\"type\":\"workflowNode\",\"data\":{\"nodeType\":\"start\"}}," +
                                 "{\"id\":\"end\",\"type\":\"workflowNode\",\"data\":{\"nodeType\":\"end\"}}" +
                                 "],\"edges\":[{\"source\":\"start\",\"target\":\"missing\"}]}"))
-                .andExpect(status().isUnauthorized())
+                /* Decision D3: layout validation errors are 400 (were 401). */
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.code").value("WORKFLOW_VALIDATION"))
                 .andExpect(jsonPath("$.message", containsString("unknown target")));
 
         String validLayout = "{\"nodes\":[" +
@@ -841,5 +843,29 @@ class ApiContractTest {
     @SuppressWarnings("unchecked")
     private Map<String, Object> objectMap(Object value) {
         return value instanceof Map ? (Map<String, Object>) value : new LinkedHashMap<String, Object>();
+    }
+
+    // P3-14: the H2 schema mirrors the unique idempotency index; NULL keys never collide.
+    @Test
+    void workflowRunIdempotencyIndexIsUnique() {
+        workflowMapper.insertRun(idempotentRun("p314-a", "p314-key"));
+        org.assertj.core.api.Assertions.assertThatThrownBy(() -> workflowMapper.insertRun(idempotentRun("p314-b", "p314-key")))
+                .isInstanceOf(org.springframework.dao.DuplicateKeyException.class);
+        workflowMapper.insertRun(idempotentRun("p314-c", null));
+        workflowMapper.insertRun(idempotentRun("p314-d", null));
+        org.assertj.core.api.Assertions.assertThat(
+                workflowMapper.findRunByIdempotencyKey("p314_workflow", "P314", "p314-key").getRunId()).isEqualTo("p314-a");
+    }
+
+    private static com.aegis.alpha.domain.WorkflowRun idempotentRun(String runId, String key) {
+        com.aegis.alpha.domain.WorkflowRun run = new com.aegis.alpha.domain.WorkflowRun();
+        run.setRunId(runId);
+        run.setWorkflowKey("p314_workflow");
+        run.setTraceId(runId + "-trace");
+        run.setStatus("COMPLETED");
+        run.setSubject("P314");
+        run.setStartedAt("2026-10-24 00:00:00");
+        run.setIdempotencyKey(key);
+        return run;
     }
 }

@@ -17,7 +17,12 @@ def test_resolve_model_explicit():
     from app.core.llm_client import LLMClient
     settings = Settings(AEGIS_ALPHA_LANGCHAIN_API_KEY="test-key", AEGIS_ALPHA_LANGCHAIN_BASE_URL="")
     client = LLMClient(settings)
-    assert client._resolve_model("gpt-4") == "gpt-4"
+    assert client._resolve_model("deepseek-v4-pro") == "deepseek-v4-pro"
+    # P4-6: an unregistered model is no longer passed through (nor silently rewritten): it falls
+    # back to the configured default and the resolution says why.
+    resolution = client.resolve_model("gpt-4")
+    assert resolution.effective == settings.model
+    assert resolution.fallback_reason == "unknown_model"
 
 
 def test_resolve_model_deepseek():

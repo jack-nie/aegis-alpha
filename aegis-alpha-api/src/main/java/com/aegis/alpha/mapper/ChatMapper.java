@@ -22,8 +22,8 @@ public interface ChatMapper {
 
     /* ================================================================ *
      * Thread ownership (P0): a thread belongs to one user + tenant.
-     * Legacy rows created before ownership tracking have null owners and
-     * are claimed by the first authenticated user that continues them.
+     * Legacy rows created before ownership tracking have null owners; only
+     * admins may access them and assign an owner (decision D2).
      * ================================================================ */
 
     @Select("select user_id, tenant_id from chat_thread where thread_id = #{threadId}")
@@ -35,14 +35,32 @@ public interface ChatMapper {
                            @Param("userId") String userId,
                            @Param("tenantId") String tenantId);
 
-    /** Claims a legacy (unowned) thread; returns 0 when another caller already owns it (lost race). */
+    /** Assigns a legacy (unowned) thread (admin only, D2); returns 0 when it already has an owner. */
     @Update("update chat_thread set user_id = #{userId}, tenant_id = #{tenantId} where thread_id = #{threadId}"
             + " and (user_id is null or user_id = '') and (tenant_id is null or tenant_id = '')")
     int updateThreadOwner(@Param("threadId") String threadId,
                            @Param("userId") String userId,
                            @Param("tenantId") String tenantId);
 
+    /** D2: legacy threads without an owner (admin listing for assignment). */
+    @Select("select thread_id, title from chat_thread where (user_id is null or user_id = '') and (tenant_id is null or tenant_id = '') order by thread_id")
+    List<Map<String, Object>> unownedThreads();
+
     @Select("select thread_id, title from chat_thread where user_id = #{userId} and tenant_id = #{tenantId} order by thread_id")
     List<Map<String, Object>> threadsForPrincipal(@Param("userId") String userId,
                                                   @Param("tenantId") String tenantId);
+
+    /**
+     * P4-11/P4-12: newest messages of a thread (callers reverse to chronological order).
+     * D10c: same-second ties are broken deterministically (see {@code ChatMessageIds.CHRONOLOGICAL}):
+     * time-ordered ids ({@code <17 digits>-...}) after legacy UUID ids; legacy rows by role
+     * (assistant after user), then message_id.
+     */
+    @Select("select message_id, role, content, created_at from chat_message where thread_id = #{threadId}"
+            + " order by created_at desc,"
+            + " case when message_id like '_________________-%' then 1 else 0 end desc,"
+            + " case when message_id like '_________________-%' then 0 when role = 'user' then 0"
+            + " when role = 'assistant' then 1 else 2 end desc,"
+            + " message_id desc limit #{limit}")
+    List<Map<String, Object>> findRecentMessages(@Param("threadId") String threadId, @Param("limit") int limit);
 }

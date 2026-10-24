@@ -39,6 +39,30 @@ class WorkflowValidationServiceTest {
         assertTrue(error.getMessage().contains("unknown target"));
     }
 
+    @Test
+    void maxToolRoundsMustBeBetweenOneAndEight() {
+        for (Object bad : new Object[] {0, 9, -1, "abc", 2.5, true}) {
+            Map<String, Object> agent = node("agent", "agent");
+            castData(agent).put("maxToolRounds", bad);
+            IllegalArgumentException error = assertThrows(IllegalArgumentException.class,
+                    () -> validationService.validateExecutableFields(layout(Collections.singletonList(agent),
+                            Collections.emptyList())), "value " + bad);
+            assertTrue(error.getMessage().contains("maxToolRounds"));
+        }
+        for (Object ok : new Object[] {1, 8, 3L, "5"}) {
+            Map<String, Object> agent = node("agent", "agent");
+            castData(agent).put("maxToolRounds", ok);
+            validationService.validateExecutableFields(layout(Collections.singletonList(agent), Collections.emptyList()));
+        }
+        validationService.validateExecutableFields(layout(Collections.singletonList(node("agent", "agent")),
+                Collections.emptyList()));
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> castData(Map<String, Object> node) {
+        return (Map<String, Object>) node.get("data");
+    }
+
     private Map<String, Object> layout(Object nodes, Object edges) {
         Map<String, Object> layout = new LinkedHashMap<>();
         layout.put("nodes", nodes);

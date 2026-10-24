@@ -20,11 +20,15 @@ from .context_assembly import (
     AGGREGATE_TOKEN_BUDGET,
     DEFAULT_TOKEN_BUDGET,
     assemble_model_context,
+    with_estimated_cost,
 )
-from .prompt_safety import USER_INPUT_TAG, fence
+from .prompt_builder import agent_tools_prompt, aggregate_prompt, analyst_prompt, digest_prompt
+from .prompt_safety import USER_INPUT_TAG, append_chat_turn, fence
 from .critique import critique_recommendation_draft
+from .log_safety import text_len
 from .llm_client import AgentToolResult, LLMClient, LLMResponse
 from .market_data import MarketDataService
+from .model_registry import ModelResolution, get_model_registry
 from .recommendation_policy import enforce_recommendation_policy
 
 logger = logging.getLogger(__name__)
@@ -37,6 +41,13 @@ def _assemble_context(state: dict[str, Any], *, aggregate: bool = False) -> str:
 
 
 AGGREGATE_HANDLER = "finance.stock_recommendation_aggregate"
+# P3-16: closer for non-single-ticker workflows (daily / portfolio / exit / sector). Large context
+# budget like the aggregate, but no recommendation policy, critique or BUY/SELL label.
+DIGEST_HANDLER = "finance.digest_aggregate"
+
+
+def digest_system_prompt(agent_name: str) -> str:
+    return digest_prompt(agent_name).text
 
 
 def render_prompt(template: str | None, *, subject: str, agent_name: str) -> str:
@@ -57,17 +68,7 @@ def aggregate_system_prompt(agent_name: str) -> str:
 
     Markdown report followed by one fenced ``json`` trailer the policy layer can parse.
     """
-    return (
-        f"You are {agent_name}. Generate an evidence-based investment research report. "
-        "Use markdown formatting with clear sections. "
-        "Use only numbers present in marketDataContext / tool outputs. "
-        "If critical market or financial data is missing, recommend INSUFFICIENT_DATA "
-        "and list missing fields. Never invent prices, multiples, or target prices. "
-        "End the report with exactly one fenced ```json block of the shape "
-        '{"recommendation":"BUY|HOLD|SELL|WATCH|INSUFFICIENT_DATA","confidence":0.0,'
-        '"claims":[{"text":"...","evidenceId":"..."}],"missingData":["..."]} '
-        "where every evidenceId is copied from the context."
-    )
+    return aggregate_prompt(agent_name).text
 
 
 _JSON_TRAILER = re.compile(r"```json\s*(\{.*?\})\s*```", re.DOTALL | re.IGNORECASE)
@@ -110,11 +111,16 @@ def register_market_evidence(market_context: dict[str, Any]) -> tuple[dict[str, 
     return {**market_context, "evidenceId": evidence_id}, {evidence_id: entry}
 
 
-def _with_token_usage(result_data: dict[str, Any], response: LLMResponse) -> dict[str, Any]:
-    """Attach provider token usage without dropping existing result data keys."""
+def _with_token_usage(
+    result_data: dict[str, Any], response: LLMResponse, model: str | None = None, models_file: str | None = None
+) -> dict[str, Any]:
+    """Attach provider token usage without dropping existing result data keys.
+
+    P4-7: ``costUsd``/``costEstimated`` are added only when the model registry has prices for ``model``.
+    """
     data = dict(result_data or {})
     if response.token_usage is not None:
-        data["tokenUsage"] = response.token_usage
+        data["tokenUsage"] = with_estimated_cost(response.token_usage, model, get_model_registry(models_file or None))
     return data
 
 
@@ -129,6 +135,7 @@ HANDLERS = {
     "general.web_search",
     "finance.financial_interpretation",
     "finance.stock_recommendation_aggregate",
+    "finance.digest_aggregate",
     "finance.fundamental_analysis",
     "finance.technical_analysis",
     "finance.valuation_analysis",
@@ -143,6 +150,57 @@ HANDLERS = {
 
 # Control flow handlers
 FALLBACK_HANDLERS = {"start", "end", "condition", "logic"}
+
+_LABEL_ALTERNATION = r"INSUFFICIENT[_ ]DATA|STRONG[_ ]BUY|STRONG[_ ]SELL|BUY|SELL|HOLD|WATCH"
+_JSON_RECOMMENDATION_RE = re.compile(
+    r'"recommendation"\s*:\s*"(' + _LABEL_ALTERNATION + r')"', re.IGNORECASE
+)
+_LABELED_RECOMMENDATION_RE = re.compile(
+    r"(?:recommendation|rating|建议|评级|结论)\s*[:：]\s*\**\s*(" + _LABEL_ALTERNATION + r")\b",
+    re.IGNORECASE,
+)
+# Bare tokens must be upper-case words: prose like "shareholder", "buyback" or "hold on" never matches.
+_BARE_LABEL_RE = re.compile(r"(?<![A-Za-z0-9_])(" + _LABEL_ALTERNATION + r")(?![A-Za-z0-9_])")
+
+
+_LABEL_PRIORITY = ("INSUFFICIENT_DATA", "BUY", "SELL", "HOLD", "WATCH")
+
+
+def _normalize_label(raw: str) -> str:
+    label = raw.strip().upper().replace(" ", "_")
+    if label == "STRONG_BUY":
+        return "BUY"
+    if label == "STRONG_SELL":
+        return "SELL"
+    return label
+
+class AgentTurnError(RuntimeError):
+    """An agent tool-loop LLM turn failed after the retry budget (P4-2)."""
+
+    def __init__(self, node_id: str, cause: Exception | None):
+        super().__init__(f"agent turn failed for {node_id}: {type(cause).__name__ if cause else 'unknown'}")
+        self.node_id = node_id
+        self.cause = cause
+
+
+
+GATED_CONTENT_NOTE = (
+    "The detailed analysis was withheld because the recommendation did not pass the evidence/policy gate."
+)
+
+
+def aggregate_gate_passed(data: dict[str, Any] | None) -> bool:
+    """P4-9: True only when the aggregate's policy did not force INSUFFICIENT_DATA and critique passed.
+
+    Fail closed: a result without policy/critique blocks counts as not passed.
+    """
+    if not isinstance(data, dict):
+        return False
+    policy = data.get("policy")
+    critique = data.get("critique")
+    if not isinstance(policy, dict) or not isinstance(critique, dict):
+        return False
+    return not policy.get("forcedInsufficient") and critique.get("ok") is True
 
 
 class NodeExecutor:
@@ -175,6 +233,37 @@ class NodeExecutor:
         base = float(2 ** attempt)
         return base * (0.5 + self._random())
 
+    @staticmethod
+    def requested_model_for(
+        node: Node, agent: AgentTemplate | None = None, explicit: str | None = None
+    ) -> str | None:
+        """P4-6: model asked for by this call: explicit > node ``data.modelName`` > agent template."""
+        if explicit and str(explicit).strip():
+            return str(explicit).strip()
+        data = node.data
+        extra = getattr(data, "model_extra", None) or {}
+        for key in ("modelName", "model_name", "model"):
+            value = extra.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        if agent is not None and (agent.model_name or "").strip():
+            return agent.model_name.strip()
+        return None
+
+    def resolve_model(self, requested: str | None) -> ModelResolution:
+        registry = get_model_registry(getattr(self._config, "models_file", "") or None)
+        return registry.resolve(
+            requested, default=self._config.model, base_url=self._config.effective_base_url
+        )
+
+    @staticmethod
+    def _attach_model_resolution(result: NodeResult, resolution: ModelResolution | None) -> NodeResult:
+        if resolution is None:
+            return result
+        result.model = resolution.effective
+        result.data = {**(result.data or {}), "modelResolution": resolution.as_trace()}
+        return result
+
     async def execute(
         self,
         node: Node,
@@ -191,7 +280,8 @@ class NodeExecutor:
         handler = self._resolve_handler(node)
         node_type = self._resolve_node_type(node)
         node_label = node.data.label or node.data.title or node.id
-        logger.info(f"[THINKING] Node started: id={node.id} handler={handler} label={node_label} subject={subject}")
+        logger.info(f"[THINKING] Node started: id={node.id} handler={handler} label={node_label} subject_len={text_len(subject)}")
+        logger.debug("Node subject: id=%s subject=%s", node.id, subject)
 
         effective_provider = provider or self._config.provider
         if effective_provider not in ("openai", "deepseek"):
@@ -215,6 +305,10 @@ class NodeExecutor:
             known.update(evidence_entries)
             state = {**state, "marketDataContext": market_context, "evidence": known}
 
+        # P4-6: node/agent model through the registry (warning + fallback, recorded in the trace).
+        resolution = self.resolve_model(self.requested_model_for(node, agent, model))
+        model = resolution.effective
+
         # Invoke LLM with retry: bounded attempts, jittered backoff and a total deadline.
         max_attempts, deadline_s = self._retry_budget()
         retry_started = self._clock()
@@ -237,7 +331,7 @@ class NodeExecutor:
                 if evidence_entries:
                     # Engine merges data.evidence into final_state.evidence (server-issued ids).
                     result.data = {**(result.data or {}), "evidence": evidence_entries}
-                return result
+                return self._attach_model_resolution(result, resolution)
             except Exception as e:
                 last_error = e
                 if not self._is_retryable(e):
@@ -340,23 +434,25 @@ class NodeExecutor:
             subject=subject,
             agent_name=agent_name,
         )
+        # P4-12: copilot history + current message, fenced (no-op for workflow nodes).
+        prompt = append_chat_turn(prompt, state)
 
         # Build context (budgeted assembly, not a JSON prefix cut).
         is_aggregate = handler == "finance.stock_recommendation_aggregate"
-        context = _assemble_context(state, aggregate=is_aggregate)
+        is_digest = handler == DIGEST_HANDLER
+        context = _assemble_context(state, aggregate=is_aggregate or is_digest)
 
-        # Build system prompt
+        # Build system prompt (P4-14: sectioned, stable prefix, versioned).
         if is_aggregate:
-            system = aggregate_system_prompt(agent_name)
+            built = aggregate_prompt(agent_name)
+        elif is_digest:
+            built = digest_prompt(agent_name)
         else:
-            system = (
-                f"You are {agent_name}. "
-                "Return only JSON. Do not use markdown. "
-                'The JSON shape is {"summary":"string","signals":[...],"sources":[...],"confidence":0.5,"data":{}}.'
-            )
+            built = analyst_prompt(agent_name)
+        system = built.text
 
         # Invoke LLM
-        timeout_ms = max(self._config.timeout_ms, 60000) if is_aggregate else self._config.timeout_ms
+        timeout_ms = max(self._config.timeout_ms, 60000) if (is_aggregate or is_digest) else self._config.timeout_ms
         response = await self._llm_client.invoke(
             system=system,
             prompt=prompt,
@@ -370,7 +466,8 @@ class NodeExecutor:
 
         duration_ms = int((datetime.now(timezone.utc) - datetime.fromisoformat(started_at)).total_seconds() * 1000)
         logger.info(f"[THINKING] Node completed: id={node.id} handler={handler} label={node_label} duration={duration_ms}ms status=completed confidence={response.confidence}")
-        logger.info(f"[THINKING] Node output: id={node.id} summary={response.summary[:200] if response.summary else 'N/A'}")
+        logger.info(f"[THINKING] Node output: id={node.id} summary_len={text_len(response.summary)}")
+        logger.debug("Node output summary: id=%s summary=%s", node.id, (response.summary or "")[:200])
 
         sources = [self._normalize_source(s) for s in response.sources]
         # Prefer market hydration as a structured source when present
@@ -387,7 +484,14 @@ class NodeExecutor:
                 *sources,
             ]
 
-        result_data = _with_token_usage(response.data or {}, response)
+        result_data = _with_token_usage(
+            response.data or {}, response, model or self._config.model, getattr(self._config, "models_file", "")
+        )
+        result_data["promptVersion"] = built.version  # P4-14
+        if is_digest:
+            # A digest never carries an actionable label into stream summaries / Java materialization.
+            result_data.pop("recommendation", None)
+            result_data["digest"] = True
         if is_aggregate:
             trailer = parse_aggregate_trailer(response.content)
             for key in ("recommendation", "claims", "missingData", "conflicts"):
@@ -473,6 +577,11 @@ class NodeExecutor:
             ]
             # Surface machine-readable label in summary prefix for Java materializer
             summary = f"[{policy['recommendation']}] {summary or ''}".strip()
+            if not aggregate_gate_passed(result_data):
+                # P4-9: raw model prose never outlives a failed policy/critique gate (it may argue
+                # for the label the gate just removed); every path sees the gated summary instead.
+                result_data = {**result_data, "contentWithheld": True}
+                content = f"{summary}\n\n{GATED_CONTENT_NOTE}"
 
         return NodeResult(
             ok=True,
@@ -495,23 +604,24 @@ class NodeExecutor:
 
     @staticmethod
     def _extract_recommendation_label(text: str) -> str | None:
-        """Best-effort parse of recommendation enum from model text/JSON fence."""
+        """Best-effort parse of the recommendation enum from model text (P3-4).
+
+        Order: JSON ``"recommendation"`` field, then an explicit ``Recommendation:/Rating:/建议:/评级:``
+        line, then a standalone upper-case token with word boundaries (so ``SHAREHOLDER`` is not HOLD
+        and ``BUYBACK`` is not BUY). Structured response fields are preferred by the caller.
+        """
         if not text:
             return None
-        import re  # local import keeps module import surface small
-
-        # JSON fence recommendation field
-        match = re.search(
-            r'"recommendation"\s*:\s*"(BUY|HOLD|SELL|WATCH|INSUFFICIENT_DATA)"',
-            text,
-            re.IGNORECASE,
-        )
+        match = _JSON_RECOMMENDATION_RE.search(text)
         if match:
-            return match.group(1).upper()
-        upper = text.upper()
-        for label in ("INSUFFICIENT_DATA", "STRONG BUY", "BUY", "SELL", "HOLD", "WATCH"):
-            if label in upper:
-                return label.replace(" ", "_") if label != "STRONG BUY" else "BUY"
+            return _normalize_label(match.group(1))
+        match = _LABELED_RECOMMENDATION_RE.search(text)
+        if match:
+            return _normalize_label(match.group(1))
+        found = {_normalize_label(m.group(1)) for m in _BARE_LABEL_RE.finditer(text)}
+        for label in _LABEL_PRIORITY:  # same precedence as the previous substring scan
+            if label in found:
+                return label
         return None
 
     def _mock_result(
@@ -605,8 +715,13 @@ class NodeExecutor:
         force_final: bool = False,
         agent: AgentTemplate | None = None,
         model: str | None = None,
+        on_delta: Any = None,
+        leading_messages: list | None = None,
     ) -> AgentToolResult:
         """One general.agent turn with bound tools (true tool-calling loop).
+
+        P4-9: ``on_delta(text, attempt)`` receives streamed text deltas (attempt is 1-based, so a
+        listener can discard the partial text of a failed attempt).
 
         Does not run finance.* hydrate paths beyond optional market context for
         general.agent. Returns AgentToolResult with either tool_calls or a final
@@ -662,20 +777,13 @@ class NodeExecutor:
             subject=subject,
             agent_name=agent_name,
         )
+        # P4-12: copilot history + current message, fenced (no-op for workflow nodes).
+        prompt = append_chat_turn(prompt, state)
 
         context = _assemble_context(state, aggregate=False)
 
-        system = (
-            f"You are {agent_name}. "
-            "You may call tools when you need live market, financial, news, or portfolio data. "
-            "When you have enough evidence, return only JSON (no markdown) with shape "
-            '{"summary":"string","signals":[...],"sources":[...],"confidence":0.5,"data":{}}.'
-        )
-        if force_final:
-            system += (
-                " You have reached the tool-call limit. Do not call tools. "
-                "Answer now using the tool results already in the conversation."
-            )
+        built = agent_tools_prompt(agent_name, force_final=force_final)
+        system = built.text
 
         logger.info(
             f"[THINKING] Agent tool-loop turn: id={node.id} label={node_label} "
@@ -683,16 +791,84 @@ class NodeExecutor:
             f"prior_messages={len(prior_messages or [])}"
         )
 
-        return await self._llm_client.invoke_agent_with_tools(
-            system=system,
-            prompt=prompt,
-            context=context,
-            tools=tools if not force_final else None,
-            prior_messages=prior_messages,
-            model=model,
-            temperature=0.2,
-            timeout_ms=self._config.timeout_ms,
-            force_final=force_final,
+        resolution = self.resolve_model(self.requested_model_for(node, agent, model))
+        model = resolution.effective
+
+        # P4-2: same bounded retry budget as execute() (attempts + total deadline, jittered
+        # backoff, non-retryable auth errors fail fast). Exhaustion raises AgentTurnError and the
+        # engine records an explicit degraded result instead of silently re-running execute().
+        max_attempts, deadline_s = self._retry_budget()
+        retry_started = self._clock()
+        last_error: Exception | None = None
+        for attempt in range(max_attempts):
+            try:
+                stream_kwargs: dict[str, Any] = {}
+                if on_delta is not None:
+                    stream_kwargs["on_delta"] = (lambda text, _a=attempt + 1: on_delta(text, _a))
+                if leading_messages:
+                    stream_kwargs["leading_messages"] = list(leading_messages)
+                agent_result = await self._llm_client.invoke_agent_with_tools(
+                    system=system,
+                    prompt=prompt,
+                    context=context,
+                    tools=tools if not force_final else None,
+                    prior_messages=prior_messages,
+                    model=model,
+                    temperature=0.2,
+                    timeout_ms=self._config.timeout_ms,
+                    force_final=force_final,
+                    **stream_kwargs,
+                )
+                try:
+                    agent_result.model_resolution = resolution
+                    agent_result.prompt_version = built.version
+                except AttributeError:
+                    pass
+                return agent_result
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                last_error = e
+                if not self._is_retryable(e) or attempt + 1 >= max_attempts:
+                    break
+                delay = self._backoff_delay(attempt)
+                if self._clock() - retry_started + delay >= deadline_s:
+                    break
+                logger.warning(
+                    f"[THINKING] Agent turn {node.id} failed (attempt {attempt + 1}/{max_attempts}), "
+                    f"retrying in {delay:.2f}s: {type(e).__name__}"
+                )
+                await self._sleep(delay)
+        raise AgentTurnError(node.id, last_error)
+
+    def agent_failure_result(
+        self,
+        node: Node,
+        subject: str,
+        started_at: str,
+        error: BaseException,
+    ) -> NodeResult:
+        """P4-2: explicit degraded result for an agent whose tool loop failed (no fake signals)."""
+        cause = error.cause if isinstance(error, AgentTurnError) else error
+        message = f"{type(cause).__name__}: {cause}" if cause is not None else str(error)
+        data = node.data
+        duration_ms = int((datetime.now(timezone.utc) - datetime.fromisoformat(started_at)).total_seconds() * 1000)
+        return NodeResult(
+            ok=True,
+            status="agent_failed",
+            handler=self._resolve_handler(node),
+            node_id=node.id,
+            node_name=data.label or data.title or node.id,
+            subject=subject,
+            summary=f"Agent {data.label or node.id} failed: {message}"[:500],
+            signals=[],
+            sources=[],
+            confidence=0.0,
+            data={"error": message[:1000], "fallback_policy": "no_fallback"},
+            duration_ms=duration_ms,
+            degraded=True,
+            provider=self._config.provider,
+            model=self._config.model,
         )
 
     def agent_tool_result_to_node_result(
@@ -702,8 +878,13 @@ class NodeExecutor:
         agent_result: AgentToolResult,
         started_at: str,
         model: str | None = None,
+        tool_errors: int = 0,
     ) -> NodeResult:
-        """Convert a final (no tool_calls) AgentToolResult into NodeResult."""
+        """Convert a final (no tool_calls) AgentToolResult into NodeResult.
+
+        P4-1: ``tool_errors`` (error ToolMessages seen in this agent's loop) marks the result degraded
+        so a conclusion drawn without the requested data is never presented as a clean one.
+        """
         handler = self._resolve_handler(node)
         data = node.data
         response = agent_result.llm_response or LLMResponse(
@@ -715,6 +896,19 @@ class NodeExecutor:
             * 1000
         )
         sources = [self._normalize_source(s) for s in response.sources]
+        resolution = getattr(agent_result, "model_resolution", None)
+        if isinstance(resolution, ModelResolution):
+            model = model or resolution.effective
+        result_data = _with_token_usage(
+            response.data or {}, response, model or self._config.model, getattr(self._config, "models_file", "")
+        )
+        if tool_errors:
+            result_data["toolErrors"] = int(tool_errors)
+        if isinstance(resolution, ModelResolution):
+            result_data["modelResolution"] = resolution.as_trace()
+        prompt_version = getattr(agent_result, "prompt_version", None)
+        if isinstance(prompt_version, str) and prompt_version:
+            result_data["promptVersion"] = prompt_version
         return NodeResult(
             ok=True,
             status="completed",
@@ -726,10 +920,10 @@ class NodeExecutor:
             signals=[self._normalize_signal(s) for s in response.signals],
             sources=sources,
             confidence=response.confidence,
-            data=_with_token_usage(response.data or {}, response),
+            data=result_data,
             duration_ms=duration_ms,
             content=response.content,
-            degraded=False,
+            degraded=bool(tool_errors),
             provider=self._config.provider,
             model=model or self._config.model,
         )

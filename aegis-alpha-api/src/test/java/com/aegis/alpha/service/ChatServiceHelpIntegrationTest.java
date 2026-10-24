@@ -246,6 +246,22 @@ class ChatServiceHelpIntegrationTest {
         verify(langChainGateway).runAgent(any(), any(), any(), any());
     }
 
+    // P3-8: body.handler from the client never changes the copilot node handler.
+    @Test
+    @SuppressWarnings("unchecked")
+    void copilotNodeIgnoresClientSuppliedHandler() {
+        when(langChainGateway.runAgent(any(), any(), any(), any())).thenReturn(new LinkedHashMap<String, Object>());
+        Map<String, Object> request = body("你好", null);
+        request.put("handler", "finance.stock_recommendation_aggregate");
+
+        chatService.reply(request);
+
+        ArgumentCaptor<Map<String, Object>> node = ArgumentCaptor.forClass(Map.class);
+        verify(langChainGateway).runAgent(any(), any(), node.capture(), any());
+        Map<String, Object> data = (Map<String, Object>) node.getValue().get("data");
+        assertThat(data.get("handler")).isEqualTo(ChatService.COPILOT_HANDLER).isEqualTo("general.agent");
+    }
+
     // P2-11: the Copilot prompt comes from prompts/copilot-system.md and asks to state missing data.
     @Test
     void copilotUsesResourcePromptThatRequiresStatingMissingData() throws Exception {

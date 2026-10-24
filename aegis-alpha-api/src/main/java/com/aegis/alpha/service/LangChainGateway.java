@@ -11,6 +11,7 @@ import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.http.client.SimpleClientHttpRequestFactory;
 import org.springframework.stereotype.Service;
+import org.springframework.web.client.HttpStatusCodeException;
 import org.springframework.web.client.RestTemplate;
 
 import java.util.LinkedHashMap;
@@ -187,6 +188,16 @@ public class LangChainGateway {
      */
     public String buildStreamBody(Map<String, Object> layout, String subject, Map<String, Object> inputs,
                                   String delegatedToken, String threadId, boolean requireApproval) {
+        return buildStreamBody(layout, subject, inputs, delegatedToken, threadId, requireApproval, null);
+    }
+
+    /**
+     * Same as above plus the run owner ({@code {userId, tenantId}}); the orchestrator registers the
+     * run's steering/follow-up message queue under that owner and rejects foreign enqueues.
+     */
+    public String buildStreamBody(Map<String, Object> layout, String subject, Map<String, Object> inputs,
+                                  String delegatedToken, String threadId, boolean requireApproval,
+                                  Map<String, String> owner) {
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("provider", provider);
         body.put("model", defaultModel);
@@ -203,6 +214,9 @@ public class LangChainGateway {
             body.put("threadId", threadId.trim());
         }
         body.put("requireApproval", requireApproval);
+        if (owner != null && !owner.isEmpty()) {
+            body.put("owner", owner);
+        }
         try {
             return objectMapper.writeValueAsString(body);
         } catch (Exception ex) {
@@ -222,19 +236,26 @@ public class LangChainGateway {
      * @throws IllegalStateException when the orchestrator is disabled, unreachable or returns no body;
      *         callers treat that as a run failure instead of fabricating node output.
      */
-    @SuppressWarnings("unchecked")
     public Map<String, Object> executeWorkflow(Map<String, Object> layout, String subject, Map<String, Object> state,
                                                String delegatedToken, String threadId, boolean requireApproval) {
+        return executeWorkflow(layout, subject, state, delegatedToken, threadId, requireApproval, null);
+    }
+
+    @SuppressWarnings("unchecked")
+    public Map<String, Object> executeWorkflow(Map<String, Object> layout, String subject, Map<String, Object> state,
+                                               String delegatedToken, String threadId, boolean requireApproval,
+                                               Map<String, String> owner) {
         if (!enabled) {
             throw new IllegalStateException("LangGraph orchestrator disabled");
         }
-        String body = buildStreamBody(layout, subject, state, delegatedToken, threadId, requireApproval);
+        String body = buildStreamBody(layout, subject, state, delegatedToken, threadId, requireApproval, owner);
         HttpHeaders headers = new HttpHeaders();
         headers.setContentType(MediaType.APPLICATION_JSON);
         applyServiceAuth(headers);
         Object response;
         try {
-            response = restTemplate.postForObject(
+            /* P4-4 (plan B): whole-run call, so the read timeout follows the workflow timeout, not the per-node one. */
+            response = workflowRestTemplate.postForObject(
                     trimSlash(engineUrl) + "/execute-workflow", new HttpEntity<String>(body, headers), Object.class);
         } catch (Exception ex) {
             log.warn("[LangChainGateway] execute-workflow failed: type={}", ex.getClass().getSimpleName());
@@ -249,8 +270,21 @@ public class LangChainGateway {
     /**
      * Resume a paused approval thread. Does not throw: disabled or failed calls return ok=false.
      */
-    @SuppressWarnings("unchecked")
     public Map<String, Object> resumeWorkflow(String threadId, boolean approved) {
+        return resumeWorkflow(threadId, approved, null);
+    }
+
+    public Map<String, Object> resumeWorkflow(String threadId, boolean approved, Map<String, String> owner) {
+        return resumeWorkflow(threadId, approved, owner, null);
+    }
+
+    /**
+     * P4-5: {@code delegatedToken} is the run-scoped portfolio:read delegation of the run owner, applied by
+     * the orchestrator (use_authorization) to tool calls made after the approval gate.
+     */
+    @SuppressWarnings("unchecked")
+    public Map<String, Object> resumeWorkflow(String threadId, boolean approved, Map<String, String> owner,
+                                              String delegatedToken) {
         Map<String, Object> failed = new LinkedHashMap<>();
         failed.put("ok", false);
         if (!enabled) {
@@ -258,16 +292,12 @@ public class LangChainGateway {
             return failed;
         }
         try {
-            Map<String, Object> resumeValue = new LinkedHashMap<>();
-            resumeValue.put("approved", approved);
-            Map<String, Object> body = new LinkedHashMap<>();
-            body.put("threadId", threadId);
-            body.put("resumeValue", resumeValue);
+            Map<String, Object> body = resumeBody(threadId, approved, owner, delegatedToken);
             HttpHeaders headers = new HttpHeaders();
             headers.setContentType(MediaType.APPLICATION_JSON);
             applyServiceAuth(headers);
             HttpEntity<Map<String, Object>> request = new HttpEntity<>(body, headers);
-            Object response = restTemplate.postForObject(
+            Object response = workflowRestTemplate.postForObject(
                     trimSlash(engineUrl) + "/resume-workflow", request, Object.class);
             if (response instanceof Map) {
                 return (Map<String, Object>) response;
@@ -277,6 +307,146 @@ public class LangChainGateway {
         } catch (Exception ex) {
             log.warn("[LangChainGateway] resumeWorkflow failed threadId={} error={}", threadId, ex.getMessage());
             failed.put("error", ex.getMessage());
+            return failed;
+        }
+    }
+
+    private static Map<String, Object> resumeBody(String threadId, boolean approved, Map<String, String> owner,
+                                                  String delegatedToken) {
+        Map<String, Object> resumeValue = new LinkedHashMap<>();
+        resumeValue.put("approved", approved);
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("threadId", threadId);
+        body.put("resumeValue", resumeValue);
+        if (owner != null && !owner.isEmpty()) {
+            body.put("owner", owner);
+        }
+        if (delegatedToken != null && !delegatedToken.trim().isEmpty()) {
+            body.put("delegatedToken", delegatedToken.trim());
+        }
+        return body;
+    }
+
+    /** P4-10 (R11): SSE resume endpoint (same events as /stream-workflow). */
+    public String resumeWorkflowStreamUrl() {
+        return trimSlash(engineUrl) + "/resume-workflow-stream";
+    }
+
+    /** P4-10: JSON body for {@link #resumeWorkflowStreamUrl()}; same fields as {@link #resumeWorkflow}. */
+    public String buildResumeStreamBody(String threadId, boolean approved, Map<String, String> owner,
+                                        String delegatedToken) {
+        try {
+            return objectMapper.writeValueAsString(resumeBody(threadId, approved, owner, delegatedToken));
+        } catch (Exception ex) {
+            throw new IllegalStateException("Failed to serialize resume body", ex);
+        }
+    }
+
+    /** Run owner payload for the orchestrator message queue; null when the run has no user. */
+    public static Map<String, String> runOwner(String userId, String tenantId) {
+        if (userId == null || userId.trim().isEmpty()) {
+            return null;
+        }
+        Map<String, String> owner = new LinkedHashMap<>();
+        owner.put("userId", userId.trim());
+        owner.put("tenantId", tenantId == null ? "" : tenantId.trim());
+        return owner;
+    }
+
+    /**
+     * Queue a steering / follow-up user message into the active orchestrator run
+     * ({@code POST /message-queue/{threadId}/messages}). Never throws: the result always has
+     * {@code ok}; failures carry {@code code} (orchestrator error code, or DISABLED /
+     * ORCHESTRATOR_UNAVAILABLE) and {@code httpStatus}. A non-blank {@code agentId} pins the
+     * message to one agent of a parallel fan-out (orchestrator answers INVALID_TARGET /
+     * TARGET_FINISHED when that agent is unknown or already done).
+     */
+    public Map<String, Object> enqueueRunMessage(String threadId, String kind, String message,
+                                                 String agentId, String userId, String tenantId) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("kind", kind);
+        body.put("message", message);
+        if (agentId != null && !agentId.trim().isEmpty()) {
+            body.put("agentId", agentId.trim());
+        }
+        body.put("owner", runOwner(userId, tenantId));
+        return postMessageQueue(threadId, "/messages", body);
+    }
+
+    /**
+     * P4-4: stop the graph of an active run on the orchestrator ({@code POST /cancel-run}). Best effort and
+     * never throws; Java remains the source of truth (the caller records CANCELLED through its CAS update).
+     * {@code code=NOT_ACTIVE} (404) means the run already ended there.
+     */
+    public Map<String, Object> cancelRun(String threadId, String userId, String tenantId) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("threadId", threadId);
+        body.put("owner", runOwner(userId, tenantId));
+        body.put("reason", "user_cancelled");
+        return postShort(trimSlash(engineUrl) + "/cancel-run", body, threadId, "cancel-run");
+    }
+
+    /** Drop pending queued messages of a run (best effort, used on cancel). */
+    public Map<String, Object> clearRunMessageQueue(String threadId, String userId, String tenantId) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("owner", runOwner(userId, tenantId));
+        return postMessageQueue(threadId, "/clear", body);
+    }
+
+    private Map<String, Object> postMessageQueue(String threadId, String suffix, Map<String, Object> body) {
+        String urlTemplate = trimSlash(engineUrl) + "/message-queue/{threadId}" + suffix;
+        return postShort(urlTemplate, body, threadId, "message-queue" + suffix);
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> postShort(String urlTemplate, Map<String, Object> body, String threadId, String label) {
+        Map<String, Object> failed = new LinkedHashMap<>();
+        failed.put("ok", false);
+        if (!enabled) {
+            failed.put("code", "DISABLED");
+            failed.put("httpStatus", 409);
+            return failed;
+        }
+        if (threadId == null || threadId.trim().isEmpty()) {
+            failed.put("code", "NOT_ACTIVE");
+            failed.put("httpStatus", 409);
+            return failed;
+        }
+        HttpHeaders headers = new HttpHeaders();
+        headers.setContentType(MediaType.APPLICATION_JSON);
+        applyServiceAuth(headers);
+        try {
+            Object response = urlTemplate.contains("{threadId}")
+                    ? shortTimeoutRestTemplate.postForObject(
+                            urlTemplate, new HttpEntity<Map<String, Object>>(body, headers), Object.class, threadId.trim())
+                    : shortTimeoutRestTemplate.postForObject(
+                            urlTemplate, new HttpEntity<Map<String, Object>>(body, headers), Object.class);
+            if (response instanceof Map) {
+                Map<String, Object> ok = new LinkedHashMap<>((Map<String, Object>) response);
+                ok.putIfAbsent("ok", true);
+                ok.putIfAbsent("httpStatus", 202);
+                return ok;
+            }
+            failed.put("code", "ORCHESTRATOR_UNAVAILABLE");
+            failed.put("httpStatus", 502);
+            return failed;
+        } catch (HttpStatusCodeException ex) {
+            failed.put("httpStatus", ex.getRawStatusCode());
+            try {
+                Map<String, Object> err = objectMapper.readValue(ex.getResponseBodyAsString(), Map.class);
+                failed.put("code", err.get("code") == null ? "ORCHESTRATOR_ERROR" : String.valueOf(err.get("code")));
+                if (err.get("error") != null) {
+                    failed.put("error", String.valueOf(err.get("error")));
+                }
+            } catch (Exception parse) {
+                failed.put("code", "ORCHESTRATOR_ERROR");
+            }
+            return failed;
+        } catch (Exception ex) {
+            log.warn("[LangChainGateway] {} failed threadId={} type={}", label, threadId,
+                    ex.getClass().getSimpleName());
+            failed.put("code", "ORCHESTRATOR_UNAVAILABLE");
+            failed.put("httpStatus", 502);
             return failed;
         }
     }
@@ -448,24 +618,13 @@ public class LangChainGateway {
         return value == null || value.trim().isEmpty() ? fallback : value.trim();
     }
 
+    /*
+     * P4-6: no silent model rewrite here. User-supplied names are allowlisted upstream (ModelAllowlist)
+     * and the orchestrator model registry resolves/falls back visibly (requestedModel/effectiveModel/
+     * modelFallbackReason in the trace).
+     */
     private String resolveModel(AgentTemplate agent) {
-        String requested = first(agent == null ? null : agent.getModelName(), defaultModel);
-        if (usesDeepSeekCompatibleEndpoint() && !isSupportedDeepSeekModel(requested)) {
-            return deepSeekDefaultModel();
-        }
-        return requested;
-    }
-
-    private boolean usesDeepSeekCompatibleEndpoint() {
-        return isSupportedDeepSeekModel(defaultModel) || (baseUrl != null && !baseUrl.trim().isEmpty());
-    }
-
-    private boolean isSupportedDeepSeekModel(String model) {
-        return "deepseek-v4-pro".equals(model) || "deepseek-v4-flash".equals(model);
-    }
-
-    private String deepSeekDefaultModel() {
-        return isSupportedDeepSeekModel(defaultModel) ? defaultModel : "deepseek-v4-flash";
+        return first(agent == null ? null : agent.getModelName(), defaultModel);
     }
 
     private final RestTemplate shortTimeoutRestTemplate;
@@ -489,6 +648,28 @@ public class LangChainGateway {
 
     int classifyReadTimeoutMs() {
         return classifyReadTimeoutMs;
+    }
+
+    /*
+     * P4-4 (plan B, decision D1: kept): /execute-workflow and /resume-workflow run the whole graph synchronously, bounded
+     * by the orchestrator's AEGIS_ALPHA_WORKFLOW_TIMEOUT_SECONDS (900s). Their read timeout is that budget
+     * plus 30s, instead of the per-node read-timeout-ms, so a long run is no longer abandoned (and left
+     * running on the orchestrator) while Java marks it FAILED.
+     */
+    static final int DEFAULT_WORKFLOW_READ_TIMEOUT_MS = 930000;
+    private volatile RestTemplate workflowRestTemplate = restTemplate(3000, DEFAULT_WORKFLOW_READ_TIMEOUT_MS);
+    private volatile int workflowReadTimeoutMs = DEFAULT_WORKFLOW_READ_TIMEOUT_MS;
+
+    @Autowired(required = false)
+    void configureWorkflowTimeouts(
+            @Value("${aegis.langchain.connect-timeout-ms:3000}") int connectTimeoutMs,
+            @Value("${aegis.langchain.workflow-read-timeout-ms:" + DEFAULT_WORKFLOW_READ_TIMEOUT_MS + "}") int readTimeoutMs) {
+        this.workflowReadTimeoutMs = Math.max(1, readTimeoutMs);
+        this.workflowRestTemplate = restTemplate(connectTimeoutMs, this.workflowReadTimeoutMs);
+    }
+
+    int workflowReadTimeoutMs() {
+        return workflowReadTimeoutMs;
     }
 
     private RestTemplate restTemplate(int connectTimeoutMs, int readTimeoutMs) {

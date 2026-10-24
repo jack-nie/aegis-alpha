@@ -18,6 +18,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 
 import java.time.Duration;
@@ -43,18 +44,24 @@ import java.util.concurrent.atomic.AtomicInteger;
 public class WorkflowService {
     private static final Logger log = LoggerFactory.getLogger(WorkflowService.class);
 
-    /** Bump when research default graphs change so stale DB layouts are skipped on read. */
-    /** 3 = parallel specialist fan-out → fan-in (P2-14); older un-customised defaults are refreshed. */
-    static final int CURRENT_RESEARCH_LAYOUT_VERSION = 3;
+    /** P3-10: default layouts and their version metadata live in {@link DefaultWorkflowLayouts}. */
+    static final int CURRENT_RESEARCH_LAYOUT_VERSION = DefaultWorkflowLayouts.CURRENT_RESEARCH_LAYOUT_VERSION;
+    static final String RECOMMENDATION_AGGREGATE_HANDLER = DefaultWorkflowLayouts.RECOMMENDATION_AGGREGATE_HANDLER;
+    static final String DIGEST_AGGREGATE_HANDLER = DefaultWorkflowLayouts.DIGEST_AGGREGATE_HANDLER;
+    static final String DIGEST_LAYOUT_PATTERN = DefaultWorkflowLayouts.DIGEST_LAYOUT_PATTERN;
     /** Short-lived portfolio:read delegation for orchestrator tool calls (15 minutes). */
     static final long DELEGATED_PORTFOLIO_READ_TTL_MS = 15L * 60L * 1000L;
     static final String SCOPE_PORTFOLIO_READ = "portfolio:read";
 
-    private static final Set<String> RESEARCH_LAYOUT_KEYS = Collections.unmodifiableSet(new HashSet<String>(Arrays.asList(
-            "stock_analysis",
-            "earnings_reaction",
-            "watchlist_digest"
-    )));
+    /** P3-16: default model for inline agents without data.modelName (decision D1, kept: falls back to aegis.langchain.model). */
+    @Value("${aegis.agent.default-model:deepseek-v4-flash}")
+    private String defaultModelName = "deepseek-v4-flash";
+
+    void setDefaultModelName(String defaultModelName) {
+        if (defaultModelName != null && !defaultModelName.trim().isEmpty()) {
+            this.defaultModelName = defaultModelName.trim();
+        }
+    }
 
     private final WorkflowMapper mapper;
     private final AgentMapper agentMapper;
@@ -72,6 +79,9 @@ public class WorkflowService {
      * Spring injects the bounded {@code workflowExecutor} bean through the setter below.
      */
     private Executor workflowExecutor = Runnable::run;
+    private QueueResultWriteback queueResultWriteback;
+    /** P3-10: approval gate (decide / approver roles); plain collaborator so the constructor contract is unchanged. */
+    private final WorkflowApprovalService approval;
 
     public WorkflowService(WorkflowMapper mapper,
                            AgentMapper agentMapper,
@@ -93,6 +103,7 @@ public class WorkflowService {
         this.validationService = validationService;
         this.tokenService = tokenService;
         this.refreshDefaultLayouts = refreshDefaultLayouts;
+        this.approval = new WorkflowApprovalService(this, mapper, langChainGateway);
     }
 
     public List<WorkflowDefinition> definitions() {
@@ -115,7 +126,7 @@ public class WorkflowService {
         definition.setOwnerUsername(username);
         definition.setUpdatedAt(now());
         mapper.insertDefinition(definition);
-        saveLayout(definition.getWorkflowKey(), defaultLayout(definition));
+        saveLayout(definition.getWorkflowKey(), DefaultWorkflowLayouts.defaultLayout(definition));
         return mapper.findDefinition(definition.getWorkflowKey());
     }
 
@@ -384,15 +395,15 @@ public class WorkflowService {
         WorkflowLayout layout = mapper.findLayout(workflowKey);
         if (layout == null || layout.getLayoutJson() == null) {
             WorkflowDefinition definition = mapper.findDefinition(workflowKey);
-            Map<String, Object> fallback = definition == null ? emptyLayout(workflowKey) : defaultLayout(definition);
+            Map<String, Object> fallback = definition == null ? DefaultWorkflowLayouts.emptyLayout(workflowKey) : DefaultWorkflowLayouts.defaultLayout(definition);
             fallback.put("updatedAt", null);
             return fallback;
         }
         try {
             Map<String, Object> parsed = objectMapper.readValue(layout.getLayoutJson(), new TypeReference<Map<String, Object>>() {});
-            if (shouldRefreshResearchLayout(workflowKey, parsed)) {
+            if (DefaultWorkflowLayouts.shouldRefreshResearchLayout(workflowKey, parsed)) {
                 WorkflowDefinition definition = mapper.findDefinition(workflowKey);
-                Map<String, Object> refreshed = definition == null ? emptyLayout(workflowKey) : defaultLayout(definition);
+                Map<String, Object> refreshed = definition == null ? DefaultWorkflowLayouts.emptyLayout(workflowKey) : DefaultWorkflowLayouts.defaultLayout(definition);
                 refreshed.put("updatedAt", layout.getUpdatedAt());
                 maybePersistRefreshedLayout(workflowKey, refreshed);
                 return refreshed;
@@ -453,7 +464,7 @@ public class WorkflowService {
         if (!layout.containsKey("engine")) {
             layout.put("engine", "langgraph");
         }
-        ensureLayoutVersionMetadata(layout, workflowKey);
+        DefaultWorkflowLayouts.ensureLayoutVersionMetadata(layout, workflowKey);
         validationService.validateLayout(layout);
         int nodeCount = countList(layout.get("nodes"));
         int edgeCount = countList(layout.get("edges"));
@@ -483,48 +494,39 @@ public class WorkflowService {
 
     public WorkflowRun createRun(String workflowKey, String subject, Map<String, Object> inputs,
                                  AuthenticatedPrincipal principal) {
-        String key = workflowKey == null || workflowKey.trim().isEmpty() ? "daily" : workflowKey.trim();
+        String key = workflowKeyOrDefault(workflowKey);
         WorkflowVersion version = mapper.findLatestVersion(key);
         Map<String, Object> runLayout = layoutForRun(key, version);
         validationService.validateLayout(runLayout);
         Map<String, Object> safeInputs = inputs == null ? new LinkedHashMap<String, Object>() : new LinkedHashMap<>(inputs);
         applyAuthenticatedUserId(safeInputs, principal == null ? null : principal.getUserId());
-        WorkflowRun run = new WorkflowRun();
-        run.setRunId(UUID.randomUUID().toString());
-        run.setWorkflowKey(key);
-        run.setTraceId(UUID.randomUUID().toString());
-        run.setStatus("RUNNING");
-        run.setSubject(subject);
-        run.setStartedAt(now());
-        run.setNodeCount(0);
-        run.setWorkflowVersionId(version == null ? null : version.getVersionId());
-        run.setInputsJson(toJson(safeInputs));
-        run.setControlStatus("ACTIVE");
-        run.setPauseRequested(0);
-        run.setCancelRequested(0);
+        WorkflowRun run = newRun(key, subject, version, safeInputs, false, null);
         applyRunOwner(run, principal);
         mapper.insertRun(run);
         recordRunEvent(run, "RUN_CREATED", null, null, "RUNNING", "Workflow run created.", null, 0);
         return run;
     }
 
+    /**
+     * Executes a run created by {@link #createRun} (Copilot dispatch). P3-13: the layout comes from the
+     * version recorded on the run ({@code workflowVersionId}), never from whatever is latest now, so a
+     * version published between create and execute does not change what runs. Success/failure handling
+     * (including the backtest record) is shared with {@link #start} and {@link #dispatchQueuedRun}.
+     */
     public void executeAsync(WorkflowRun run, Map<String, Object> inputs, String workflowKey) {
-        WorkflowVersion version = mapper.findLatestVersion(workflowKey);
-        Map<String, Object> runLayout = layoutForRun(workflowKey, version);
+        String key = run.getWorkflowKey() == null || run.getWorkflowKey().trim().isEmpty()
+                ? workflowKeyOrDefault(workflowKey) : run.getWorkflowKey();
+        Map<String, Object> runLayout;
         try {
-            runWorkflow(run, inputs, runLayout);
-            backtestService.createFromWorkflowRun(mapper.findRun(run.getRunId()), inputs);
-        } catch (WorkflowStoppedException stopped) {
-            // run already updated by execute()
+            runLayout = layoutForRun(key, run.getWorkflowVersionId());
         } catch (Exception ex) {
-            run.setStatus("FAILED");
-            run.setCompletedAt(now());
-            run.setErrorMessage(ex.getMessage());
-            run.setControlStatus("FAILED");
-            mapper.updateRun(run);
-            recordRunEvent(run, "RUN_FAILED", null, null, "FAILED", ex.getMessage(), null, 1000000);
+            markRunFailed(run, ex);
+            materializeRunOutcome(mapper.findRun(run.getRunId()), inputs, null);
+            return;
         }
+        executeAndFinish(run, inputs, runLayout, inputs);
     }
+
     public WorkflowRun start(String workflowKey, String subject) {
         return start(workflowKey, subject, new LinkedHashMap<String, Object>(), (String) null, null);
     }
@@ -539,7 +541,7 @@ public class WorkflowService {
 
     public WorkflowRun start(String workflowKey, String subject, Map<String, Object> inputs, String idempotencyKey,
                              AuthenticatedPrincipal principal) {
-        String key = workflowKey == null || workflowKey.trim().isEmpty() ? "daily" : workflowKey.trim();
+        String key = workflowKeyOrDefault(workflowKey);
         String normalizedIdempotencyKey = normalizeIdempotencyKey(idempotencyKey);
         WorkflowRun existing = findIdempotentRun(key, subject, normalizedIdempotencyKey);
         if (existing != null && (principal == null || isRunAccessible(existing, principal))) {
@@ -550,41 +552,174 @@ public class WorkflowService {
         validationService.validateLayout(runLayout);
         Map<String, Object> safeInputs = inputs == null ? new LinkedHashMap<String, Object>() : new LinkedHashMap<>(inputs);
         applyAuthenticatedUserId(safeInputs, principal == null ? null : principal.getUserId());
+        WorkflowRun run = newRun(key, subject, version, safeInputs, false, normalizedIdempotencyKey);
+        applyRunOwner(run, principal);
+        WorkflowRun raced = insertRunOrExisting(run, principal);
+        if (raced != null) {
+            return raced;
+        }
+        recordRunEvent(run, "RUN_CREATED", null, null, "RUNNING", "Workflow run created.", null, 0);
+        return executeAndFinish(run, safeInputs, runLayout, inputs);
+    }
+
+    /**
+     * P3-14: inserts an idempotent run. When a concurrent request with the same
+     * (workflow_key, subject, idempotency_key) won the unique index, returns that run instead
+     * (null means this run was inserted). A key already used by a run the caller cannot access is
+     * rejected (decision D1, kept: previously a second run was created).
+     */
+    WorkflowRun insertRunOrExisting(WorkflowRun run, AuthenticatedPrincipal principal) {
+        try {
+            mapper.insertRun(run);
+            return null;
+        } catch (DuplicateKeyException duplicate) {
+            if (run.getIdempotencyKey() == null) {
+                throw duplicate;
+            }
+            WorkflowRun existing = mapper.findRunByIdempotencyKey(run.getWorkflowKey(), run.getSubject(), run.getIdempotencyKey());
+            if (existing == null) {
+                throw duplicate;
+            }
+            if (principal != null && !isRunAccessible(existing, principal)) {
+                throw new IllegalArgumentException("Idempotency key already used by another run.");
+            }
+            log.info("Idempotent run race resolved: runId={} existingRunId={}", run.getRunId(), existing.getRunId());
+            return existing;
+        }
+    }
+
+    /**
+     * P3-13: the one place a new {@code workflow_run} row is built (create/start/streaming/queue).
+     * Callers still apply the owner and insert; status is RUNNING, or QUEUED when {@code queued}.
+     */
+    private WorkflowRun newRun(String key, String subject, WorkflowVersion version, Map<String, Object> safeInputs,
+                               boolean queued, String idempotencyKey) {
+        String timestamp = now();
         WorkflowRun run = new WorkflowRun();
         run.setRunId(UUID.randomUUID().toString());
         run.setWorkflowKey(key);
         run.setTraceId(UUID.randomUUID().toString());
-        run.setStatus("RUNNING");
+        run.setStatus(queued ? "QUEUED" : "RUNNING");
         run.setSubject(subject);
-        run.setStartedAt(now());
+        run.setStartedAt(timestamp);
+        if (queued) {
+            run.setQueuedAt(timestamp);
+        }
         run.setNodeCount(0);
-        run.setIdempotencyKey(normalizedIdempotencyKey);
+        run.setIdempotencyKey(idempotencyKey);
         run.setWorkflowVersionId(version == null ? null : version.getVersionId());
         run.setInputsJson(toJson(safeInputs));
-        run.setControlStatus("ACTIVE");
+        run.setControlStatus(queued ? "QUEUED" : "ACTIVE");
         run.setPauseRequested(0);
         run.setCancelRequested(0);
-        applyRunOwner(run, principal);
-        mapper.insertRun(run);
-        recordRunEvent(run, "RUN_CREATED", null, null, "RUNNING", "Workflow run created.", null, 0);
+        return run;
+    }
 
+    private static String workflowKeyOrDefault(String workflowKey) {
+        return workflowKey == null || workflowKey.trim().isEmpty() ? "daily" : workflowKey.trim();
+    }
+
+    /**
+     * P3-13: shared execution + terminal handling for {@link #start}, {@link #dispatchQueuedRun} and
+     * {@link #executeAsync}. A backtest record is created for both completed and failed runs (the
+     * behaviour {@code start()} already had); stopped (paused/cancelled) runs are returned as stored.
+     */
+    private WorkflowRun executeAndFinish(WorkflowRun run, Map<String, Object> executionInputs,
+                                         Map<String, Object> runLayout, Map<String, Object> backtestInputs) {
         try {
-            runWorkflow(run, safeInputs, runLayout);
+            runWorkflow(run, executionInputs, runLayout);
             WorkflowRun completed = mapper.findRun(run.getRunId());
-            backtestService.createFromWorkflowRun(completed, inputs);
+            materializeRunOutcome(completed, backtestInputs, runLayout);
             return completed;
         } catch (WorkflowStoppedException stopped) {
             return mapper.findRun(run.getRunId());
         } catch (Exception ex) {
-            run.setStatus("FAILED");
-            run.setCompletedAt(now());
-            run.setErrorMessage(ex.getMessage());
-            run.setControlStatus("FAILED");
-            mapper.updateRun(run);
-            recordRunEvent(run, "RUN_FAILED", null, null, "FAILED", ex.getMessage(), null, 1000000);
+            markRunFailed(run, ex);
             WorkflowRun failed = mapper.findRun(run.getRunId());
-            backtestService.createFromWorkflowRun(failed, inputs);
+            materializeRunOutcome(failed, backtestInputs, runLayout);
             return failed;
+        }
+    }
+
+    /**
+     * P3-16: single-ticker workflows get a backtest + recommendation record; digest layouts
+     * (closer = {@link #DIGEST_AGGREGATE_HANDLER}, no recommendation aggregate) only get their
+     * model-call / evidence trace materialized, never a BUY/SELL recommendation or backtest row.
+     */
+    private void materializeRunOutcome(WorkflowRun run, Map<String, Object> inputs, Map<String, Object> layout) {
+        if (run == null) {
+            return;
+        }
+        if (isDigestLayout(layout)) {
+            backtestService.materializeRunTrace(run);
+            return;
+        }
+        backtestService.createFromWorkflowRun(run, inputs);
+    }
+
+    boolean isDigestLayout(Map<String, Object> layout) {
+        boolean digest = false;
+        for (Map<String, Object> node : castList(layout == null ? null : layout.get("nodes"))) {
+            String handler = handler(node);
+            if (RECOMMENDATION_AGGREGATE_HANDLER.equals(handler)) {
+                return false;
+            }
+            if (DIGEST_AGGREGATE_HANDLER.equals(handler)) {
+                digest = true;
+            }
+        }
+        return digest;
+    }
+
+    /**
+     * P3-13 / P4-4: single FAILED write for the non-streaming paths. Conditional (CAS) on RUNNING/QUEUED and
+     * no cancel request, so a failure observed after a user cancel (e.g. the orchestrator stopped the
+     * graph) never overwrites CANCELLED; a cancel requested meanwhile ends the run as CANCELLED instead.
+     */
+    private void markRunFailed(WorkflowRun run, Exception ex) {
+        run.setStatus("FAILED");
+        run.setCompletedAt(now());
+        run.setErrorMessage(ex.getMessage());
+        run.setControlStatus("FAILED");
+        if (mapper.updateRunStatusIf(run, RUNNING_OR_QUEUED, true) > 0) {
+            recordRunEvent(run, "RUN_FAILED", null, null, "FAILED", ex.getMessage(), null, 1000000);
+            return;
+        }
+        WorkflowRun latest = mapper.findRun(run.getRunId());
+        if (isCancelRequested(latest)) {
+            finishSyncAsCancelled(latest, "Workflow run cancelled; the orchestrator run was stopped.");
+        }
+    }
+
+    static final List<String> RUNNING_OR_QUEUED = Arrays.asList("RUNNING", "QUEUED");
+
+    /**
+     * P4-4: terminal / paused writes of the synchronous orchestrator path only apply while the run is
+     * still RUNNING and not cancelled (CAS). Losing the race means the user cancelled (finish as
+     * CANCELLED) or something else moved the run on; either way the caller stops.
+     */
+    private void writeSyncRunIfRunning(WorkflowRun run) {
+        if (mapper.updateRunStatusIf(run, RUNNING_ONLY, true) > 0) {
+            return;
+        }
+        WorkflowRun latest = mapper.findRun(run.getRunId());
+        if (isCancelRequested(latest)) {
+            finishSyncAsCancelled(latest, "Workflow run cancelled while the orchestrator was running it.");
+            throw new WorkflowStoppedException("CANCELLED");
+        }
+        throw new WorkflowStoppedException(latest == null ? "UNKNOWN" : String.valueOf(latest.getStatus()));
+    }
+
+    private void finishSyncAsCancelled(WorkflowRun latest, String message) {
+        if (latest == null || "CANCELLED".equals(latest.getStatus())) {
+            return;
+        }
+        latest.setStatus("CANCELLED");
+        latest.setControlStatus("CANCELLED");
+        latest.setCancelRequested(1);
+        latest.setCompletedAt(now());
+        if (mapper.updateRunStatusIf(latest, Arrays.asList("RUNNING", "PAUSED", "QUEUED"), false) > 0) {
+            recordRunEvent(latest, "RUN_CANCELLED", null, null, "CANCELLED", message, null, 1000000);
         }
     }
 
@@ -604,25 +739,13 @@ public class WorkflowService {
     public WorkflowRun startWithStreaming(String workflowKey, String subject, Map<String, Object> inputs,
                                           org.springframework.web.servlet.mvc.method.annotation.SseEmitter emitter,
                                           String userId, String tenantId) {
-        String key = workflowKey == null || workflowKey.trim().isEmpty() ? "daily" : workflowKey.trim();
+        String key = workflowKeyOrDefault(workflowKey);
         WorkflowVersion version = mapper.findLatestVersion(key);
         Map<String, Object> runLayout = layoutForRun(key, version);
         validationService.validateLayout(runLayout);
         Map<String, Object> safeInputs = inputs == null ? new LinkedHashMap<String, Object>() : new LinkedHashMap<String, Object>(inputs);
         applyAuthenticatedUserId(safeInputs, userId);
-        final WorkflowRun run = new WorkflowRun();
-        run.setRunId(UUID.randomUUID().toString());
-        run.setWorkflowKey(key);
-        run.setTraceId(UUID.randomUUID().toString());
-        run.setStatus("RUNNING");
-        run.setSubject(subject);
-        run.setStartedAt(now());
-        run.setNodeCount(0);
-        run.setWorkflowVersionId(version == null ? null : version.getVersionId());
-        run.setInputsJson(toJson(safeInputs));
-        run.setControlStatus("ACTIVE");
-        run.setPauseRequested(0);
-        run.setCancelRequested(0);
+        final WorkflowRun run = newRun(key, subject, version, safeInputs, false, null);
         if (hasText(userId)) {
             run.setUserId(userId.trim());
         }
@@ -633,9 +756,10 @@ public class WorkflowService {
         recordRunEvent(run, "RUN_CREATED", null, null, "RUNNING", "Workflow run created (streaming).", null, 0);
         String streamUrl = langChainGateway.streamWorkflowUrl();
         String delegatedToken = delegatedTokenFor(run, safeInputs);
-        boolean requireApproval = requireApprovalRequested(safeInputs, runLayout);
+        boolean requireApproval = WorkflowApprovalService.requireApprovalRequested(safeInputs, runLayout);
         String streamBody = langChainGateway.buildStreamBody(
-                runLayout, subject, safeInputs, delegatedToken, run.getRunId(), requireApproval);
+                runLayout, subject, safeInputs, delegatedToken, run.getRunId(), requireApproval,
+                LangChainGateway.runOwner(run.getUserId(), run.getTenantId()));
         final String runId = run.getRunId();
         // P1-16: monotonic sort order for streamed node events; node_update upserts workflow_node_run.
         final AtomicInteger streamSequence = new AtomicInteger(0);
@@ -685,8 +809,17 @@ public class WorkflowService {
                 }
             }
 
-            /* P2-17: re-read before acting; a cancel requested meanwhile ends the stream as CANCELLED. */
-            private boolean stopIfCancelled() {
+            /* P4-10: next time the cancel flag may be re-read (high-rate v2 events are throttled). */
+            private long nextCancelCheckAt = Long.MIN_VALUE;
+
+            /* P2-17: re-read before acting; a cancel requested meanwhile ends the stream as CANCELLED.
+             * P4-10: at most one DB read per cancel-check interval unless {@code force} (terminal events). */
+            private boolean stopIfCancelled(boolean force) {
+                long nowMs = cancelCheckClock.getAsLong();
+                if (!force && nowMs < nextCancelCheckAt) {
+                    return false;
+                }
+                nextCancelCheckAt = nowMs + streamCancelCheckIntervalMs;
                 WorkflowRun latest = mapper.findRun(runId);
                 if (!isCancelRequested(latest)) {
                     return false;
@@ -711,10 +844,21 @@ public class WorkflowService {
 
             @Override public void onEvent(String eventName, String data) {
                 try {
-                    if (stopIfCancelled()) {
+                    if (stopIfCancelled(isTerminalStreamEvent(eventName))) {
                         return;
                     }
-                    if ("node_update".equals(eventName)) {
+                    if (isStreamV2Event(eventName)) {
+                        /* P4-10: v2 progress events are forwarded, not persisted; only a finished tool call
+                         * leaves a run event (no args, no result body). */
+                        if ("tool_execution_end".equals(eventName)) {
+                            Map<String, Object> audit = toolExecutionEndAudit(parseJsonMap(data));
+                            recordRunEvent(run, "TOOL_EXECUTION_END", null,
+                                    hasText(string(audit.get("nodeId"))) ? string(audit.get("nodeId")) : null, "RUNNING",
+                                    toolExecutionEndMessage(audit), audit, streamSequence.incrementAndGet() * 100);
+                        }
+                        send(org.springframework.web.servlet.mvc.method.annotation.SseEmitter.event()
+                                .name(eventName).data(data == null ? "{}" : data));
+                    } else if ("node_update".equals(eventName)) {
                         Map<String, Object> nodePayload = parseJsonMap(data);
                         WorkflowNodeRun nodeRun = upsertStreamedNodeRun(run, nodePayload, streamedNodeRuns,
                                 streamLayoutNodes, streamSequence.incrementAndGet());
@@ -724,6 +868,17 @@ public class WorkflowService {
                                 nodePayload, nodeRun.getSortOrder() + 1);
                         recordStreamedNodeSpan(run, nodeRun, nodePayload);
                         send(org.springframework.web.servlet.mvc.method.annotation.SseEmitter.event().name("node_update").data(data));
+                    } else if (isMessageQueueEvent(eventName)) {
+                        Map<String, Object> payload = parseJsonMap(data);
+                        String eventType = messageQueueRunEventType(eventName);
+                        if (eventType != null) {
+                            recordRunEvent(run, eventType, null,
+                                    hasText(string(payload.get("nodeId"))) ? string(payload.get("nodeId")) : null, "RUNNING",
+                                    messageQueueEventMessage(eventName, payload), payload,
+                                    streamSequence.incrementAndGet() * 100);
+                        }
+                        send(org.springframework.web.servlet.mvc.method.annotation.SseEmitter.event()
+                                .name(eventName).data(data == null ? "{}" : data));
                     } else if ("degraded".equals(eventName)) {
                         Map<String, Object> payload = parseJsonMap(data);
                         recordRunEvent(run, "RUN_DEGRADED", null, null, "RUNNING",
@@ -777,7 +932,7 @@ public class WorkflowService {
                         recordRunEvent(run, "RUN_COMPLETED", null, null, "COMPLETED",
                                 degraded ? "Workflow run completed degraded (streaming)." : "Workflow run completed (streaming).",
                                 payload, 1000000);
-                        materializeStreamingCompletedRun(runId, safeInputs);
+                        materializeStreamingCompletedRun(runId, safeInputs, runLayout);
                         String completeData = data == null || data.trim().isEmpty()
                                 ? (degraded ? "{\"ok\":true,\"degraded\":true}" : "{\"ok\":true}")
                                 : data;
@@ -839,7 +994,7 @@ public class WorkflowService {
                     if (mapper.updateRunStatusIf(latest, RUNNING_ONLY, true) > 0) {
                         recordRunEvent(latest, "RUN_COMPLETED", null, null, "COMPLETED",
                                 "Workflow run completed (streaming stream end).", null, 1000000);
-                        materializeStreamingCompletedRun(runId, safeInputs);
+                        materializeStreamingCompletedRun(runId, safeInputs, runLayout);
                     }
                 }
                 closeEmitter();
@@ -960,13 +1115,13 @@ public class WorkflowService {
         }
     }
 
-    private void materializeStreamingCompletedRun(String runId, Map<String, Object> inputs) {
+    private void materializeStreamingCompletedRun(String runId, Map<String, Object> inputs, Map<String, Object> layout) {
         try {
             WorkflowRun completed = mapper.findRun(runId);
             if (completed == null || !"COMPLETED".equals(completed.getStatus())) {
                 return;
             }
-            backtestService.createFromWorkflowRun(completed, inputs);
+            materializeRunOutcome(completed, inputs, layout);
         } catch (Exception ex) {
             try {
                 WorkflowRun latest = mapper.findRun(runId);
@@ -1085,7 +1240,7 @@ public class WorkflowService {
 
     public WorkflowRun queueStart(String workflowKey, String subject, Map<String, Object> inputs, String idempotencyKey,
                                   AuthenticatedPrincipal principal) {
-        String key = workflowKey == null || workflowKey.trim().isEmpty() ? "daily" : workflowKey.trim();
+        String key = workflowKeyOrDefault(workflowKey);
         String normalizedIdempotencyKey = normalizeIdempotencyKey(idempotencyKey);
         WorkflowRun existing = findIdempotentRun(key, subject, normalizedIdempotencyKey);
         if (existing != null && (principal == null || isRunAccessible(existing, principal))) {
@@ -1096,24 +1251,12 @@ public class WorkflowService {
         validationService.validateLayout(runLayout);
         Map<String, Object> safeInputs = inputs == null ? new LinkedHashMap<String, Object>() : new LinkedHashMap<>(inputs);
         applyAuthenticatedUserId(safeInputs, principal == null ? null : principal.getUserId());
-        String timestamp = now();
-        WorkflowRun run = new WorkflowRun();
-        run.setRunId(UUID.randomUUID().toString());
-        run.setWorkflowKey(key);
-        run.setTraceId(UUID.randomUUID().toString());
-        run.setStatus("QUEUED");
-        run.setSubject(subject);
-        run.setStartedAt(timestamp);
-        run.setQueuedAt(timestamp);
-        run.setNodeCount(0);
-        run.setIdempotencyKey(normalizedIdempotencyKey);
-        run.setWorkflowVersionId(version == null ? null : version.getVersionId());
-        run.setInputsJson(toJson(safeInputs));
-        run.setControlStatus("QUEUED");
-        run.setPauseRequested(0);
-        run.setCancelRequested(0);
+        WorkflowRun run = newRun(key, subject, version, safeInputs, true, normalizedIdempotencyKey);
         applyRunOwner(run, principal);
-        mapper.insertRun(run);
+        WorkflowRun raced = insertRunOrExisting(run, principal);
+        if (raced != null) {
+            return raced;
+        }
         recordRunEvent(run, "RUN_CREATED", null, null, "QUEUED", "Workflow run queued.", safeInputs, 0);
         return mapper.findRun(run.getRunId());
     }
@@ -1136,24 +1279,7 @@ public class WorkflowService {
         recordRunEvent(run, "RUN_DISPATCHED", null, null, "RUNNING", "Workflow run dispatched.", null, 1);
         Map<String, Object> inputs = parseJsonMap(run.getInputsJson());
         Map<String, Object> runLayout = layoutForRun(run.getWorkflowKey(), run.getWorkflowVersionId());
-        try {
-            runWorkflow(run, inputs, runLayout);
-            WorkflowRun completed = mapper.findRun(run.getRunId());
-            backtestService.createFromWorkflowRun(completed, inputs);
-            return completed;
-        } catch (WorkflowStoppedException stopped) {
-            return mapper.findRun(run.getRunId());
-        } catch (Exception ex) {
-            run.setStatus("FAILED");
-            run.setCompletedAt(now());
-            run.setErrorMessage(ex.getMessage());
-            run.setControlStatus("FAILED");
-            mapper.updateRun(run);
-            recordRunEvent(run, "RUN_FAILED", null, null, "FAILED", ex.getMessage(), null, 1000000);
-            WorkflowRun failed = mapper.findRun(run.getRunId());
-            backtestService.createFromWorkflowRun(failed, inputs);
-            return failed;
-        }
+        return executeAndFinish(run, inputs, runLayout, inputs);
     }
 
     public WorkflowRun pauseRun(String runId) {
@@ -1192,7 +1318,63 @@ public class WorkflowService {
         return mapper.findRun(runId);
     }
 
-    /** P2-19 (待确认): stop reading and cancel the run when the SSE client goes away. */
+    /** P4-10 (decision D1: kept): minimum interval between cancel-flag DB reads while streaming (terminal events always check). */
+    @Value("${aegis.workflow.stream.cancel-check-interval-ms:500}")
+    private long streamCancelCheckIntervalMs = 500L;
+
+    private java.util.function.LongSupplier cancelCheckClock = System::currentTimeMillis;
+
+    void setStreamCancelCheckIntervalMs(long intervalMs) {
+        this.streamCancelCheckIntervalMs = Math.max(0L, intervalMs);
+    }
+
+    void setCancelCheckClock(java.util.function.LongSupplier clock) {
+        this.cancelCheckClock = clock == null ? System::currentTimeMillis : clock;
+    }
+
+    /* D10a: the streaming approval endpoint shares the cancel-check interval and clock. */
+    long streamCancelCheckIntervalMs() {
+        return streamCancelCheckIntervalMs;
+    }
+
+    long cancelCheckNow() {
+        return cancelCheckClock.getAsLong();
+    }
+
+    /** D10a: fresh read of the run's cancel flag (cancel requested, CANCEL_REQUESTED or CANCELLED). */
+    boolean isCancelRequestedNow(String runId) {
+        return isCancelRequested(mapper.findRun(runId));
+    }
+
+    /** P4-10: orchestrator event protocol v2 events forwarded to the client (P4-9). */
+    static boolean isStreamV2Event(String eventName) {
+        return "node_start".equals(eventName) || "message_delta".equals(eventName) || "token".equals(eventName)
+                || "tool_execution_start".equals(eventName) || "tool_execution_end".equals(eventName)
+                || "usage".equals(eventName);
+    }
+
+    static boolean isTerminalStreamEvent(String eventName) {
+        return "workflow_complete".equals(eventName) || "error".equals(eventName)
+                || "human_interrupt".equals(eventName) || "cancelled".equals(eventName);
+    }
+
+    /** Persisted subset of a tool_execution_end event: identity, outcome and timing only. */
+    static Map<String, Object> toolExecutionEndAudit(Map<String, Object> payload) {
+        Map<String, Object> audit = new LinkedHashMap<>();
+        for (String key : new String[] {"toolCallId", "toolName", "nodeId", "isError", "durationMs", "truncated"}) {
+            if (payload != null && payload.get(key) != null) {
+                audit.put(key, payload.get(key));
+            }
+        }
+        return audit;
+    }
+
+    private static String toolExecutionEndMessage(Map<String, Object> audit) {
+        String name = audit.get("toolName") == null ? "tool" : String.valueOf(audit.get("toolName"));
+        return (Boolean.TRUE.equals(audit.get("isError")) ? "Tool failed: " : "Tool completed: ") + name;
+    }
+
+    /** P2-19 (decision D1: kept): stop reading and cancel the run when the SSE client goes away. */
     @Value("${aegis.workflow.stream.cancel-on-disconnect:false}")
     private boolean cancelStreamOnDisconnect = false;
 
@@ -1200,225 +1382,43 @@ public class WorkflowService {
         this.cancelStreamOnDisconnect = cancelStreamOnDisconnect;
     }
 
-    /** Roles allowed to approve/reject runs paused at the approval gate (comma separated). */
-    @Value("${aegis.workflow.approver-roles:desk,admin}")
-    private String approverRoles = "desk,admin";
+    /** P3-10: approval-gate logic lives in {@link WorkflowApprovalService}; these delegates keep the public API. */
+    static final String APPROVAL_IN_PROGRESS = WorkflowApprovalService.APPROVAL_IN_PROGRESS;
 
     /** True when the principal holds one of the configured approver roles. */
     public boolean isApprover(AuthenticatedPrincipal principal) {
-        if (principal == null || approverRoles == null) {
-            return false;
-        }
-        for (String role : approverRoles.split(",")) {
-            if (!role.trim().isEmpty() && principal.hasRole(role.trim())) {
-                return true;
-            }
-        }
-        return false;
+        return approval.isApprover(principal);
     }
 
+    /** Roles allowed to approve/reject runs paused at the approval gate (comma separated). */
+    @Value("${aegis.workflow.approver-roles:desk,admin}")
     void setApproverRoles(String approverRoles) {
-        this.approverRoles = approverRoles;
+        approval.setApproverRoles(approverRoles);
     }
 
-    /** Control status held while one request owns the approval decision (CAS from HUMAN_INTERRUPT). */
-    static final String APPROVAL_IN_PROGRESS = "APPROVAL_IN_PROGRESS";
-
-    /**
-     * Continue a run paused at the orchestrator approval gate. Does not start a new execution.
-     */
+    /** Continue a run paused at the orchestrator approval gate. Does not start a new execution. */
     public WorkflowRun decideApproval(String runId, boolean approved) {
-        return decideApproval(runId, approved, null, null);
+        return approval.decideApproval(runId, approved, null, null);
     }
 
-    /**
-     * Approve or reject a run paused at the approval gate.
-     *
-     * <ul>
-     *   <li>Only one caller wins the {@code HUMAN_INTERRUPT → APPROVAL_IN_PROGRESS} compare-and-set,
-     *       so the orchestrator is resumed at most once; repeated submissions for an already
-     *       decided run return its current state.</li>
-     *   <li>Approval completes the run ({@code COMPLETED}); rejection ends it as {@code REJECTED}
-     *       (status name 待确认 with product) and the orchestrator skips the aggregate node.</li>
-     *   <li>A failed resume returns the run to {@code HUMAN_INTERRUPT} so it can be retried.</li>
-     * </ul>
-     *
-     * @throws IllegalStateException when the run never waited for approval
-     */
+    /** See {@link WorkflowApprovalService#decideApproval}. */
     public WorkflowRun decideApproval(String runId, boolean approved, String comment, AuthenticatedPrincipal approver) {
-        WorkflowRun run = requireRun(runId);
-        if (!isHumanInterrupt(run)) {
-            if (isApprovalDecidedOrInFlight(run)) {
-                return mapper.findRun(runId);
-            }
-            throw new IllegalStateException("Workflow run is not awaiting human approval: " + runId);
-        }
-        if (mapper.transitionControlStatus(runId, "HUMAN_INTERRUPT", APPROVAL_IN_PROGRESS) == 0) {
-            /* Another request claimed the decision first. */
-            return mapper.findRun(runId);
-        }
-        Map<String, Object> audit = new LinkedHashMap<>();
-        audit.put("approved", approved);
-        if (approver != null) {
-            audit.put("approverUserId", approver.getUserId());
-            audit.put("approverUsername", approver.getUsername());
-        }
-        if (comment != null && !comment.trim().isEmpty()) {
-            String trimmed = comment.trim();
-            audit.put("comment", trimmed.length() > 500 ? trimmed.substring(0, 500) : trimmed);
-        }
-        recordRunEvent(run, "RUN_APPROVAL_DECISION", null, null, "PAUSED",
-                approved ? "Approval submitted." : "Rejection submitted.", audit, 955000);
-
-        Map<String, Object> resume = langChainGateway.resumeWorkflow(run.getRunId(), approved);
-        if (isResumeOk(resume)) {
-            /* P2-13 / Phase-1 leftover: nodes that ran after the approval gate are materialized
-             * as node runs + NODE_* events (same for runs started streaming or non-streaming). */
-            int resumedNodes = materializeResumeTrace(run, resume);
-            if (resumedNodes > 0) {
-                run.setNodeCount((run.getNodeCount() == null ? 0 : run.getNodeCount()) + resumedNodes);
-            }
-            if (isInterruptedAgain(resume)) {
-                run.setStatus("PAUSED");
-                run.setControlStatus("HUMAN_INTERRUPT");
-                run.setPauseRequested(1);
-                mapper.updateRun(run);
-                recordRunEvent(run, "RUN_PAUSED", null, null, "PAUSED",
-                        "Workflow paused for human approval again after resume.", null, 990000);
-                return mapper.findRun(runId);
-            }
-            run.setStatus(approved ? "COMPLETED" : "REJECTED");
-            run.setCompletedAt(now());
-            run.setControlStatus(approved ? "COMPLETED" : "REJECTED");
-            run.setPauseRequested(0);
-            Map<String, Object> result = new LinkedHashMap<>();
-            if (resume != null) {
-                result.putAll(resume);
-            }
-            result.putAll(audit);
-            if (approved) {
-                result.put("approval", "approved");
-            } else {
-                result.put("approval", "rejected");
-                result.put("rejected", true);
-                if (run.getErrorMessage() == null || run.getErrorMessage().trim().isEmpty()) {
-                    run.setErrorMessage("REJECTED");
-                }
-            }
-            run.setResultJson(toJson(result));
-            mapper.updateRun(run);
-            recordRunEvent(run, approved ? "RUN_APPROVED" : "RUN_REJECTED", null, null,
-                    approved ? "COMPLETED" : "REJECTED",
-                    approved ? "Human approval accepted; workflow resumed."
-                            : "Human approval rejected; final report skipped.",
-                    result, 1000000);
-        } else {
-            String error = resume == null ? "" : string(resume.get("error"));
-            run.setControlStatus("HUMAN_INTERRUPT");
-            run.setErrorMessage(error == null || error.trim().isEmpty() ? "resume failed" : error);
-            mapper.updateRun(run);
-            recordRunEvent(run, "RUN_RESUME_FAILED", null, null, "PAUSED",
-                    "Human approval resume failed.", resume, 960000);
-        }
-        return mapper.findRun(runId);
+        return approval.decideApproval(runId, approved, comment, approver);
     }
 
-    /** Insert node runs for trace entries of the resumed graph that were not recorded before the pause. */
-    @SuppressWarnings("unchecked")
-    private int materializeResumeTrace(WorkflowRun run, Map<String, Object> resume) {
-        if (resume == null || !(resume.get("trace") instanceof List)) {
-            return 0;
-        }
-        try {
-            List<Object> trace = (List<Object>) resume.get("trace");
-            Map<String, Object> nodeOutputs = resume.get("node_outputs") instanceof Map
-                    ? (Map<String, Object>) resume.get("node_outputs") : new LinkedHashMap<String, Object>();
-            java.util.Set<String> recorded = new java.util.HashSet<String>();
-            int maxSort = 0;
-            List<WorkflowNodeRun> existing = mapper.findNodeRuns(run.getRunId());
-            if (existing != null) {
-                for (WorkflowNodeRun nodeRun : existing) {
-                    if (nodeRun.getNodeId() != null) {
-                        recorded.add(nodeRun.getNodeId());
-                    }
-                    if (nodeRun.getSortOrder() != null) {
-                        maxSort = Math.max(maxSort, nodeRun.getSortOrder());
-                    }
-                }
-            }
-            Map<String, Object> layout = layoutForRun(run.getWorkflowKey(), run.getWorkflowVersionId());
-            return materializeOrchestratorTrace(run, layout, trace, nodeOutputs, recorded, maxSort, 956000);
-        } catch (Exception ex) {
-            log.warn("[WorkflowService] resume trace materialization failed runId={} error={}",
-                    run.getRunId(), ex.getClass().getSimpleName());
-            return 0;
-        }
+    /** P4-10 (R11): streaming approval; see {@link WorkflowApprovalService#decideApprovalStreaming}. */
+    public void decideApprovalStreaming(String runId, boolean approved, String comment, AuthenticatedPrincipal approver,
+                                        org.springframework.web.servlet.mvc.method.annotation.SseEmitter emitter) {
+        approval.decideApprovalStreaming(runId, approved, comment, approver, emitter);
     }
 
-    @SuppressWarnings("unchecked")
-    private boolean isInterruptedAgain(Map<String, Object> resume) {
-        Object finalState = resume.get("final_state");
-        return finalState instanceof Map && Boolean.TRUE.equals(((Map<String, Object>) finalState).get("interrupted"));
-    }
-
-    private boolean isApprovalDecidedOrInFlight(WorkflowRun run) {
-        if (run == null) {
-            return false;
-        }
-        if (APPROVAL_IN_PROGRESS.equals(run.getControlStatus()) || "REJECTED".equals(run.getStatus())) {
-            return true;
-        }
-        Map<String, Object> result = parseJsonMap(run.getResultJson());
-        return result.get("approval") != null;
-    }
-
-    private boolean isHumanInterrupt(WorkflowRun run) {
+    boolean isHumanInterrupt(WorkflowRun run) {
         return run != null && "HUMAN_INTERRUPT".equals(run.getControlStatus());
-    }
-
-    private boolean isResumeOk(Map<String, Object> resume) {
-        if (resume == null) {
-            return false;
-        }
-        Object ok = resume.get("ok");
-        if (ok instanceof Boolean) {
-            return (Boolean) ok;
-        }
-        return "true".equalsIgnoreCase(string(ok));
-    }
-
-    @SuppressWarnings("unchecked")
-    private boolean requireApprovalRequested(Map<String, Object> inputs, Map<String, Object> layout) {
-        if (isTruthyFlag(inputs, "requireApproval") || isTruthyFlag(inputs, "require_approval")) {
-            return true;
-        }
-        if (layout == null || !(layout.get("metadata") instanceof Map)) {
-            return false;
-        }
-        return isTruthyFlag((Map<String, Object>) layout.get("metadata"), "requireApproval")
-                || isTruthyFlag((Map<String, Object>) layout.get("metadata"), "require_approval");
-    }
-
-    private boolean isTruthyFlag(Map<String, Object> source, String key) {
-        if (source == null || key == null || !source.containsKey(key)) {
-            return false;
-        }
-        Object value = source.get(key);
-        if (value instanceof Boolean) {
-            return (Boolean) value;
-        }
-        if (value instanceof Number) {
-            return ((Number) value).intValue() != 0;
-        }
-        if (value == null) {
-            return false;
-        }
-        String text = String.valueOf(value).trim();
-        return "true".equalsIgnoreCase(text) || "1".equals(text) || "yes".equalsIgnoreCase(text);
     }
 
     public WorkflowRun cancelRun(String runId) {
         WorkflowRun run = requireRun(runId);
+        boolean pausedAtApproval = isHumanInterrupt(run);
         if ("QUEUED".equals(run.getStatus()) || "PAUSED".equals(run.getStatus())) {
             run.setStatus("CANCELLED");
             run.setControlStatus("CANCELLED");
@@ -1426,13 +1426,172 @@ public class WorkflowService {
             run.setCompletedAt(now());
             mapper.updateRun(run);
             recordRunEvent(run, "RUN_CANCELLED", null, null, "CANCELLED", "Workflow run cancelled before dispatch.", null, 4);
+            if (pausedAtApproval) {
+                clearQueuedRunMessages(run);
+            }
+            if (WorkflowApprovalService.APPROVAL_IN_PROGRESS.equals(run.getControlStatus())) {
+                /* D10a: an approval is resuming the graph right now; stop it on the orchestrator too. */
+                requestOrchestratorCancel(run);
+            }
         } else if ("RUNNING".equals(run.getStatus())) {
             run.setCancelRequested(1);
             run.setControlStatus("CANCEL_REQUESTED");
-            mapper.updateRun(run);
-            recordRunEvent(run, "RUN_CANCEL_REQUESTED", null, null, "RUNNING", "Workflow run cancellation requested.", null, 4);
+            /* P4-4: CAS so a run that completed meanwhile is not rewritten to RUNNING/CANCEL_REQUESTED. */
+            if (mapper.updateRunStatusIf(run, RUNNING_ONLY, false) > 0) {
+                recordRunEvent(run, "RUN_CANCEL_REQUESTED", null, null, "RUNNING", "Workflow run cancellation requested.", null, 4);
+                clearQueuedRunMessages(run);
+                requestOrchestratorCancel(run);
+            }
         }
         return mapper.findRun(runId);
+    }
+
+    /**
+     * P4-4: ask the orchestrator to stop the graph of a RUNNING run (best effort). The orchestrator answers
+     * the in-flight execute/stream call with a cancelled outcome; Java records CANCELLED via its CAS writes.
+     */
+    void requestOrchestratorCancel(WorkflowRun run) {
+        if (langChainGateway == null || !langChainGateway.isEnabled()) {
+            return;
+        }
+        try {
+            Map<String, Object> response = langChainGateway.cancelRun(run.getRunId(), run.getUserId(), run.getTenantId());
+            if (response != null && !Boolean.TRUE.equals(response.get("ok"))) {
+                log.info("[WorkflowService] orchestrator cancel not applied runId={} code={}", run.getRunId(),
+                        response.get("code"));
+            }
+        } catch (RuntimeException ex) {
+            log.warn("[WorkflowService] orchestrator cancel failed runId={} type={}", run.getRunId(),
+                    ex.getClass().getSimpleName());
+        }
+    }
+
+    /** Cancelling a running / approval-paused run also drops its pending steering / follow-up messages (best effort). */
+    private void clearQueuedRunMessages(WorkflowRun run) {
+        if (langChainGateway == null || !langChainGateway.isEnabled()) {
+            return;
+        }
+        try {
+            langChainGateway.clearRunMessageQueue(run.getRunId(), run.getUserId(), run.getTenantId());
+        } catch (RuntimeException ex) {
+            log.warn("[WorkflowService] clear message queue failed runId={} type={}", run.getRunId(),
+                    ex.getClass().getSimpleName());
+        }
+    }
+
+    /** Orchestrator message-queue kinds accepted from clients (pi steer / followUp). */
+    public static final String QUEUE_KIND_STEER = "steer";
+    public static final String QUEUE_KIND_FOLLOW_UP = "follow_up";
+
+    /** Normalize a client delivery/kind value; null when it is not a queue kind. */
+    public static String normalizeQueueKind(String value) {
+        if (value == null) {
+            return null;
+        }
+        String v = value.trim().toLowerCase(java.util.Locale.ROOT).replace('-', '_');
+        if ("steer".equals(v) || "steering".equals(v)) {
+            return QUEUE_KIND_STEER;
+        }
+        if ("follow_up".equals(v) || "followup".equals(v)) {
+            return QUEUE_KIND_FOLLOW_UP;
+        }
+        return null;
+    }
+
+    /**
+     * Queue a user message into the caller's own RUNNING orchestrator run.
+     * Only the run owner (same userId + tenantId) may steer it; admins can read but not steer.
+     * Always returns a map with {@code ok}; failures carry {@code code} + {@code httpStatus}:
+     * NOT_FOUND (404, missing or not owned), RUN_NOT_RUNNING (409), INVALID_KIND (422) or the
+     * orchestrator codes (NOT_ACTIVE / RUN_PAUSED 409, QUEUE_FULL / DELIVERY_LIMIT 429, ...).
+     */
+    public Map<String, Object> enqueueRunMessage(String runId, AuthenticatedPrincipal principal,
+                                                 String kind, String message) {
+        return enqueueRunMessage(runId, principal, kind, message, null);
+    }
+
+    /** {@code agentId} (optional) targets one agent of a parallel fan-out; null = first ready agent. */
+    public Map<String, Object> enqueueRunMessage(String runId, AuthenticatedPrincipal principal,
+                                                 String kind, String message, String agentId) {
+        WorkflowRun run = runForPrincipal(runId, principal);
+        if (run == null || !isRunOwner(run, principal)) {
+            return queueFailure("NOT_FOUND", 404, "Run not found");
+        }
+        String normalized = normalizeQueueKind(kind);
+        if (normalized == null) {
+            return queueFailure("INVALID_KIND", 422, "kind must be steer or follow_up");
+        }
+        if (!"RUNNING".equals(run.getStatus()) || "CANCEL_REQUESTED".equals(run.getControlStatus())) {
+            return queueFailure("RUN_NOT_RUNNING", 409, "Run is not running");
+        }
+        if (langChainGateway == null || !langChainGateway.isEnabled()) {
+            return queueFailure("DISABLED", 409, "Orchestrator disabled");
+        }
+        Map<String, Object> result = langChainGateway.enqueueRunMessage(
+                run.getRunId(), normalized, message, agentId, run.getUserId(), run.getTenantId());
+        Map<String, Object> out = result == null ? queueFailure("ORCHESTRATOR_UNAVAILABLE", 502, null)
+                : new LinkedHashMap<String, Object>(result);
+        out.put("runId", run.getRunId());
+        out.put("kind", normalized);
+        if (agentId != null && !agentId.trim().isEmpty()) {
+            out.put("agentId", agentId.trim());
+        }
+        return out;
+    }
+
+    private static boolean isRunOwner(WorkflowRun run, AuthenticatedPrincipal principal) {
+        return run != null && principal != null
+                && run.getUserId() != null && run.getUserId().equals(principal.getUserId())
+                && run.getTenantId() != null && run.getTenantId().equals(principal.getTenantId());
+    }
+
+    private static Map<String, Object> queueFailure(String code, int httpStatus, String error) {
+        Map<String, Object> failed = new LinkedHashMap<>();
+        failed.put("ok", false);
+        failed.put("code", code);
+        failed.put("httpStatus", httpStatus);
+        if (error != null) {
+            failed.put("error", error);
+        }
+        return failed;
+    }
+
+    static boolean isMessageQueueEvent(String eventName) {
+        return "message_queued".equals(eventName) || "message_dequeued".equals(eventName)
+                || "tool_skipped".equals(eventName) || "message_queue_closed".equals(eventName)
+                || "message_queue_cleared".equals(eventName);
+    }
+
+    /** Run-event type persisted for a streamed queue event (message_queued is not persisted: it carries no new state). */
+    static String messageQueueRunEventType(String eventName) {
+        if ("message_dequeued".equals(eventName)) {
+            return "MESSAGE_DELIVERED";
+        }
+        if ("tool_skipped".equals(eventName)) {
+            return "TOOL_SKIPPED";
+        }
+        if ("message_queue_closed".equals(eventName)) {
+            return "MESSAGE_QUEUE_CLOSED";
+        }
+        if ("message_queue_cleared".equals(eventName)) {
+            return "MESSAGE_QUEUE_CLEARED";
+        }
+        return null;
+    }
+
+    private String messageQueueEventMessage(String eventName, Map<String, Object> payload) {
+        if ("message_dequeued".equals(eventName)) {
+            return "Queued " + string(payload.get("kind")) + " message delivered to " + string(payload.get("nodeId")) + ".";
+        }
+        if ("tool_skipped".equals(eventName)) {
+            return "Tool call " + string(payload.get("toolName")) + " skipped due to queued user message.";
+        }
+        if ("message_queue_closed".equals(eventName)) {
+            Object undelivered = payload.get("undelivered");
+            int n = undelivered instanceof List ? ((List<?>) undelivered).size() : 0;
+            return "Message queue closed (" + string(payload.get("reason")) + "), undelivered=" + n + ".";
+        }
+        return "Message queue cleared.";
     }
 
     public WorkflowRun findIdempotentRun(String workflowKey, String subject, String idempotencyKey) {
@@ -1471,10 +1630,17 @@ public class WorkflowService {
         state.put("runId", run.getRunId());
         state.put("subject", run.getSubject());
         String delegatedToken = delegatedTokenFor(run, inputs);
-        boolean requireApproval = requireApprovalRequested(inputs == null ? new LinkedHashMap<String, Object>() : inputs, layout);
+        boolean requireApproval = WorkflowApprovalService.requireApprovalRequested(inputs == null ? new LinkedHashMap<String, Object>() : inputs, layout);
         Map<String, Object> response = langChainGateway.executeWorkflow(
-                layout, run.getSubject(), state, delegatedToken, run.getRunId(), requireApproval);
+                layout, run.getSubject(), state, delegatedToken, run.getRunId(), requireApproval,
+                LangChainGateway.runOwner(run.getUserId(), run.getTenantId()));
         if (response == null || Boolean.FALSE.equals(response.get("ok"))) {
+            /* P4-4: the orchestrator stopped the graph because the user cancelled -> CANCELLED, not FAILED. */
+            WorkflowRun latest = mapper.findRun(run.getRunId());
+            if (isCancelRequested(latest)) {
+                finishSyncAsCancelled(latest, "Workflow run cancelled; the orchestrator run was stopped.");
+                throw new WorkflowStoppedException("CANCELLED");
+            }
             String error = response == null ? "" : string(response.get("error"));
             throw new IllegalStateException(error == null || error.trim().isEmpty()
                     ? "Orchestrator workflow failed" : "Orchestrator workflow failed: " + error);
@@ -1502,7 +1668,7 @@ public class WorkflowService {
             run.setStatus("PAUSED");
             run.setControlStatus("HUMAN_INTERRUPT");
             run.setPauseRequested(1);
-            mapper.updateRun(run);
+            writeSyncRunIfRunning(run);
             recordRunEvent(run, "RUN_PAUSED", null, null, "PAUSED",
                     "Workflow paused for human approval.", null, 950000);
             return;
@@ -1515,7 +1681,7 @@ public class WorkflowService {
         if (degraded && (run.getErrorMessage() == null || run.getErrorMessage().trim().isEmpty())) {
             run.setErrorMessage("DEGRADED");
         }
-        mapper.updateRun(run);
+        writeSyncRunIfRunning(run);
         if (degraded) {
             recordRunEvent(run, "RUN_DEGRADED", null, null, "COMPLETED",
                     "Workflow completed with degraded nodes.", null, 999999);
@@ -1536,8 +1702,8 @@ public class WorkflowService {
      * after {@code sortBase}, event sequences after {@code eventBase}. Returns the number inserted.
      */
     @SuppressWarnings("unchecked")
-    private int materializeOrchestratorTrace(WorkflowRun run, Map<String, Object> layout, List<Object> trace,
-                                             Map<String, Object> nodeOutputs, java.util.Set<String> skipNodeIds,
+    int materializeOrchestratorTrace(WorkflowRun run, Map<String, Object> layout, List<Object> trace,
+                                     Map<String, Object> nodeOutputs, java.util.Set<String> skipNodeIds,
                                              int sortBase, int eventBase) {
         Map<String, Map<String, Object>> layoutNodes = new LinkedHashMap<>();
         for (Map<String, Object> node : castList(layout == null ? null : layout.get("nodes"))) {
@@ -1588,7 +1754,10 @@ public class WorkflowService {
     private void execute(WorkflowRun run, Map<String, Object> inputs, Map<String, Object> layout) throws Exception {
         List<Map<String, Object>> nodes = castList(layout.get("nodes"));
         List<Map<String, Object>> edges = castList(layout.get("edges"));
+        /* P3-15: fail fast on graphs the Java fallback cannot run faithfully instead of silently skipping. */
+        validateFallbackNodes(nodes);
         List<Map<String, Object>> orderedNodes = executionOrder(nodes, edges);
+        recordUnevaluatedConditions(run, orderedNodes);
         Map<String, Object> state = new LinkedHashMap<>(inputs);
         state.put("workflowKey", run.getWorkflowKey());
         state.put("runId", run.getRunId());
@@ -1715,7 +1884,7 @@ public class WorkflowService {
     static final int MAX_NODE_INPUT_JSON_CHARS = 32000;
     private static final String[] UPSTREAM_SUMMARY_KEYS = {"ok", "summary", "signals", "label", "confidence", "degraded"};
 
-    /** P2-20 (待确认): node retries allowed per run across all nodes (the only retry layer). */
+    /** P2-20 (decision D1: kept): node retries allowed per run across all nodes (the only retry layer). */
     @Value("${aegis.workflow.run-retry-budget:4}")
     private int runRetryBudget = 4;
 
@@ -1890,7 +2059,7 @@ public class WorkflowService {
         }
         try {
             Map<String, Object> parsed = objectMapper.readValue(version.getLayoutJson(), new TypeReference<Map<String, Object>>() {});
-            if (shouldRefreshResearchLayout(workflowKey, parsed)) {
+            if (DefaultWorkflowLayouts.shouldRefreshResearchLayout(workflowKey, parsed)) {
                 Map<String, Object> refreshed = layout(workflowKey);
                 refreshed.put("workflowVersionId", version.getVersionId());
                 return refreshed;
@@ -1903,7 +2072,7 @@ public class WorkflowService {
         }
     }
 
-    private Map<String, Object> layoutForRun(String workflowKey, String workflowVersionId) {
+    Map<String, Object> layoutForRun(String workflowKey, String workflowVersionId) {
         if (workflowVersionId == null || workflowVersionId.trim().isEmpty()) {
             return layout(workflowKey);
         }
@@ -1911,7 +2080,7 @@ public class WorkflowService {
         return layoutForRun(workflowKey, version);
     }
 
-    private Map<String, Object> parseJsonMap(String json) {
+    Map<String, Object> parseJsonMap(String json) {
         if (json == null || json.trim().isEmpty()) {
             return new LinkedHashMap<>();
         }
@@ -1922,7 +2091,7 @@ public class WorkflowService {
         }
     }
 
-    private WorkflowRun requireRun(String runId) {
+    WorkflowRun requireRun(String runId) {
         WorkflowRun run = mapper.findRun(runId);
         if (run == null) {
             throw new IllegalArgumentException("Workflow run not found: " + runId);
@@ -1944,6 +2113,9 @@ public class WorkflowService {
             result.put("handler", handler);
             result.put("summary", simulatedNodeMessage(type, handler, run.getSubject()));
             result.put("message", result.get("summary"));
+            if ("condition".equals(type)) {
+                result.put("evaluated", false);
+            }
             result.put("ok", true);
             return result;
         }
@@ -1955,11 +2127,56 @@ public class WorkflowService {
         if ("start".equals(type) || "end".equals(type) || "condition".equals(type)) {
             return true;
         }
-        if (handler == null) {
-            return true;
+        // Only truly deterministic control-flow handlers skip LLM. handler(node) never returns null
+        // (it falls back to functionName/nodeType); nodes without any executable definition are
+        // rejected up front by validateFallbackNodes (P3-15) instead of being skipped here.
+        return "workflow.end".equals(handler) || "scheduler.manual".equals(handler) || "scheduler.daily".equals(handler);
+    }
+
+    static final String CONDITION_NOT_EVALUATED_MESSAGE =
+            "Condition not evaluated by the Java fallback engine; all downstream branches run.";
+
+    /**
+     * P3-15: a non start/end/condition node needs a handler, functionName, agentId or prompt; otherwise
+     * the Java fallback would send a bare node type to the gateway. Rejected as a validation error.
+     */
+    void validateFallbackNodes(List<Map<String, Object>> nodes) {
+        List<String> invalid = new ArrayList<>();
+        for (Map<String, Object> node : nodes) {
+            String type = nodeType(node);
+            if ("start".equals(type) || "end".equals(type) || "condition".equals(type)) {
+                continue;
+            }
+            Map<String, Object> data = data(node);
+            boolean executable = !text(data, "handler", "").isEmpty()
+                    || !text(data, "functionName", "").isEmpty()
+                    || !text(data, "agentId", "").isEmpty()
+                    || !text(data, "prompt", "").isEmpty()
+                    || !text(data, "systemPrompt", "").isEmpty();
+            if (!executable) {
+                invalid.add(nodeId(node));
+            }
         }
-        // Only truly deterministic control-flow handlers skip LLM
-        return handler.equals("workflow.end") || handler.equals("scheduler.manual") || handler.equals("scheduler.daily");
+        if (!invalid.isEmpty()) {
+            throw new WorkflowValidationException("Workflow validation failed: nodes without handler: " + invalid);
+        }
+    }
+
+    private void recordUnevaluatedConditions(WorkflowRun run, List<Map<String, Object>> orderedNodes) {
+        List<String> conditions = new ArrayList<>();
+        for (Map<String, Object> node : orderedNodes) {
+            if ("condition".equals(nodeType(node))) {
+                conditions.add(nodeId(node));
+            }
+        }
+        if (conditions.isEmpty()) {
+            return;
+        }
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("nodes", conditions);
+        payload.put("engine", ENGINE_JAVA_FALLBACK);
+        recordRunEvent(run, "CONDITION_NOT_EVALUATED", null, null, "RUNNING",
+                CONDITION_NOT_EVALUATED_MESSAGE, payload, 50);
     }
 
     private AgentTemplate resolveAgent(Map<String, Object> node) {
@@ -1975,7 +2192,7 @@ public class WorkflowService {
         inline.setCategory("inline");
         inline.setTags("inline,workflow");
         inline.setPrompt(text(data(node), "prompt", text(data(node), "systemPrompt", "Execute this workflow agent node.")));
-        inline.setModelName(text(data(node), "modelName", "deepseek-v4-flash"));
+        inline.setModelName(text(data(node), "modelName", defaultModelName));
         inline.setToolsJson(text(data(node), "toolsJson", "[]"));
         return inline;
     }
@@ -1985,7 +2202,7 @@ public class WorkflowService {
             return "Workflow started for " + subject;
         }
         if ("condition".equals(type)) {
-            return "Condition evaluated as pass.";
+            return CONDITION_NOT_EVALUATED_MESSAGE;
         }
         if ("end".equals(type)) {
             return "Workflow completed.";
@@ -2017,7 +2234,7 @@ public class WorkflowService {
         }
     }
 
-    private List<Map<String, Object>> executionOrder(List<Map<String, Object>> nodes, List<Map<String, Object>> edges) {
+    List<Map<String, Object>> executionOrder(List<Map<String, Object>> nodes, List<Map<String, Object>> edges) {
         if (nodes.isEmpty() || edges.isEmpty()) {
             return nodes;
         }
@@ -2060,169 +2277,16 @@ public class WorkflowService {
             }
         }
         if (ordered.size() != nodes.size()) {
-            return nodes;
+            /* P3-15: previously fell back to declaration order silently. */
+            throw new WorkflowValidationException("Workflow validation failed: graph contains a cycle.");
         }
         return ordered;
     }
 
-    private Map<String, Object> defaultLayout(WorkflowDefinition definition) {
-        Map<String, Object> layout = emptyLayout(definition.getWorkflowKey());
-        layout.put("name", definition.getName());
-        layout.put("engine", definition.getEngine() == null ? "langgraph" : definition.getEngine());
-        if ("stock_recommendation_research".equals(definition.getWorkflowKey())) {
-            layout.put("nodes", stockRecommendationNodes());
-            layout.put("edges", stockRecommendationEdges());
-            return layout;
-        }
-        if ("stock_analysis".equals(definition.getWorkflowKey())) {
-            layout.put("nodes", stockAnalysisNodes());
-            layout.put("edges", stockAnalysisEdges());
-            attachResearchLayoutMetadata(layout, "fan_in_aggregate");
-            return layout;
-        }
-        if ("daily".equals(definition.getWorkflowKey())) {
-            layout.put("nodes", dailyNodes());
-            layout.put("edges", dailyEdges());
-            return layout;
-        }
-        if ("deep_dive".equals(definition.getWorkflowKey())) {
-            layout.put("nodes", deepDiveNodes());
-            layout.put("edges", deepDiveEdges());
-            return layout;
-        }
-        if ("exit_workflow".equals(definition.getWorkflowKey())) {
-            layout.put("nodes", exitWorkflowNodes());
-            layout.put("edges", exitWorkflowEdges());
-            return layout;
-        }
-        if ("portfolio_workflow".equals(definition.getWorkflowKey())) {
-            layout.put("nodes", portfolioWorkflowNodes());
-            layout.put("edges", portfolioWorkflowEdges());
-            return layout;
-        }
-        if ("position_workflow".equals(definition.getWorkflowKey())) {
-            layout.put("nodes", positionWorkflowNodes());
-            layout.put("edges", positionWorkflowEdges());
-            return layout;
-        }
-        if ("sector-analyst-workflow".equals(definition.getWorkflowKey())) {
-            layout.put("nodes", sectorAnalystNodes());
-            layout.put("edges", sectorAnalystEdges());
-            return layout;
-        }
-        if ("telegram_hourly_news_digest".equals(definition.getWorkflowKey())) {
-            layout.put("nodes", telegramDigestNodes());
-            layout.put("edges", telegramDigestEdges());
-            return layout;
-        }
-        if ("earnings_reaction".equals(definition.getWorkflowKey())) {
-            layout.put("nodes", earningsReactionNodes());
-            layout.put("edges", earningsReactionEdges());
-            attachResearchLayoutMetadata(layout, "earnings_reaction");
-            return layout;
-        }
-        if ("watchlist_digest".equals(definition.getWorkflowKey())) {
-            layout.put("nodes", watchlistDigestNodes());
-            layout.put("edges", watchlistDigestEdges());
-            attachResearchLayoutMetadata(layout, "watchlist_digest");
-            return layout;
-        }
-        List<Map<String, Object>> nodes = new ArrayList<>();
-        nodes.add(flowNode("start", "Start", "start", 80, 260, "scheduler.manual", null));
-        nodes.add(flowNode("context", "Load Context", "logic", 320, 260, "portfolio.get_context", null));
-        nodes.add(flowNode("analyst", "Research Agent", "agent", 590, 260, "general.agent", "agent-preset-value-investing"));
-        nodes.add(flowNode("end", "End", "end", 860, 260, "workflow.end", null));
-        List<Map<String, Object>> edges = new ArrayList<>();
-        edges.add(edge("start", "context"));
-        edges.add(edge("context", "analyst"));
-        edges.add(edge("analyst", "end"));
-        layout.put("nodes", nodes);
-        layout.put("edges", edges);
-        return layout;
-    }
-
-    private void attachResearchLayoutMetadata(Map<String, Object> layout, String pattern) {
-        Map<String, Object> metadata = new LinkedHashMap<>();
-        metadata.put("layoutVersion", CURRENT_RESEARCH_LAYOUT_VERSION);
-        metadata.put("pattern", pattern);
-        metadata.put("custom", false);
-        layout.put("metadata", metadata);
-    }
-
-    private boolean isResearchLayoutKey(String workflowKey) {
-        return workflowKey != null && RESEARCH_LAYOUT_KEYS.contains(workflowKey.trim());
-    }
-
-    /**
-     * Research keys without layoutVersion / with version &lt; CURRENT are treated as stale
-     * code defaults. User-marked custom layouts and version-stamped saves are never auto-refreshed.
-     */
-    @SuppressWarnings("unchecked")
-    private boolean shouldRefreshResearchLayout(String workflowKey, Map<String, Object> layout) {
-        if (!isResearchLayoutKey(workflowKey) || layout == null) {
-            return false;
-        }
-        Object metaObj = layout.get("metadata");
-        if (!(metaObj instanceof Map)) {
-            return true;
-        }
-        Map<String, Object> metadata = (Map<String, Object>) metaObj;
-        if (isCustomLayout(metadata)) {
-            return false;
-        }
-        return layoutVersionOf(metadata) < CURRENT_RESEARCH_LAYOUT_VERSION;
-    }
-
-    private boolean isCustomLayout(Map<String, Object> metadata) {
-        Object custom = metadata.get("custom");
-        if (custom instanceof Boolean) {
-            return Boolean.TRUE.equals(custom);
-        }
-        return custom != null && "true".equalsIgnoreCase(String.valueOf(custom).trim());
-    }
-
-    private int layoutVersionOf(Map<String, Object> metadata) {
-        Object version = metadata.get("layoutVersion");
-        if (version == null) {
-            return 0;
-        }
-        if (version instanceof Number) {
-            return ((Number) version).intValue();
-        }
-        try {
-            return Integer.parseInt(String.valueOf(version).trim());
-        } catch (NumberFormatException ex) {
-            return 0;
-        }
-    }
-
-    @SuppressWarnings("unchecked")
-    private void ensureLayoutVersionMetadata(Map<String, Object> layout, String workflowKey) {
-        Object metaObj = layout.get("metadata");
-        Map<String, Object> metadata;
-        if (metaObj instanceof Map) {
-            metadata = new LinkedHashMap<>((Map<String, Object>) metaObj);
-        } else {
-            metadata = new LinkedHashMap<>();
-        }
-        metadata.put("layoutVersion", CURRENT_RESEARCH_LAYOUT_VERSION);
-        if (isResearchLayoutKey(workflowKey) && !metadata.containsKey("pattern")) {
-            metadata.put("pattern", researchPattern(workflowKey));
-        }
-        layout.put("metadata", metadata);
-    }
-
-    private String researchPattern(String workflowKey) {
-        if ("stock_analysis".equals(workflowKey)) {
-            return "fan_in_aggregate";
-        }
-        if ("earnings_reaction".equals(workflowKey)) {
-            return "earnings_reaction";
-        }
-        if ("watchlist_digest".equals(workflowKey)) {
-            return "watchlist_digest";
-        }
-        return workflowKey;
+    /** P4-11: optional, so existing tests / constructors are unaffected. */
+    @Autowired(required = false)
+    public void setQueueResultWriteback(QueueResultWriteback queueResultWriteback) {
+        this.queueResultWriteback = queueResultWriteback;
     }
 
     /** Optional setter injection keeps the existing constructor contract for tests. */
@@ -2245,358 +2309,6 @@ public class WorkflowService {
                 // best-effort write-back; read-path already returns the code default
             }
         });
-    }
-
-    private List<Map<String, Object>> stockRecommendationNodes() {
-        List<Map<String, Object>> nodes = new ArrayList<>();
-        nodes.add(flowNode("start", "Start", "start", 80, 260, "scheduler.manual", null));
-        nodes.add(flowNode("market_analysis", "市场分析", "agent", 320, 120, "finance.market_analysis", null));
-        nodes.add(flowNode("industry_share", "行业份额", "agent", 320, 260, "finance.industry_share", null));
-        nodes.add(flowNode("sentiment_monitor", "舆情监测", "agent", 320, 400, "finance.sentiment_monitor", null));
-        nodes.add(flowNode("tech_breakthrough", "技术突破", "agent", 590, 120, "finance.tech_breakthrough", null));
-        nodes.add(flowNode("industry_news", "行业新闻", "agent", 590, 260, "finance.industry_news", null));
-        nodes.add(flowNode("web_search", "网页搜索", "agent", 590, 400, "general.web_search", null));
-        nodes.add(flowNode("financial_interpretation", "财务解读", "agent", 860, 260, "finance.financial_interpretation", null));
-        nodes.add(flowNode("recommendation", "股票推荐聚合", "agent", 1130, 260, "finance.stock_recommendation_aggregate", null));
-        nodes.add(flowNode("end", "End", "end", 1400, 260, "workflow.end", null));
-        return nodes;
-    }
-
-    private List<Map<String, Object>> stockRecommendationEdges() {
-        List<Map<String, Object>> edges = new ArrayList<>();
-        edges.add(edge("start", "market_analysis"));
-        edges.add(edge("market_analysis", "industry_share"));
-        edges.add(edge("industry_share", "sentiment_monitor"));
-        edges.add(edge("sentiment_monitor", "tech_breakthrough"));
-        edges.add(edge("tech_breakthrough", "industry_news"));
-        edges.add(edge("industry_news", "web_search"));
-        edges.add(edge("web_search", "financial_interpretation"));
-        edges.add(edge("financial_interpretation", "recommendation"));
-        edges.add(edge("recommendation", "end"));
-        return edges;
-    }
-
-    // Aligned with research_graph.build_single_name_research_layout (sequential multi-specialist).
-    private List<Map<String, Object>> stockAnalysisNodes() {
-        List<Map<String, Object>> nodes = new ArrayList<>();
-        nodes.add(flowNode("start", "Start", "start", 80, 260, "scheduler.manual", null));
-        nodes.add(flowNode("fundamentals", "Fundamentals", "agent", 340, 80, "finance.fundamental_analysis", null));
-        nodes.add(flowNode("news", "Industry News", "agent", 340, 200, "finance.industry_news", null));
-        nodes.add(flowNode("valuation", "Valuation", "agent", 340, 320, "finance.valuation_analysis", null));
-        nodes.add(flowNode("risk", "Risk Assessment", "agent", 340, 440, "finance.risk_assessment", null));
-        nodes.add(flowNode("aggregate", "Recommendation Aggregate", "agent", 620, 260, "finance.stock_recommendation_aggregate", null));
-        nodes.add(flowNode("end", "End", "end", 880, 260, "workflow.end", null));
-        return nodes;
-    }
-
-    private List<Map<String, Object>> stockAnalysisEdges() {
-        List<Map<String, Object>> edges = new ArrayList<>();
-        /* Parallel specialists fan in to the aggregate (orchestrator defers the join). */
-        for (String specialist : Arrays.asList("fundamentals", "news", "valuation", "risk")) {
-            edges.add(edge("start", specialist));
-            edges.add(edge(specialist, "aggregate"));
-        }
-        edges.add(edge("aggregate", "end"));
-        return edges;
-    }
-
-    // ===== daily =====
-    private List<Map<String, Object>> dailyNodes() {
-        List<Map<String, Object>> nodes = new ArrayList<>();
-        nodes.add(flowNode("start", "Start", "start", 80, 260, "scheduler.manual", null));
-        nodes.add(flowNode("market_overview", "Market Overview", "agent", 320, 120, "finance.market_analysis", null));
-        nodes.add(flowNode("sector_rotation", "Sector Rotation", "agent", 320, 400, "finance.industry_share", null));
-        nodes.add(flowNode("sentiment_pulse", "Sentiment Pulse", "agent", 600, 120, "finance.sentiment_monitor", null));
-        nodes.add(flowNode("key_indicators", "Key Indicators", "agent", 600, 400, "finance.financial_interpretation", null));
-        nodes.add(flowNode("daily_summary", "Daily Briefing", "agent", 880, 260, "finance.stock_recommendation_aggregate", null));
-        nodes.add(flowNode("end", "End", "end", 1140, 260, "workflow.end", null));
-        return nodes;
-    }
-    private List<Map<String, Object>> dailyEdges() {
-        List<Map<String, Object>> edges = new ArrayList<>();
-        edges.add(edge("start", "market_overview"));
-        edges.add(edge("start", "sector_rotation"));
-        edges.add(edge("market_overview", "sentiment_pulse"));
-        edges.add(edge("sector_rotation", "key_indicators"));
-        edges.add(edge("sentiment_pulse", "daily_summary"));
-        edges.add(edge("key_indicators", "daily_summary"));
-        edges.add(edge("daily_summary", "end"));
-        return edges;
-    }
-
-    // ===== deep_dive =====
-    private List<Map<String, Object>> deepDiveNodes() {
-        List<Map<String, Object>> nodes = new ArrayList<>();
-        nodes.add(flowNode("start", "Start", "start", 80, 360, "scheduler.manual", null));
-        nodes.add(flowNode("fundamental", "Fundamental", "agent", 260, 100, "finance.fundamental_analysis", "agent-preset-fundamental"));
-        nodes.add(flowNode("technical", "Technical", "agent", 260, 280, "finance.technical_analysis", "agent-preset-technical"));
-        nodes.add(flowNode("valuation", "Valuation", "agent", 260, 460, "finance.valuation_analysis", "agent-preset-value-investing"));
-        nodes.add(flowNode("money_flow", "Money Flow", "agent", 480, 100, "finance.money_flow_analysis", null));
-        nodes.add(flowNode("industry", "Industry", "agent", 480, 280, "finance.industry_share", null));
-        nodes.add(flowNode("sentiment", "Sentiment", "agent", 480, 460, "finance.sentiment_monitor", null));
-        nodes.add(flowNode("news", "News", "agent", 700, 100, "finance.industry_news", null));
-        nodes.add(flowNode("tech_break", "Tech Breakthrough", "agent", 700, 280, "finance.tech_breakthrough", null));
-        nodes.add(flowNode("risk", "Risk Assessment", "agent", 700, 460, "finance.risk_assessment", "agent-preset-risk-exit"));
-        nodes.add(flowNode("peer_comp", "Peer Comparison", "agent", 920, 100, "finance.peer_comparison", null));
-        nodes.add(flowNode("catalysts", "Catalyst Analysis", "agent", 920, 280, "finance.catalyst_analysis", null));
-        nodes.add(flowNode("thesis", "Thesis Builder", "agent", 920, 460, "finance.thesis_builder", null));
-        nodes.add(flowNode("risk_reward", "Risk-Reward", "agent", 1140, 180, "finance.risk_reward_analysis", null));
-        nodes.add(flowNode("entry", "Entry Strategy", "agent", 1140, 380, "finance.entry_strategy", "agent-preset-price-action"));
-        nodes.add(flowNode("recommendation", "Recommendation", "agent", 1360, 280, "finance.stock_recommendation_aggregate", null));
-        nodes.add(flowNode("end", "End", "end", 1580, 280, "workflow.end", null));
-        return nodes;
-    }
-    private List<Map<String, Object>> deepDiveEdges() {
-        List<Map<String, Object>> edges = new ArrayList<>();
-        edges.add(edge("start", "fundamental"));
-        edges.add(edge("start", "technical"));
-        edges.add(edge("start", "valuation"));
-        edges.add(edge("fundamental", "money_flow"));
-        edges.add(edge("technical", "industry"));
-        edges.add(edge("valuation", "sentiment"));
-        edges.add(edge("money_flow", "news"));
-        edges.add(edge("industry", "tech_break"));
-        edges.add(edge("sentiment", "risk"));
-        edges.add(edge("news", "peer_comp"));
-        edges.add(edge("tech_break", "catalysts"));
-        edges.add(edge("risk", "thesis"));
-        edges.add(edge("peer_comp", "risk_reward"));
-        edges.add(edge("catalysts", "risk_reward"));
-        edges.add(edge("thesis", "entry"));
-        edges.add(edge("risk_reward", "recommendation"));
-        edges.add(edge("entry", "recommendation"));
-        edges.add(edge("recommendation", "end"));
-        return edges;
-    }
-
-    // ===== exit_workflow =====
-    private List<Map<String, Object>> exitWorkflowNodes() {
-        List<Map<String, Object>> nodes = new ArrayList<>();
-        nodes.add(flowNode("start", "Start", "start", 80, 260, "scheduler.manual", null));
-        nodes.add(flowNode("position_check", "Position Check", "logic", 300, 140, "portfolio.get_positions", null));
-        nodes.add(flowNode("pnl_analysis", "P&L Analysis", "agent", 300, 380, "finance.market_analysis", null));
-        nodes.add(flowNode("stop_loss", "Stop Loss Review", "agent", 540, 140, "general.agent", null));
-        nodes.add(flowNode("take_profit", "Take Profit Review", "agent", 540, 380, "general.agent", null));
-        nodes.add(flowNode("signal_decay", "Signal Decay", "agent", 780, 140, "finance.risk_assessment", null));
-        nodes.add(flowNode("news_risk", "News Risk Scan", "agent", 780, 380, "finance.industry_news", null));
-        nodes.add(flowNode("exit_decision", "Exit Decision", "agent", 1020, 260, "finance.stock_recommendation_aggregate", null));
-        nodes.add(flowNode("end", "End", "end", 1260, 260, "workflow.end", null));
-        return nodes;
-    }
-    private List<Map<String, Object>> exitWorkflowEdges() {
-        List<Map<String, Object>> edges = new ArrayList<>();
-        edges.add(edge("start", "position_check"));
-        edges.add(edge("start", "pnl_analysis"));
-        edges.add(edge("position_check", "stop_loss"));
-        edges.add(edge("pnl_analysis", "take_profit"));
-        edges.add(edge("stop_loss", "signal_decay"));
-        edges.add(edge("take_profit", "news_risk"));
-        edges.add(edge("signal_decay", "exit_decision"));
-        edges.add(edge("news_risk", "exit_decision"));
-        edges.add(edge("exit_decision", "end"));
-        return edges;
-    }
-
-    // ===== portfolio_workflow =====
-    private List<Map<String, Object>> portfolioWorkflowNodes() {
-        List<Map<String, Object>> nodes = new ArrayList<>();
-        nodes.add(flowNode("start", "Start", "start", 80, 260, "scheduler.manual", null));
-        nodes.add(flowNode("holdings", "Holdings Overview", "logic", 320, 140, "portfolio.get_context", null));
-        nodes.add(flowNode("market_scan", "Market Scan", "agent", 320, 380, "finance.market_analysis", null));
-        nodes.add(flowNode("sector_exposure", "Sector Exposure", "agent", 580, 140, "finance.industry_share", null));
-        nodes.add(flowNode("risk_metrics", "Risk Metrics", "agent", 580, 380, "finance.risk_assessment", null));
-        nodes.add(flowNode("rebalance", "Rebalancing Plan", "agent", 840, 260, "finance.stock_recommendation_aggregate", null));
-        nodes.add(flowNode("end", "End", "end", 1100, 260, "workflow.end", null));
-        return nodes;
-    }
-    private List<Map<String, Object>> portfolioWorkflowEdges() {
-        List<Map<String, Object>> edges = new ArrayList<>();
-        edges.add(edge("start", "holdings"));
-        edges.add(edge("start", "market_scan"));
-        edges.add(edge("holdings", "sector_exposure"));
-        edges.add(edge("market_scan", "risk_metrics"));
-        edges.add(edge("sector_exposure", "rebalance"));
-        edges.add(edge("risk_metrics", "rebalance"));
-        edges.add(edge("rebalance", "end"));
-        return edges;
-    }
-
-    // ===== position_workflow =====
-    private List<Map<String, Object>> positionWorkflowNodes() {
-        List<Map<String, Object>> nodes = new ArrayList<>();
-        nodes.add(flowNode("start", "Start", "start", 80, 340, "scheduler.manual", null));
-        nodes.add(flowNode("holdings", "Load Holdings", "logic", 260, 340, "portfolio.get_positions", null));
-        nodes.add(flowNode("pnl", "P&L Analysis", "agent", 440, 140, "finance.market_analysis", null));
-        nodes.add(flowNode("cost_basis", "Cost Basis", "agent", 440, 340, "finance.financial_interpretation", null));
-        nodes.add(flowNode("duration", "Duration Analysis", "agent", 440, 540, "finance.technical_analysis", null));
-        nodes.add(flowNode("correlation", "Correlation", "agent", 640, 140, "finance.valuation_analysis", null));
-        nodes.add(flowNode("concentration", "Concentration Risk", "agent", 640, 340, "finance.risk_assessment", null));
-        nodes.add(flowNode("sector_break", "Sector Breakdown", "agent", 640, 540, "finance.industry_share", null));
-        nodes.add(flowNode("money_flow", "Cash Flow", "agent", 840, 140, "finance.money_flow_analysis", null));
-        nodes.add(flowNode("sentiment", "Position Sentiment", "agent", 840, 340, "finance.sentiment_monitor", null));
-        nodes.add(flowNode("tax_impact", "Tax Impact", "agent", 840, 540, "general.agent", null));
-        nodes.add(flowNode("hedge", "Hedge Ideas", "agent", 1040, 140, "general.agent", null));
-        nodes.add(flowNode("action_items", "Action Items", "agent", 1040, 440, "general.agent", null));
-        nodes.add(flowNode("aggregate", "Portfolio Summary", "agent", 1260, 340, "finance.stock_recommendation_aggregate", null));
-        nodes.add(flowNode("end", "End", "end", 1480, 340, "workflow.end", null));
-        return nodes;
-    }
-    private List<Map<String, Object>> positionWorkflowEdges() {
-        List<Map<String, Object>> edges = new ArrayList<>();
-        edges.add(edge("start", "holdings"));
-        edges.add(edge("holdings", "pnl"));
-        edges.add(edge("holdings", "cost_basis"));
-        edges.add(edge("holdings", "duration"));
-        edges.add(edge("pnl", "correlation"));
-        edges.add(edge("cost_basis", "concentration"));
-        edges.add(edge("duration", "sector_break"));
-        edges.add(edge("correlation", "money_flow"));
-        edges.add(edge("concentration", "sentiment"));
-        edges.add(edge("sector_break", "tax_impact"));
-        edges.add(edge("money_flow", "hedge"));
-        edges.add(edge("sentiment", "action_items"));
-        edges.add(edge("tax_impact", "action_items"));
-        edges.add(edge("hedge", "aggregate"));
-        edges.add(edge("action_items", "aggregate"));
-        edges.add(edge("aggregate", "end"));
-        return edges;
-    }
-
-    // ===== sector-analyst-workflow =====
-    private List<Map<String, Object>> sectorAnalystNodes() {
-        List<Map<String, Object>> nodes = new ArrayList<>();
-        nodes.add(flowNode("start", "Start", "start", 80, 340, "scheduler.manual", null));
-        nodes.add(flowNode("macro", "Macro Environment", "agent", 280, 100, "general.agent", null));
-        nodes.add(flowNode("industry_chain", "Industry Chain", "agent", 280, 340, "finance.industry_share", null));
-        nodes.add(flowNode("policy", "Policy Impact", "agent", 280, 580, "general.agent", null));
-        nodes.add(flowNode("competitive", "Competitive Map", "agent", 520, 100, "finance.industry_news", null));
-        nodes.add(flowNode("top_players", "Top Players", "agent", 520, 340, "finance.fundamental_analysis", null));
-        nodes.add(flowNode("tech_trends", "Tech Trends", "agent", 520, 580, "finance.tech_breakthrough", null));
-        nodes.add(flowNode("valuation_band", "Valuation Band", "agent", 760, 100, "finance.valuation_analysis", null));
-        nodes.add(flowNode("sentiment", "Sector Sentiment", "agent", 760, 340, "finance.sentiment_monitor", null));
-        nodes.add(flowNode("money_flow", "Capital Flow", "agent", 760, 580, "finance.money_flow_analysis", null));
-        nodes.add(flowNode("risk", "Sector Risk", "agent", 1000, 100, "finance.risk_assessment", null));
-        nodes.add(flowNode("catalysts", "Catalyst Calendar", "agent", 1000, 340, "general.agent", null));
-        nodes.add(flowNode("rotation", "Rotation Signal", "agent", 1000, 580, "finance.market_analysis", null));
-        nodes.add(flowNode("recommendation", "Sector Call", "agent", 1240, 340, "finance.stock_recommendation_aggregate", null));
-        nodes.add(flowNode("end", "End", "end", 1480, 340, "workflow.end", null));
-        return nodes;
-    }
-    private List<Map<String, Object>> sectorAnalystEdges() {
-        List<Map<String, Object>> edges = new ArrayList<>();
-        edges.add(edge("start", "macro"));
-        edges.add(edge("start", "industry_chain"));
-        edges.add(edge("start", "policy"));
-        edges.add(edge("macro", "competitive"));
-        edges.add(edge("industry_chain", "top_players"));
-        edges.add(edge("policy", "tech_trends"));
-        edges.add(edge("competitive", "valuation_band"));
-        edges.add(edge("top_players", "sentiment"));
-        edges.add(edge("tech_trends", "money_flow"));
-        edges.add(edge("valuation_band", "risk"));
-        edges.add(edge("sentiment", "catalysts"));
-        edges.add(edge("money_flow", "rotation"));
-        edges.add(edge("risk", "recommendation"));
-        edges.add(edge("catalysts", "recommendation"));
-        edges.add(edge("rotation", "recommendation"));
-        edges.add(edge("recommendation", "end"));
-        return edges;
-    }
-
-    // ===== telegram_hourly_news_digest =====
-    private List<Map<String, Object>> telegramDigestNodes() {
-        List<Map<String, Object>> nodes = new ArrayList<>();
-        nodes.add(flowNode("start", "Start", "start", 80, 200, "scheduler.manual", null));
-        nodes.add(flowNode("news_fetch", "Fetch News", "agent", 320, 200, "general.web_search", null));
-        nodes.add(flowNode("sentiment_filter", "Sentiment Filter", "agent", 560, 200, "finance.sentiment_monitor", null));
-        nodes.add(flowNode("end", "End", "end", 800, 200, "workflow.end", null));
-        return nodes;
-    }
-    private List<Map<String, Object>> telegramDigestEdges() {
-        List<Map<String, Object>> edges = new ArrayList<>();
-        edges.add(edge("start", "news_fetch"));
-        edges.add(edge("news_fetch", "sentiment_filter"));
-        edges.add(edge("sentiment_filter", "end"));
-        return edges;
-    }
-
-    // Aligned with research_graph.build_earnings_reaction_layout.
-    private List<Map<String, Object>> earningsReactionNodes() {
-        List<Map<String, Object>> nodes = new ArrayList<>();
-        nodes.add(flowNode("start", "Start", "start", 80, 260, "scheduler.manual", null));
-        nodes.add(flowNode("market_analysis", "Market Reaction", "agent", 340, 140, "finance.market_analysis", null));
-        nodes.add(flowNode("financial_interpretation", "Earnings Interpretation", "agent", 340, 260, "finance.financial_interpretation", null));
-        nodes.add(flowNode("industry_news", "Industry & Guidance News", "agent", 340, 380, "finance.industry_news", null));
-        nodes.add(flowNode("aggregate", "Earnings Recommendation", "agent", 620, 260, "finance.stock_recommendation_aggregate", null));
-        nodes.add(flowNode("end", "End", "end", 880, 260, "workflow.end", null));
-        return nodes;
-    }
-    private List<Map<String, Object>> earningsReactionEdges() {
-        List<Map<String, Object>> edges = new ArrayList<>();
-        for (String specialist : Arrays.asList("market_analysis", "financial_interpretation", "industry_news")) {
-            edges.add(edge("start", specialist));
-            edges.add(edge(specialist, "aggregate"));
-        }
-        edges.add(edge("aggregate", "end"));
-        return edges;
-    }
-
-    // Aligned with research_graph.build_watchlist_digest_layout (lightweight, no aggregate).
-    private List<Map<String, Object>> watchlistDigestNodes() {
-        List<Map<String, Object>> nodes = new ArrayList<>();
-        nodes.add(flowNode("start", "Start", "start", 80, 260, "scheduler.manual", null));
-        nodes.add(flowNode("market_analysis", "Watchlist Market Snapshot", "agent", 340, 180, "finance.market_analysis", null));
-        nodes.add(flowNode("industry_news", "Watchlist News", "agent", 340, 340, "finance.industry_news", null));
-        nodes.add(flowNode("risk_assessment", "Digest Risk Summary", "agent", 620, 260, "finance.risk_assessment", null));
-        nodes.add(flowNode("end", "End", "end", 880, 260, "workflow.end", null));
-        return nodes;
-    }
-    private List<Map<String, Object>> watchlistDigestEdges() {
-        List<Map<String, Object>> edges = new ArrayList<>();
-        for (String specialist : Arrays.asList("market_analysis", "industry_news")) {
-            edges.add(edge("start", specialist));
-            edges.add(edge(specialist, "risk_assessment"));
-        }
-        edges.add(edge("risk_assessment", "end"));
-        return edges;
-    }
-
-    private Map<String, Object> emptyLayout(String workflowKey) {
-        Map<String, Object> empty = new LinkedHashMap<>();
-        empty.put("workflowKey", workflowKey);
-        empty.put("engine", "langgraph");
-        empty.put("nodes", Collections.emptyList());
-        empty.put("edges", Collections.emptyList());
-        return empty;
-    }
-
-    private Map<String, Object> flowNode(String id, String label, String nodeType, int x, int y, String handler, String agentId) {
-        Map<String, Object> node = new LinkedHashMap<>();
-        node.put("id", id);
-        node.put("type", "workflowNode");
-        Map<String, Object> position = new LinkedHashMap<>();
-        position.put("x", x);
-        position.put("y", y);
-        node.put("position", position);
-        Map<String, Object> data = new LinkedHashMap<>();
-        data.put("label", label);
-        data.put("nodeType", nodeType);
-        data.put("handler", handler);
-        data.put("agentId", agentId);
-        data.put("prompt", "");
-        data.put("inputKeys", Collections.emptyList());
-        data.put("outputKeys", Collections.emptyList());
-        node.put("data", data);
-        return node;
-    }
-
-    private Map<String, Object> edge(String source, String target) {
-        Map<String, Object> edge = new LinkedHashMap<>();
-        edge.put("id", source + "-" + target);
-        edge.put("source", source);
-        edge.put("target", target);
-        edge.put("animated", true);
-        return edge;
     }
 
     private WorkflowDefinition requireDefinition(String workflowKey) {
@@ -2666,7 +2378,7 @@ public class WorkflowService {
         return value instanceof List ? ((List<?>) value).size() : 0;
     }
 
-    private String toJson(Object value) {
+    String toJson(Object value) {
         try {
             return objectMapper.writeValueAsString(value);
         } catch (Exception ex) {
@@ -2674,7 +2386,7 @@ public class WorkflowService {
         }
     }
 
-    private void recordRunEvent(WorkflowRun run,
+    void recordRunEvent(WorkflowRun run,
                                 String eventType,
                                 WorkflowNodeRun nodeRun,
                                 String nodeId,
@@ -2694,6 +2406,17 @@ public class WorkflowService {
         event.setCreatedAt(now());
         event.setSortOrder(sortOrder);
         mapper.insertRunEvent(event);
+        if (queueResultWriteback != null && QueueResultWriteback.isTrigger(eventType)) {
+            /* P4-11: answer queued chat messages in their thread (never throws). */
+            queueResultWriteback.onRunEvent(run, eventType, payload);
+        }
+    }
+
+    /** P4-11: chat path bookkeeping — this thread queued a message into the run. */
+    public void recordChatQueuedMessage(String runId, String threadId, String kind, Object queueId) {
+        if (queueResultWriteback != null) {
+            queueResultWriteback.recordQueued(runId, threadId, kind, queueId);
+        }
     }
 
     private String normalizeIdempotencyKey(String idempotencyKey) {
@@ -2733,11 +2456,11 @@ public class WorkflowService {
         }
     }
 
-    private String string(Object value) {
+    String string(Object value) {
         return value == null ? "" : String.valueOf(value);
     }
 
-    private String now() {
+    String now() {
         return LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
     }
 

@@ -2,13 +2,14 @@
 
 from contextlib import nullcontext
 from fastapi import APIRouter, Request
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel, Field, ConfigDict
 from typing import Any
 
 from ..models.requests import WorkflowRequest, NodeRequest
 from ..models.responses import WorkflowResult, NodeResult
 from ..dependencies import workflow_engine, node_executor
+from ..core.run_registry import RunRegistryError
 from ..core.tools import use_authorization
 
 router = APIRouter(tags=["workflow"])
@@ -17,9 +18,40 @@ router = APIRouter(tags=["workflow"])
 class ResumeRequest(BaseModel):
     thread_id: str = Field(..., alias="threadId")
     resume_value: dict[str, Any] | None = Field(default=None, alias="resumeValue")
+    owner: dict[str, Any] | None = None
+    # P4-5: run-scoped delegated token (issued by Java for the run owner, not the approver) so tool
+    # calls after the approval gate keep the same portfolio:read scope as the original run.
+    delegated_token: str | None = Field(default=None, alias="delegatedToken")
 
-    class Config:
-        populate_by_name = True
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class CancelRunRequest(BaseModel):
+    thread_id: str = Field(..., alias="threadId")
+    owner: dict[str, Any] | None = None
+    reason: str | None = None
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+_CANCEL_STATUS = {"NOT_ACTIVE": 404, "OWNER_MISMATCH": 403}
+
+
+@router.post("/cancel-run")
+async def cancel_run(body: CancelRunRequest):
+    """P4-3: stop an active run on this orchestrator (service token + owner check).
+
+    Java owns the run status (CAS to CANCELLED); this only stops the graph. ``NOT_ACTIVE`` means the
+    run already finished here (or runs on another replica, see P4-16) and is not an error for Java.
+    """
+    try:
+        result = workflow_engine.cancel_run(body.thread_id, body.owner, (body.reason or "cancelled")[:64])
+    except RunRegistryError as exc:
+        return JSONResponse(
+            status_code=_CANCEL_STATUS.get(exc.code, 400),
+            content={"ok": False, "code": exc.code, "error": exc.message},
+        )
+    return {"ok": True, **result}
 
 
 def _authorization_context(delegated_token: str | None):
@@ -33,11 +65,13 @@ def _authorization_context(delegated_token: str | None):
 async def resume_workflow(body: ResumeRequest):
     """Resume a workflow that was interrupted by an approval gate."""
     try:
-        result = await workflow_engine.resume_workflow(
-            thread_id=body.thread_id,
-            # No default: a missing decision must never be treated as approval.
-            resume_value=body.resume_value,
-        )
+        with _authorization_context(body.delegated_token):
+            result = await workflow_engine.resume_workflow(
+                thread_id=body.thread_id,
+                # No default: a missing decision must never be treated as approval.
+                resume_value=body.resume_value,
+                owner=body.owner,
+            )
         return result
     except Exception as e:
         return WorkflowResult(
@@ -45,6 +79,32 @@ async def resume_workflow(body: ResumeRequest):
             error=str(e),
             final_state={},
         )
+
+
+@router.post("/resume-workflow-stream")
+async def resume_workflow_stream(body: ResumeRequest):
+    """P4-10 (R11): SSE resume of an approval-gate interrupt (same events as /stream-workflow)."""
+    import json
+
+    async def event_generator():
+        with _authorization_context(body.delegated_token):
+            async for event in workflow_engine.resume_workflow_stream(
+                thread_id=body.thread_id,
+                # No default: a missing decision must never be treated as approval.
+                resume_value=body.resume_value,
+                owner=body.owner,
+            ):
+                yield f"event: {event.event}\ndata: {json.dumps(event.data)}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @router.post("/stream-workflow")
@@ -62,6 +122,7 @@ async def stream_workflow(request: Request, body: WorkflowRequest):
                 subject=body.subject,
                 require_approval=body.require_approval,
                 thread_id=body.thread_id,
+                owner=body.owner,
             ):
                 yield f"event: {event.event}\ndata: {json.dumps(event.data)}\n\n"
 
@@ -89,6 +150,7 @@ async def stream_workflow_tokens(request: Request, body: WorkflowRequest):
                 subject=body.subject,
                 require_approval=body.require_approval,
                 thread_id=body.thread_id,
+                owner=body.owner,
             ):
                 yield f"event: {event.event}\ndata: {json.dumps(event.data)}\n\n"
 
@@ -115,6 +177,7 @@ async def execute_workflow(request: Request, body: WorkflowRequest) -> WorkflowR
                 subject=body.subject,
                 require_approval=body.require_approval,
                 thread_id=body.thread_id,
+                owner=body.owner,
             )
         return result
     except Exception as e:

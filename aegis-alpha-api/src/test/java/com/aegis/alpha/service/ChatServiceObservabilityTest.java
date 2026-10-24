@@ -51,8 +51,11 @@ class ChatServiceObservabilityTest {
     @BeforeEach
     void setUp() {
         chatMapper = mock(ChatMapper.class);
-        /* Unstubbed findThreadOwner returns an empty map (legacy thread); let the conditional claim succeed. */
-        when(chatMapper.updateThreadOwner(anyString(), anyString(), anyString())).thenReturn(1);
+        /* D2: legacy threads are no longer claimable, so every thread is owned by the caller. */
+        java.util.Map<String, Object> owned = new java.util.LinkedHashMap<String, Object>();
+        owned.put("user_id", "u-1");
+        owned.put("tenant_id", "tenant-1");
+        when(chatMapper.findThreadOwner(anyString())).thenReturn(owned);
         langChainGateway = mock(LangChainGateway.class);
         marketDataService = mock(MarketDataService.class);
         workflowService = mock(WorkflowService.class);

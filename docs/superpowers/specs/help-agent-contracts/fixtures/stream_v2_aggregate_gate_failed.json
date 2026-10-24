@@ -1,0 +1,15 @@
+{
+  "description": "P4-9: the aggregate answer is released exactly once, after the policy/critique gate. The gate failed here, so only the labelled gated summary is sent (withheld=true) and the raw model prose never appears. /stream-workflow-tokens additionally sends one deprecated `token` alias with the same text.",
+  "requiredKeys": {
+    "node_start": ["nodeId", "nodeName", "handler", "turn"],
+    "message_delta": ["nodeId", "delta", "final", "gatePassed"],
+    "token": ["nodeId", "content"]
+  },
+  "events": [
+    {"event": "node_start", "data": {"nodeId": "aggregate", "nodeName": "Report", "handler": "finance.stock_recommendation_aggregate", "turn": 1}},
+    {"event": "message_delta", "data": {"nodeId": "aggregate", "delta": "[INSUFFICIENT_DATA] report", "final": true, "gatePassed": false, "withheld": true}},
+    {"event": "token", "data": {"nodeId": "aggregate", "content": "[INSUFFICIENT_DATA] report"}},
+    {"event": "node_update", "data": {"nodeId": "aggregate", "nodeName": "Report", "handler": "finance.stock_recommendation_aggregate", "status": "completed", "ok": true, "degraded": false, "startedAt": "2026-10-24T00:00:00+00:00", "completedAt": "2026-10-24T00:00:01+00:00", "durationMs": 1000}},
+    {"event": "workflow_complete", "data": {"ok": true, "degraded": false, "final_state": {}}}
+  ]
+}

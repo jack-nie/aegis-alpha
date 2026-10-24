@@ -11,7 +11,7 @@ import logging
 from typing import Any
 
 from fastapi import APIRouter
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 
 from ..core.help_loop import run_help_loop
 
@@ -30,9 +30,7 @@ class HelpExecuteRequest(BaseModel):
     intent: dict[str, Any] | None = None
     max_rounds: int = 3
 
-    class Config:
-        populate_by_name = True
-        extra = "ignore"
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
 
 
 @router.post("/help/execute")

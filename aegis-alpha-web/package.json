@@ -10,7 +10,9 @@
     "test:portfolio-list": "node scripts/portfolio-list-view.test.mjs",
     "test:market-data-query": "node scripts/market-data-query.test.mjs",
     "test:enterprise-console": "node scripts/enterprise-console-foundation.test.mjs",
-    "test:ui-ux-audit": "node scripts/ui-ux-audit-regression.test.mjs"
+    "test:ui-ux-audit": "node scripts/ui-ux-audit-regression.test.mjs",
+    "test:workflow-stream-events": "node scripts/workflow-stream-events.test.mjs",
+    "test:copilot-queue-delivery": "node scripts/copilot-queue-delivery.test.mjs"
   },
   "dependencies": {
     "@xyflow/react": "^12.10.2",

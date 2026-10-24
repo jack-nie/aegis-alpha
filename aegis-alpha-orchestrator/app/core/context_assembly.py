@@ -31,12 +31,23 @@ _SKIP_NODE_KEYS = frozenset(
         "last_agent_id",
         "approval_status",
         "evidence",
+        "usage_turns",
+        "usage_by_node",
+        "usageTotals",
+        "copilotChat",
     }
 )
 
 _INPUT_TOKEN_KEYS = ("inputTokens", "input_tokens")
 _OUTPUT_TOKEN_KEYS = ("outputTokens", "output_tokens")
 _TOTAL_TOKEN_KEYS = ("totalTokens", "total_tokens")
+# P4-7: cache-read input tokens (LangChain input_token_details.cache_read, DeepSeek prompt_cache_hit_tokens,
+# OpenAI prompt_tokens_details.cached_tokens) and reasoning output tokens.
+_CACHE_READ_KEYS = ("cacheReadTokens", "cache_read_tokens", "prompt_cache_hit_tokens", "cache_read_input_tokens")
+_CACHE_READ_NESTED = (("input_token_details", "cache_read"), ("prompt_tokens_details", "cached_tokens"))
+_REASONING_KEYS = ("reasoningTokens", "reasoning_tokens")
+_REASONING_NESTED = (("output_token_details", "reasoning"), ("completion_tokens_details", "reasoning_tokens"))
+_USAGE_INT_FIELDS = ("inputTokens", "outputTokens", "totalTokens", "cacheReadTokens", "reasoningTokens")
 _SOURCE_ID_FIELDS = ("evidenceId", "id", "sourceId")
 _CLAIM_ID_FIELDS = ("evidenceId", "evidence_id")
 
@@ -157,6 +168,8 @@ def normalize_token_usage(usage: Any) -> dict | None:
     """Normalize provider usage to ``{inputTokens, outputTokens, totalTokens}``.
 
     Accepts camelCase or snake_case. Missing total is the sum of input and output.
+    P4-7: ``cacheReadTokens`` / ``reasoningTokens`` are added when the provider reports them, and an
+    already-computed ``costUsd`` / ``costEstimated`` pair is preserved (never invented here).
     Returns None when no usage fields are present.
     """
     mapping = _as_mapping(usage)
@@ -185,11 +198,77 @@ def normalize_token_usage(usage: Any) -> dict | None:
         return None
     if total_tokens is None:
         total_tokens = input_tokens + output_tokens
-    return {
+    normalized: dict[str, Any] = {
         "inputTokens": input_tokens,
         "outputTokens": output_tokens,
         "totalTokens": total_tokens,
     }
+    cache_read = _optional_count(mapping, _CACHE_READ_KEYS, _CACHE_READ_NESTED)
+    if cache_read is not None:
+        normalized["cacheReadTokens"] = cache_read
+    reasoning = _optional_count(mapping, _REASONING_KEYS, _REASONING_NESTED)
+    if reasoning is not None:
+        normalized["reasoningTokens"] = reasoning
+    cost = mapping.get("costUsd")
+    if isinstance(cost, (int, float)) and not isinstance(cost, bool):
+        normalized["costUsd"] = float(cost)
+        normalized["costEstimated"] = bool(mapping.get("costEstimated", True))
+    return normalized
+
+
+def _optional_count(mapping: dict, keys: tuple[str, ...], nested: tuple[tuple[str, str], ...]) -> int | None:
+    for key in keys:
+        if mapping.get(key) is not None:
+            return _as_int(mapping[key])
+    for outer, inner in nested:
+        details = mapping.get(outer)
+        if isinstance(details, dict) and details.get(inner) is not None:
+            return _as_int(details[inner])
+    return None
+
+
+def with_estimated_cost(usage: dict | None, model: str | None, registry: Any) -> dict | None:
+    """Return ``usage`` plus ``costUsd``/``costEstimated`` when the registry has prices for ``model``.
+
+    Prices come only from the model registry config; with no configured price the usage is returned
+    unchanged (cost unknown, not zero).
+    """
+    if not isinstance(usage, dict) or not model or registry is None:
+        return usage
+    try:
+        cost = registry.estimate_cost(model, usage)
+    except Exception:
+        cost = None
+    if cost is None:
+        return usage
+    return {**usage, "costUsd": round(float(cost), 8), "costEstimated": True}
+
+
+def sum_token_usage(usages: list[Any]) -> dict | None:
+    """Sum normalized usages. ``costUsd`` is summed only when every part carries one."""
+    parts = [u for u in (normalize_token_usage(x) for x in usages or []) if u]
+    if not parts:
+        return None
+    total: dict[str, Any] = {"inputTokens": 0, "outputTokens": 0, "totalTokens": 0}
+    for part in parts:
+        for field in _USAGE_INT_FIELDS:
+            if field in part:
+                total[field] = total.get(field, 0) + _as_int(part[field])
+    if all("costUsd" in part for part in parts):
+        total["costUsd"] = round(sum(float(part["costUsd"]) for part in parts), 8)
+        total["costEstimated"] = any(part.get("costEstimated", True) for part in parts)
+    return total
+
+
+def usage_totals(usage_by_node: Any) -> dict | None:
+    """``final_state.usageTotals``: run total over per-node totals, plus the node count that reported usage."""
+    if not isinstance(usage_by_node, dict) or not usage_by_node:
+        return None
+    total = sum_token_usage(list(usage_by_node.values()))
+    if total is None:
+        return None
+    total["nodes"] = len([v for v in usage_by_node.values() if normalize_token_usage(v)])
+    return total
 
 
 def _as_mapping(usage: Any) -> dict | None:
@@ -323,7 +402,11 @@ def _render_latest_tools(state: dict, *, max_tokens: int | None = None) -> str |
     if latest is None:
         return None
     if isinstance(latest, str):
-        body = latest
+        # P4-1: a fenced ToolMessage body (or its JSON) is rendered as its inner data; the whole
+        # context is fenced again by build_user_content, so no nested tags reach the model.
+        from .tool_pipeline import unfence_tool_result
+
+        body = unfence_tool_result(latest)
     else:
         body = json.dumps(latest, ensure_ascii=False, default=str)
     if max_tokens is not None and estimate_tokens(body) > max_tokens:

@@ -292,7 +292,11 @@ class WorkflowServiceAuthzTest {
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("modelName");
         validation.validateExecutableFields(validLayout("ok", "deepseek-v4-pro"));
-        new WorkflowValidationService().validateExecutableFields(validLayout("ok", "anything"));
+        /* Decision D4: the default list is the registry list, not "anything". */
+        WorkflowValidationService defaults = new WorkflowValidationService();
+        assertThatThrownBy(() -> defaults.validateExecutableFields(validLayout("ok", "anything")))
+                .isInstanceOf(WorkflowValidationException.class);
+        defaults.validateExecutableFields(validLayout("ok", "deepseek-v4-flash"));
     }
 
     private static Map<String, Object> validLayout(String prompt, String modelName) {

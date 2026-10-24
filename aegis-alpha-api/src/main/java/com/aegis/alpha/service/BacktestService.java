@@ -87,6 +87,18 @@ public class BacktestService {
         return run;
     }
 
+    /**
+     * P3-16: runs without a single-ticker recommendation (digest workflows) keep their model-call and
+     * evidence trace but get no backtest row and no recommendation record.
+     */
+    public void materializeRunTrace(WorkflowRun workflowRun) {
+        if (workflowRun == null) {
+            return;
+        }
+        modelGovernanceService.materializeCalls(workflowRun);
+        evidenceService.materializeEvidence(workflowRun);
+    }
+
     private void materializeGovernance(WorkflowRun workflowRun, BacktestRun backtestRun, Map<String, Object> inputs) {
         modelGovernanceService.materializeCalls(workflowRun);
         evidenceService.materializeEvidence(workflowRun);

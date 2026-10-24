@@ -35,19 +35,25 @@ mybatis:
     map-underscore-to-camel-case: true
 
 aegis:
+  # Decision D6: deployment marker. "prod"/"production" (or an active Spring profile prod/production)
+  # makes startup fail when AEGIS_ALPHA_DEV_MODE=true or the documented sample service token is used.
+  env: ${AEGIS_ALPHA_ENV:}
+  dev-mode: ${AEGIS_ALPHA_DEV_MODE:false}
   seed-enabled: ${AEGIS_ALPHA_SEED_ENABLED:true}
   token-secret: ${AEGIS_ALPHA_TOKEN_SECRET:local-aegis-demo-secret}
   workflow:
-    # When true, stale research layouts (layoutVersion < 2) are async-written back to DB after read-path refresh.
+    # When true, stale versioned layouts (research + digest keys, layoutVersion < 4) are async-written back to DB after read-path refresh.
     # Read-path version check always applies for research keys regardless of this flag.
     refresh-default-layouts: ${AEGIS_ALPHA_REFRESH_DEFAULT_LAYOUTS:false}
-    # Roles allowed to approve/reject runs paused at the approval gate (待确认: seed users only have
+    # Roles allowed to approve/reject runs paused at the approval gate (decision D1, kept: seed users only have
     # portfolio_manager/research_user; add e.g. portfolio_manager here if they should approve).
     approver-roles: ${AEGIS_ALPHA_APPROVER_ROLES:desk,admin}
-    # User-authored layout limits (待确认): prompt/systemPrompt max length; modelName whitelist (empty = any).
+    # User-authored layout limits: prompt/systemPrompt max length (decided: 8000).
     max-prompt-chars: ${AEGIS_ALPHA_WORKFLOW_MAX_PROMPT_CHARS:8000}
+    # Decision D4: empty = use aegis.models.allowed-names (registry list); a value may only narrow it
+    # (names outside it fail startup).
     allowed-model-names: ${AEGIS_ALPHA_WORKFLOW_ALLOWED_MODEL_NAMES:}
-    # 待确认: node retries allowed per run across all nodes (java-fallback node loop; the only retry layer).
+    # Decision D1 (kept): node retries allowed per run across all nodes (java-fallback node loop; the only retry layer).
     run-retry-budget: ${AEGIS_ALPHA_WORKFLOW_RUN_RETRY_BUDGET:4}
     # Bounded workflow executor (streaming runs, async starts).
     executor:
@@ -55,9 +61,18 @@ aegis:
       max-size: ${AEGIS_ALPHA_WORKFLOW_EXECUTOR_MAX:16}
       queue-capacity: ${AEGIS_ALPHA_WORKFLOW_EXECUTOR_QUEUE:200}
     stream:
-      # 待确认: when the browser disconnects, false = keep consuming the orchestrator stream so the run
+      # Decision D1 (kept): when the browser disconnects, false = keep consuming the orchestrator stream so the run
       # finishes and is recorded (CLIENT_DISCONNECTED event); true = stop reading and cancel the run.
       cancel-on-disconnect: ${AEGIS_ALPHA_WORKFLOW_STREAM_CANCEL_ON_DISCONNECT:false}
+  models:
+    # Model names a client may request (chat body.modelName, agent modelName, workflow node modelName).
+    # Decision D4: must equal the model names in aegis-alpha-orchestrator app/core/models.yaml
+    # (ModelRegistryConsistencyTest / test_model_registry_consistency.py enforce it).
+    allowed-names: ${AEGIS_ALPHA_ALLOWED_MODEL_NAMES:deepseek-v4-flash,deepseek-v4-pro}
+  agent:
+    # P3-16 (decision D1: kept): default model for agents / inline workflow agents without an explicit modelName.
+    # Defaults to the orchestrator gateway model so one env var changes both.
+    default-model: ${AEGIS_AGENT_DEFAULT_MODEL:${AEGIS_ALPHA_LANGCHAIN_MODEL:deepseek-v4-flash}}
   langchain:
     enabled: ${AEGIS_ALPHA_LANGCHAIN_ENABLED:true}
     engine-url: ${AEGIS_ALPHA_LANGCHAIN_ENGINE_URL:http://127.0.0.1:8787}
@@ -67,6 +82,9 @@ aegis:
     base-url: ${AEGIS_ALPHA_LANGCHAIN_BASE_URL:${OPENAI_BASE_URL:}}
     connect-timeout-ms: ${AEGIS_ALPHA_LANGCHAIN_CONNECT_TIMEOUT_MS:5000}
     read-timeout-ms: ${AEGIS_ALPHA_LANGCHAIN_READ_TIMEOUT_MS:120000}
+    # P4-4 (decision D1: kept): read timeout of the synchronous whole-run calls (/execute-workflow, /resume-workflow);
+    # keep it at the orchestrator AEGIS_ALPHA_WORKFLOW_TIMEOUT_SECONDS (900s) + 30s.
+    workflow-read-timeout-ms: ${AEGIS_ALPHA_LANGCHAIN_WORKFLOW_READ_TIMEOUT_MS:930000}
   router:
     # Intent routing: LLM results below llm-min-confidence never short-circuit keyword rules;
     # research-priority-confidence is the minimum to dispatch a workflow from chat.
@@ -99,4 +117,5 @@ aegis:
     sec-companyfacts-url: ${AEGIS_ALPHA_SEC_COMPANYFACTS_URL:https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json}
     yahoo-news-rss-url: ${AEGIS_ALPHA_YAHOO_NEWS_RSS_URL:https://feeds.finance.yahoo.com/rss/2.0/headline?s={symbol}&region=US&lang=en-US}
     gdelt-news-url: ${AEGIS_ALPHA_GDELT_NEWS_URL:https://api.gdeltproject.org/api/v2/doc/doc?query={symbol}&mode=artlist&format=json&maxrecords=10}
-    http-timeout-ms: ${AEGIS_ALPHA_MARKET_DATA_HTTP_TIMEOUT_MS:4000}
+    # Values below 8000 are raised to 8000 (MarketDataService.MIN_HTTP_TIMEOUT_MS).
+    http-timeout-ms: ${AEGIS_ALPHA_MARKET_DATA_HTTP_TIMEOUT_MS:8000}

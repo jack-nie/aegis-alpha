@@ -73,6 +73,20 @@ class AgentServiceTest {
     }
 
     @Test
+    void createUsesConfiguredDefaultModel() throws Exception {
+        when(mapper.nextSortOrder()).thenReturn(3);
+        service.setDefaultModelName("deepseek-v4-pro");
+
+        AgentTemplate result = service.create("bob", new HashMap<String, Object>());
+
+        assertThat(result.getModelName()).isEqualTo("deepseek-v4-pro");
+        org.springframework.beans.factory.annotation.Value value = AgentService.class
+                .getDeclaredField("defaultModelName")
+                .getAnnotation(org.springframework.beans.factory.annotation.Value.class);
+        assertThat(value.value()).startsWith("${aegis.agent.default-model:");
+    }
+
+    @Test
     void updateThrowsForReadonlyAgent() {
         AgentTemplate agent = new AgentTemplate();
         agent.setAgentId("ro-agent");
@@ -207,5 +221,49 @@ class AgentServiceTest {
 
         assertThat(result).containsEntry("summary", "done");
         verify(mapper).updateRunState(any(AgentTemplate.class));
+    }
+
+    @Test
+    void createRejectsModelOutsideAllowlist() {
+        when(mapper.nextSortOrder()).thenReturn(4);
+        Map<String, Object> body = new HashMap<>();
+        body.put("modelName", "gpt-unlisted");
+
+        assertThatThrownBy(() -> service.create("bob", body))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Model is not allowed");
+        verify(mapper, org.mockito.Mockito.never()).insert(any(AgentTemplate.class));
+    }
+
+    @Test
+    void createAcceptsAllowlistedModelAndConfiguredList() {
+        when(mapper.nextSortOrder()).thenReturn(5);
+        Map<String, Object> body = new HashMap<>();
+        body.put("modelName", "deepseek-v4-pro");
+        assertThat(service.create("bob", body).getModelName()).isEqualTo("deepseek-v4-pro");
+
+        service.setModelAllowlist(ModelAllowlist.of("house-model"));
+        body.put("modelName", "house-model");
+        assertThat(service.create("bob", body).getModelName()).isEqualTo("house-model");
+    }
+
+    @Test
+    void updateRejectsNewDisallowedModelButKeepsStoredLegacyValue() {
+        AgentTemplate stored = new AgentTemplate();
+        stored.setAgentId("a9");
+        stored.setOwnerUsername("bob");
+        stored.setModelName("legacy-model");
+        when(mapper.findById("a9")).thenReturn(stored);
+
+        Map<String, Object> rename = new HashMap<>();
+        rename.put("name", "Renamed");
+        rename.put("modelName", "legacy-model");
+        assertThat(service.update("bob", "a9", rename).getModelName()).isEqualTo("legacy-model");
+
+        Map<String, Object> change = new HashMap<>();
+        change.put("modelName", "gpt-unlisted");
+        assertThatThrownBy(() -> service.update("bob", "a9", change))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Model is not allowed");
     }
 }

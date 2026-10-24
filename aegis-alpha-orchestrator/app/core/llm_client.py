@@ -5,18 +5,23 @@ from __future__ import annotations
 import json
 import logging
 import re
-from typing import Any
+from typing import Any, Callable
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 
 from ..config import Settings
+from .agent_context import ContextPolicy, compact, is_context_overflow, transform_context
 from .context_assembly import normalize_token_usage
+from .message_queue import is_queued_human_message
+from .model_registry import ModelResolution, get_model_registry
+from .agent_envelope import convert_to_llm
 from .prompt_safety import build_user_content, with_untrusted_notice
 
 logger = logging.getLogger(__name__)
 
+# Kept for importers; the allowed set now lives in the model registry (app/core/models.yaml).
 DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-flash"
 SUPPORTED_DEEPSEEK_MODELS = {"deepseek-v4-pro", "deepseek-v4-flash"}
 
@@ -40,6 +45,10 @@ INTENT_CLASSIFIER_SYSTEM_PROMPT = (
 )
 
 
+# P4-2: set on an AIMessage whose tool calls were cut by ``finish_reason == "length"``.
+TRUNCATED_TOOL_CALLS_FLAG = "aegis_truncated_tool_calls"
+
+
 class AgentToolResult:
     """Result of a single agent turn that may request tools."""
 
@@ -55,6 +64,12 @@ class AgentToolResult:
         self.has_tool_calls = has_tool_calls
         self.llm_response = llm_response
         self.seed_human = seed_human
+        # P4-11: queued steering delivered before the first LLM call (appended after the seed).
+        self.leading_messages: list[Any] = []
+        # P4-8: what transform_context did to the prior messages for this call (trace only).
+        self.context_stats: dict[str, Any] | None = None
+        # P4-6: set by the node executor (requested vs effective model) for the trace.
+        self.model_resolution: Any = None
 
     @property
     def messages_to_append(self) -> list[Any]:
@@ -62,9 +77,17 @@ class AgentToolResult:
         out: list[Any] = []
         if self.seed_human is not None:
             out.append(self.seed_human)
+        out.extend(self.leading_messages or [])
         if self.ai_message is not None:
             out.append(self.ai_message)
         return out
+
+    @property
+    def turn_usage(self) -> dict | None:
+        """P4-7: usage of this single LLM call, including turns that only request tools."""
+        if self.llm_response is not None and self.llm_response.token_usage is not None:
+            return self.llm_response.token_usage
+        return normalize_token_usage(getattr(self.ai_message, "usage_metadata", None))
 
 
 class SignalModel(BaseModel):
@@ -131,14 +154,16 @@ class LLMClient:
         self._config = config
         self._client_cache: dict[str, ChatOpenAI] = {}
 
-    def _resolve_model(self, requested: str | None = None) -> str:
-        """Resolve model name with DeepSeek compatibility."""
-        requested = requested or self._config.model
-        base_url = self._config.effective_base_url
+    def resolve_model(self, requested: str | None = None) -> ModelResolution:
+        """P4-6: registry-based resolution (warning + fallback instead of a silent rewrite)."""
+        registry = get_model_registry(getattr(self._config, "models_file", "") or None)
+        return registry.resolve(
+            requested, default=self._config.model, base_url=self._config.effective_base_url
+        )
 
-        if self._uses_deepseek_endpoint(base_url) and requested not in SUPPORTED_DEEPSEEK_MODELS:
-            return DEFAULT_DEEPSEEK_MODEL
-        return requested
+    def _resolve_model(self, requested: str | None = None) -> str:
+        """Effective model name for one call (see :meth:`resolve_model`)."""
+        return self.resolve_model(requested).effective
 
     def _uses_deepseek_endpoint(self, base_url: str) -> bool:
         """Check if using DeepSeek-compatible endpoint."""
@@ -158,6 +183,8 @@ class LLMClient:
             "temperature": temperature,
             "timeout": timeout_ms / 1000,
             "max_retries": 0,
+            # P4-9: usage is also reported on streamed agent turns.
+            "stream_usage": True,
         }
         base_url = self._config.effective_base_url
         if base_url:
@@ -268,8 +295,14 @@ class LLMClient:
         temperature: float = 0.2,
         timeout_ms: int | None = None,
         force_final: bool = False,
+        on_delta: Callable[[str], None] | None = None,
+        leading_messages: list | None = None,
     ) -> AgentToolResult:
         """One agent turn with optional tool binding.
+
+        P4-9: with ``on_delta`` the turn is streamed (``astream``) and each text delta is reported;
+        chunks are aggregated back into one AIMessage (tool calls, usage, finish_reason) so the rest
+        of the loop is unchanged. Tool-call argument deltas are aggregated, never emitted.
 
         Builds [System, Human?, *prior] and invokes the chat model. When tools are
         bound and the model returns tool_calls, the raw AIMessage is returned so the
@@ -286,15 +319,18 @@ class LLMClient:
         user_content = build_user_content(prompt, context)
         system = with_untrusted_notice(system)
 
-        prior = list(prior_messages or [])
+        # P4-15: the single LLM boundary — envelopes/legacy messages → provider messages.
+        prior = convert_to_llm(prior_messages or [])
         seed_human: HumanMessage | None = None
         chat: list[BaseMessage] = [SystemMessage(content=system)]
 
         if prior:
             # Continue mid-loop conversation (Human + AI(tool_calls) + ToolMessages).
+            # Queued steering / follow-up messages are extra user turns, not the task itself:
+            # without a seed HumanMessage the task prompt is restated first.
             has_human = any(
-                type(m).__name__ == "HumanMessage"
-                or getattr(m, "type", None) in ("human", "user")
+                (type(m).__name__ == "HumanMessage" or getattr(m, "type", None) in ("human", "user"))
+                and not is_queued_human_message(m)
                 for m in prior
             )
             if not has_human:
@@ -304,12 +340,27 @@ class LLMClient:
         else:
             seed_human = HumanMessage(content=user_content)
             chat.append(seed_human)
+            # P4-11: steering queued before the first call reaches that first request.
+            chat.extend(convert_to_llm(leading_messages or []))
 
+        # P4-8: transformContext — elide old tool results / compact over budget (graph state untouched).
+        policy = self._context_policy(resolved_model)
+        head = chat[:-len(prior)] if prior else chat
+        context_stats: dict[str, Any] | None = None
+        if prior:
+            sent_prior, context_stats = transform_context(prior, policy)
+            chat = head + sent_prior
         try:
-            response = await client.ainvoke(chat)
+            response = await self._call_agent_model(client, chat, on_delta)
         except Exception as e:
-            logger.error(f"Agent tool-loop invocation failed: {e}")
-            raise
+            if not (prior and is_context_overflow(e)):
+                logger.error(f"Agent tool-loop invocation failed: {e}")
+                raise
+            # Overflow: compact once and retry once; a second overflow propagates.
+            logger.warning("Agent context overflow; compacting once and retrying: %s", type(e).__name__)
+            chat = head + compact(prior, policy)
+            context_stats = {**(context_stats or {}), "compacted": True, "overflowRetry": True}
+            response = await self._call_agent_model(client, chat, on_delta)
 
         # Ensure we always work with an AIMessage-like object for ToolNode routing.
         if not isinstance(response, AIMessage):
@@ -328,6 +379,29 @@ class LLMClient:
             if raw_calls:
                 tool_calls = raw_calls
 
+        # P4-2: output cut at max_tokens while emitting tool calls → the arguments are unreliable
+        # (LangChain moves unparsable ones to invalid_tool_calls). Keep every call on the message,
+        # flagged, so the tools node answers each with an error ToolMessage and executes none.
+        finish_reason = str((getattr(response, "response_metadata", None) or {}).get("finish_reason") or "")
+        invalid_calls = list(getattr(response, "invalid_tool_calls", None) or [])
+        if finish_reason == "length" and (tool_calls or invalid_calls) and not force_final:
+            merged = [dict(tc) for tc in tool_calls if isinstance(tc, dict) and tc.get("name") is not None]
+            for index, bad in enumerate(invalid_calls):
+                merged.append({
+                    "name": str(bad.get("name") or "unknown_tool"),
+                    "args": {},
+                    "id": str(bad.get("id") or f"truncated-{index}"),
+                })
+            response = AIMessage(
+                content=response.content or "",
+                tool_calls=merged,
+                response_metadata={**(getattr(response, "response_metadata", None) or {}), "finish_reason": "length"},
+                usage_metadata=getattr(response, "usage_metadata", None),
+                additional_kwargs={TRUNCATED_TOOL_CALLS_FLAG: True},
+            )
+            logger.warning("Agent tool calls truncated by finish_reason=length; %d call(s) refused", len(merged))
+            return self._with_context_stats(context_stats, AgentToolResult(response, has_tool_calls=True, seed_human=seed_human))
+
         if tool_calls and not force_final:
             # Normalize tool_calls onto the message for route_to_tools / ToolNode.
             if not getattr(response, "tool_calls", None):
@@ -339,12 +413,15 @@ class LLMClient:
                 msg_id = getattr(response, "id", None)
                 if msg_id is not None:
                     ai_kwargs["id"] = msg_id
+                # P4-7: keep the usage of a tool-requesting turn (it used to be dropped here).
+                if getattr(response, "usage_metadata", None):
+                    ai_kwargs["usage_metadata"] = response.usage_metadata
                 response = AIMessage(**ai_kwargs)
-            return AgentToolResult(
+            return self._with_context_stats(context_stats, AgentToolResult(
                 response,
                 has_tool_calls=True,
                 seed_human=seed_human,
-            )
+            ))
 
         content = response.content if hasattr(response, "content") else str(response)
         if isinstance(content, list):
@@ -360,12 +437,49 @@ class LLMClient:
             content = "\n".join(parts)
         usage = getattr(response, "usage_metadata", None)
         llm_response = self._normalize_content(str(content or ""), usage)
-        return AgentToolResult(
+        return self._with_context_stats(context_stats, AgentToolResult(
             response,
             has_tool_calls=False,
             llm_response=llm_response,
             seed_human=seed_human,
-        )
+        ))
+
+    @staticmethod
+    async def _call_agent_model(client: Any, chat: list[BaseMessage], on_delta: Callable[[str], None] | None) -> Any:
+        if on_delta is None or not hasattr(client, "astream"):
+            return await client.ainvoke(chat)
+        aggregated: Any = None
+        async for chunk in client.astream(chat):
+            text = chunk.content if isinstance(getattr(chunk, "content", None), str) else ""
+            if text:
+                try:
+                    on_delta(text)
+                except Exception:  # noqa: BLE001 - a broken listener never fails the turn
+                    logger.debug("message_delta listener failed", exc_info=True)
+            aggregated = chunk if aggregated is None else aggregated + chunk
+        if aggregated is None:
+            return AIMessage(content="")
+        kwargs: dict[str, Any] = {
+            "content": aggregated.content if aggregated.content is not None else "",
+            "tool_calls": list(getattr(aggregated, "tool_calls", None) or []),
+            "invalid_tool_calls": list(getattr(aggregated, "invalid_tool_calls", None) or []),
+            "response_metadata": dict(getattr(aggregated, "response_metadata", None) or {}),
+            "additional_kwargs": dict(getattr(aggregated, "additional_kwargs", None) or {}),
+        }
+        if getattr(aggregated, "usage_metadata", None):
+            kwargs["usage_metadata"] = aggregated.usage_metadata
+        if getattr(aggregated, "id", None):
+            kwargs["id"] = aggregated.id
+        return AIMessage(**kwargs)
+
+    @staticmethod
+    def _with_context_stats(stats: dict[str, Any] | None, result: AgentToolResult) -> AgentToolResult:
+        result.context_stats = stats
+        return result
+
+    def _context_policy(self, model: str) -> ContextPolicy:
+        spec = get_model_registry(getattr(self._config, "models_file", "") or None).get(model)
+        return ContextPolicy.from_settings(self._config, getattr(spec, "context_window", None))
 
     async def classify_intent(
         self, message: str, tools: list[dict[str, Any]]
@@ -376,7 +490,14 @@ class LLMClient:
         workflow function, ``None`` when it deliberately called nothing (non-workflow intent)
         or the call failed. ``confidence`` is the model-provided value (may be ``None``).
         """
-        resolved_model = self._resolve_model(getattr(self._config, "router_model", "") or None)
+        # The router model is operator configuration (like the default model), not a request:
+        # it is only checked against the endpoint family, never against the registry list.
+        registry = get_model_registry(getattr(self._config, "models_file", "") or None)
+        resolved_model = registry.resolve(
+            None,
+            default=getattr(self._config, "router_model", "") or self._config.model,
+            base_url=self._config.effective_base_url,
+        ).effective
         timeout_ms = int(getattr(self._config, "router_timeout_ms", 0) or 2500)
         client = self._build_client(resolved_model, temperature=0, timeout_ms=timeout_ms)
 

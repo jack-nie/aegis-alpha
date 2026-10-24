@@ -10,9 +10,10 @@ ARG PIP_INDEX_URL=https://pypi.org/simple
 ARG PIP_DEFAULT_TIMEOUT=60
 ARG PIP_RETRIES=5
 
-# Dependency layer first: only re-runs when requirements.txt or the ARGs above change.
-COPY requirements.txt ./
-RUN pip install --no-cache-dir --disable-pip-version-check -r requirements.txt
+# Dependency layer first: only re-runs when requirements/constraints or the ARGs above change.
+# constraints.txt pins transitive versions for reproducible builds.
+COPY requirements.txt constraints.txt ./
+RUN pip install --no-cache-dir --disable-pip-version-check -c constraints.txt -r requirements.txt
 
 COPY app/ ./app/
 

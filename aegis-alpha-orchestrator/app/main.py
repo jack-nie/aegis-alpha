@@ -11,10 +11,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from .config import settings
-from .core.checkpointer_lifecycle import close_async_checkpointer, open_async_checkpointer
+from .core.run_backends import checkpointer_factory_from_settings, enforce_replica_safety
 from .dependencies import CHECKPOINT_DB_PATH, market_data, memory_store_manager, workflow_engine
 from .core.tools import get_backend_client
-from .routers import health, workflow, intent, help as help_router
+from .routers import health, workflow, intent, help as help_router, message_queue
 
 # Paths that do not require service token (health/docs only)
 _PUBLIC_PATH_PREFIXES = (
@@ -38,6 +38,11 @@ async def lifespan(app: FastAPI):
     logger.info(f"Starting Aegis Alpha Orchestrator on port {settings.port}")
     logger.info(f"Provider: {settings.provider}, Model: {settings.model}")
     logger.info(f"Mock mode: {settings.is_mock_mode}")
+    # Decision D6: dev conveniences never start in production (fatal, the process exits).
+    fatal = settings.production_safety_problems
+    if fatal:
+        logger.critical("Refusing to start in production: %s", ", ".join(fatal))
+        raise RuntimeError(f"production safety check failed: {fatal}")
     problem = settings.service_token_problem
     if problem:
         logger.warning(
@@ -46,11 +51,17 @@ async def lifespan(app: FastAPI):
             "or AEGIS_ALPHA_LANGCHAIN_MOCK=true).",
             problem,
         )
+    # P4-16: checkpointer behind CheckpointerFactory (sqlite default; memory for demos).
+    checkpointer_factory = checkpointer_factory_from_settings(settings, CHECKPOINT_DB_PATH)
+    # Decision D9: fail fast (before any startup side effects) on unsafe multi-replica config.
+    for warning in enforce_replica_safety(settings, checkpointer_factory):
+        logger.warning("[REPLICAS] %s", warning)
     await market_data.start()
     await memory_store_manager.initialize()
     try:
-        workflow_engine.attach_checkpointer(await open_async_checkpointer(CHECKPOINT_DB_PATH))
-        logger.info("Durable AsyncSqliteSaver checkpointer attached")
+        workflow_engine.attach_checkpointer(await checkpointer_factory.open())
+        logger.info("Checkpointer attached: backend=%s durable=%s", checkpointer_factory.name,
+                    checkpointer_factory.durable)
     except ImportError:
         logger.warning("langgraph-checkpoint-sqlite/aiosqlite missing; checkpoints stay in memory")
     yield
@@ -61,7 +72,7 @@ async def lifespan(app: FastAPI):
     from langgraph.checkpoint.memory import MemorySaver
 
     workflow_engine.attach_checkpointer(MemorySaver())
-    await close_async_checkpointer()
+    await checkpointer_factory.close()
     logger.info("Shutting down Aegis Alpha Orchestrator")
 
 
@@ -146,6 +157,7 @@ app.include_router(health.router)
 app.include_router(workflow.router)
 app.include_router(intent.router)
 app.include_router(help_router.router)
+app.include_router(message_queue.router)
 
 
 def start():

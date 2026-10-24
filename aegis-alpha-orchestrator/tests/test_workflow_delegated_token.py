@@ -82,3 +82,42 @@ def test_use_authorization_matches_context_helper():
     client = ToolBackendClient(settings)
     with use_authorization("Bearer sticky"):
         assert client._authorization_header() == "Bearer sticky"
+
+
+# --- P4-5: resume carries the run-scoped delegated token -------------------------------------
+
+
+def test_resume_request_accepts_delegated_token():
+    from app.routers.workflow import ResumeRequest
+
+    req = ResumeRequest.model_validate(
+        {"threadId": "run-1", "resumeValue": {"approved": True}, "delegatedToken": "resume-token"}
+    )
+    assert req.delegated_token == "resume-token"
+    assert ResumeRequest.model_validate({"threadId": "run-1"}).delegated_token is None
+
+
+def test_resume_endpoint_applies_delegated_token_to_tool_calls(monkeypatch):
+    import asyncio
+
+    from app.core import tools as tools_module
+    from app.routers import workflow as workflow_router
+
+    seen: list[str | None] = []
+
+    async def fake_resume(thread_id, resume_value, owner=None):
+        seen.append(tools_module.authorization_override.get())
+        return {"ok": True, "final_state": {}}
+
+    monkeypatch.setattr(workflow_router.workflow_engine, "resume_workflow", fake_resume)
+    body = workflow_router.ResumeRequest.model_validate(
+        {"threadId": "run-1", "resumeValue": {"approved": True}, "delegatedToken": "resume-token"}
+    )
+    asyncio.run(workflow_router.resume_workflow(body))
+    body_without = workflow_router.ResumeRequest.model_validate(
+        {"threadId": "run-1", "resumeValue": {"approved": True}}
+    )
+    asyncio.run(workflow_router.resume_workflow(body_without))
+
+    assert seen == ["resume-token", None]
+    assert tools_module.authorization_override.get() is None

@@ -67,7 +67,7 @@ class WorkflowDelegationIdentityTest {
         response.put("final_state", new LinkedHashMap<String, Object>());
         response.put("trace", new ArrayList<Object>());
         response.put("node_outputs", new LinkedHashMap<String, Object>());
-        when(gateway.executeWorkflow(anyMap(), anyString(), anyMap(), nullable(String.class), anyString(), anyBoolean()))
+        when(gateway.executeWorkflow(anyMap(), anyString(), anyMap(), nullable(String.class), anyString(), anyBoolean(), any()))
                 .thenReturn(response);
     }
 
@@ -87,7 +87,7 @@ class WorkflowDelegationIdentityTest {
 
         verify(tokenService).issueServiceDelegation(anyString(), eq("u-alice"), eq("t-1"), anyList(), anyLong());
         verify(tokenService, never()).issueServiceDelegation(anyString(), eq("victim-user"), anyString(), anyList(), anyLong());
-        verify(gateway).executeWorkflow(anyMap(), anyString(), anyMap(), eq("delegated-test-token"), anyString(), anyBoolean());
+        verify(gateway).executeWorkflow(anyMap(), anyString(), anyMap(), eq("delegated-test-token"), anyString(), anyBoolean(), any());
     }
 
     @Test
@@ -95,7 +95,7 @@ class WorkflowDelegationIdentityTest {
         service.start("daily", "AAPL", forgedInputs());
 
         verify(tokenService, never()).issueServiceDelegation(anyString(), anyString(), anyString(), anyList(), anyLong());
-        verify(gateway).executeWorkflow(anyMap(), anyString(), anyMap(), isNull(), anyString(), anyBoolean());
+        verify(gateway).executeWorkflow(anyMap(), anyString(), anyMap(), isNull(), anyString(), anyBoolean(), any());
         List<String> types = new ArrayList<>();
         for (WorkflowRunEvent event : events) {
             types.add(event.getEventType());

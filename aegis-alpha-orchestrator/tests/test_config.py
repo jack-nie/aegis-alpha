@@ -68,3 +68,20 @@ def test_router_defaults_are_below_java_classify_timeout():
     assert settings.router_timeout_ms == 2500
     assert settings.router_timeout_ms < 4000
     assert settings.router_model == ""
+
+
+def test_dotenv_does_not_override_process_env(tmp_path, monkeypatch):
+    """P3-11: load_dotenv(override=False) — exported variables beat the .env file."""
+    from app.config import _load_env_file
+
+    env_file = tmp_path / ".env"
+    env_file.write_text("AEGIS_P311_EXPORTED=from-dotenv\nAEGIS_P311_ONLY_DOTENV=filled\n", encoding="utf-8")
+    monkeypatch.setenv("AEGIS_P311_EXPORTED", "from-process")
+    monkeypatch.delenv("AEGIS_P311_ONLY_DOTENV", raising=False)
+
+    _load_env_file(env_file)
+
+    import os
+    assert os.environ["AEGIS_P311_EXPORTED"] == "from-process"
+    assert os.environ["AEGIS_P311_ONLY_DOTENV"] == "filled"
+    monkeypatch.delenv("AEGIS_P311_ONLY_DOTENV", raising=False)

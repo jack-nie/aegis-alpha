@@ -3,20 +3,23 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import logging
+import threading
 import uuid
 from collections import defaultdict, OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Annotated, Any, AsyncIterator, Optional
+from typing import Annotated, Any, AsyncIterator, Awaitable, Callable, Optional
 from typing_extensions import TypedDict
 
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import StateGraph, START, END
+from langchain_core.messages import ToolMessage
 from langchain_core.runnables import RunnableConfig
-from langgraph.prebuilt import ToolNode
+from langgraph.prebuilt import ToolNode  # noqa: F401 - re-exported for tests
 from langgraph.store.base import BaseStore
 
 try:
@@ -29,23 +32,119 @@ from langgraph.types import interrupt, Command
 
 from ..models.workflow import Node, Edge, TraceEntry
 from ..models.responses import NodeResult, WorkflowResult, SSEEvent
+from .log_safety import text_len
 from .checkpointer_lifecycle import ensure_async_checkpointer
-from .context_assembly import apply_trace_usage, memory_hit_count
+from .context_assembly import (
+    apply_trace_usage,
+    memory_hit_count,
+    normalize_token_usage,
+    sum_token_usage,
+    usage_totals,
+    with_estimated_cost,
+)
+from .model_registry import get_model_registry
 from .memory_selector import load_run_memory, read_store_value, ticker_namespace
 from .market_data import run_scoped_market_cache
 from .memory_store import MemoryStoreManager
-from .node_executor import NodeExecutor
+from .message_queue import (
+    CONFIG_QUEUE_KEY,
+    SKIPPED_TOOL_RESULT_TEXT,
+    MessageQueueRegistry,
+    QueueOwner,
+    ThreadMessageQueue,
+    is_queued_human_message,
+    queue_from_config,
+    to_human_messages,
+)
+from .node_executor import NodeExecutor, aggregate_gate_passed
+from .run_registry import RunCancelled, RunHandle, RunRegistry, await_or_cancel
+from .agent_envelope import conversation_kinds
+from .tool_pipeline import (
+    ToolPolicy,
+    build_tool_node,
+    count_tool_errors,
+    emit_tool_event,
+    is_truncated_tool_call_message,
+    refuse_tool_calls,
+)
 from .tool_registry import TOOL_SPECS, resolve_agent_roles, tools_for_roles
 
 logger = logging.getLogger(__name__)
 
 _GRAPH_CACHE_MAX = 100
+AGGREGATE_HANDLER = "finance.stock_recommendation_aggregate"
+
+# P4-9 event protocol v2: events nodes emit through LangGraph's custom stream. They are forwarded
+# 1:1 as SSE events by the streaming endpoints (``stream_mode=["updates", "custom"]``).
+STREAM_V2_EVENTS = frozenset(
+    {"node_start", "message_delta", "tool_execution_start", "tool_execution_end", "usage"}
+)
+CONFIG_STREAM_KEY = "__aegis_stream_v2"
+
+
+class _StreamV2Marker:
+    """Non-primitive configurable value, so it is never persisted into checkpoint metadata."""
+
+    __slots__ = ()
+
+
+_STREAM_V2_ON = _StreamV2Marker()
+
+
+def _streaming_active() -> bool:
+    """True inside a node of a streaming run (sync ``ainvoke`` runs never stream deltas)."""
+    try:
+        from langgraph.config import get_config
+
+        return isinstance((get_config().get("configurable") or {}).get(CONFIG_STREAM_KEY), _StreamV2Marker)
+    except Exception:  # noqa: BLE001 - outside a runnable context
+        return False
+
+
+def _current_run_queue() -> Any:
+    """The run's message queue inside a node, or None (no queue / outside a runnable context)."""
+    try:
+        from langgraph.config import get_config
+
+        return queue_from_config(get_config())
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _with_stream_v2(config: dict[str, Any]) -> dict[str, Any]:
+    return {**config, "configurable": {**(config.get("configurable") or {}), CONFIG_STREAM_KEY: _STREAM_V2_ON}}
 # Max agent→tools→agent iterations per specialist node (avoids infinite tool loops).
 MAX_TOOL_ROUNDS = 3
+# P4-8: node-level data.maxToolRounds bounds (Java WorkflowValidationService rejects values outside).
+MIN_NODE_TOOL_ROUNDS = 1
+MAX_NODE_TOOL_ROUNDS = 8
+
+
+def max_tool_rounds_for(node: Node) -> int:
+    """``data.maxToolRounds`` clamped to 1–8; default ``MAX_TOOL_ROUNDS``."""
+    data = node.data
+    raw = None
+    if data is not None:
+        raw = getattr(data, "maxToolRounds", None)
+        if raw is None and getattr(data, "model_extra", None):
+            raw = data.model_extra.get("maxToolRounds") or data.model_extra.get("max_tool_rounds")
+    try:
+        value = int(raw) if raw is not None and not isinstance(raw, bool) else MAX_TOOL_ROUNDS
+    except (TypeError, ValueError):
+        value = MAX_TOOL_ROUNDS
+    return max(MIN_NODE_TOOL_ROUNDS, min(MAX_NODE_TOOL_ROUNDS, value))
 
 
 def _is_tools_node_name(name: str) -> bool:
     return name == "tools" or name.startswith("tools__")
+
+
+INBOX_NODE_PREFIX = "inbox__"
+
+
+def _is_inbox_node_name(name: str) -> bool:
+    """Queue delivery nodes (``inbox__{agent}``) are internal: no node_update SSE."""
+    return name.startswith(INBOX_NODE_PREFIX)
 
 
 def _is_tool_message(msg: Any) -> bool:
@@ -60,25 +159,119 @@ def _is_tool_message(msg: Any) -> bool:
 
 
 def _messages_for_tool_continuation(messages: list[Any]) -> list[Any]:
-    """Slice conversation from the last HumanMessage when tools just returned.
+    """Slice conversation from the last seed HumanMessage when the loop continues.
 
     Used so a mid-loop re-entry continues the same Human/AI/Tool thread without
-    re-seeding a new HumanMessage.
+    re-seeding a new HumanMessage. The loop continues when tools just returned,
+    or when queued steering / follow-up user messages were injected (those are
+    HumanMessages marked by ``message_queue``; they never start a new slice).
     """
     if not messages:
         return []
     last = messages[-1]
-    if not _is_tool_message(last):
+    if not (_is_tool_message(last) or is_queued_human_message(last)):
         return []
     start = 0
     for i in range(len(messages) - 1, -1, -1):
         msg = messages[i]
         cls_name = type(msg).__name__
         role = getattr(msg, "type", None) or getattr(msg, "role", None)
-        if cls_name == "HumanMessage" or role in ("human", "user"):
+        if (cls_name == "HumanMessage" or role in ("human", "user")) and not is_queued_human_message(msg):
             start = i
             break
     return list(messages[start:])
+
+
+def _owner_from_state(state: Any) -> dict[str, str] | None:
+    """Fallback run owner when the caller did not send ``owner`` explicitly."""
+    if not isinstance(state, dict):
+        return None
+    user_id = state.get("userId") or state.get("user_id")
+    if not user_id:
+        return None
+    return {"userId": str(user_id), "tenantId": str(state.get("tenantId") or state.get("tenant_id") or "")}
+
+
+def _graph_output_interrupted(graph_out: Any) -> bool:
+    """``ainvoke`` returns (not raises) with ``__interrupt__`` when a gate pauses the run."""
+    return isinstance(graph_out, dict) and bool(graph_out.get("__interrupt__"))
+
+
+def _tool_messages_from(output: Any) -> list[Any] | None:
+    """ToolNode output -> list of ToolMessages, or None for Command/other shapes."""
+    if isinstance(output, dict) and isinstance(output.get("messages"), list):
+        return list(output["messages"])
+    if isinstance(output, list) and all(_is_tool_message(m) for m in output):
+        return list(output)
+    return None
+
+
+async def _merge_queue_events(
+    source: AsyncIterator[Any], queue: ThreadMessageQueue | None
+) -> AsyncIterator[tuple[str, Any]]:
+    """Interleave graph stream chunks with message-queue events.
+
+    Yields ``("chunk", chunk)`` / ``("queue", event)``. Queue events raised
+    synchronously inside a node are delivered before that node's update chunk.
+    Closing this generator cancels the underlying graph stream (client abort / timeout).
+    """
+    if queue is None:
+        try:
+            async for chunk in source:
+                yield ("chunk", chunk)
+        finally:
+            aclose = getattr(source, "aclose", None)
+            if aclose is not None:
+                with contextlib.suppress(Exception):
+                    await aclose()
+        return
+
+    out: asyncio.Queue = asyncio.Queue()
+    loop = asyncio.get_running_loop()
+    loop_thread = threading.get_ident()
+
+    def _listener(event: dict[str, Any]) -> None:
+        if threading.get_ident() == loop_thread:
+            out.put_nowait(("queue", event))
+        else:  # enqueue from a worker thread
+            loop.call_soon_threadsafe(out.put_nowait, ("queue", event))
+
+    async def _pump() -> None:
+        try:
+            async for chunk in source:
+                await out.put(("chunk", chunk))
+        except asyncio.CancelledError:
+            raise
+        except BaseException as exc:  # GraphInterrupt and real errors re-raised in consumer
+            await out.put(("error", exc))
+            return
+        await out.put(("done", None))
+
+    unsubscribe = queue.subscribe(_listener)
+    task = asyncio.create_task(_pump())
+    try:
+        while True:
+            kind, value = await out.get()
+            if kind == "done":
+                break
+            if kind == "error":
+                raise value
+            yield (kind, value)
+        # Drain queue events emitted right before completion.
+        while not out.empty():
+            kind, value = out.get_nowait()
+            if kind == "queue":
+                yield (kind, value)
+    finally:
+        unsubscribe()
+        if not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+        aclose = getattr(source, "aclose", None)
+        if aclose is not None:
+            with contextlib.suppress(Exception):
+                await aclose()
 
 
 def deep_merge(current: dict, update: dict) -> dict:
@@ -135,6 +328,43 @@ _STREAM_RECOMMENDATION_KEYS = (
 )
 
 
+# D10b: per-node results attached to a resume stream's workflow_complete (Java materializes them
+# like the sync /resume-workflow node_outputs). Bounded per node and in total (JSON characters).
+RESUME_NODE_OUTPUT_MAX_CHARS = 32000
+RESUME_NODE_OUTPUTS_TOTAL_MAX_CHARS = 128000
+
+
+def bounded_node_outputs(
+    node_outputs: dict[str, Any] | None,
+    *,
+    per_node_max: int = RESUME_NODE_OUTPUT_MAX_CHARS,
+    total_max: int = RESUME_NODE_OUTPUTS_TOTAL_MAX_CHARS,
+) -> dict[str, Any]:
+    """Per-node results (JSON-safe) for nodes that ran in this stream; oversize entries are replaced by
+    the trimmed summary entry flagged ``truncated`` (never dropped silently)."""
+    out: dict[str, Any] = {}
+    used = 0
+    for node_id, payload in (node_outputs if isinstance(node_outputs, dict) else {}).items():
+        if not isinstance(payload, dict):
+            continue
+        safe = json.loads(json.dumps(payload, ensure_ascii=False, default=str))
+        size = len(json.dumps(safe, ensure_ascii=False))
+        if size > per_node_max or used + size > total_max:
+            summary = safe.get("summary")
+            safe = {
+                "handler": safe.get("handler", ""),
+                "ok": safe.get("ok", True),
+                "status": safe.get("status", ""),
+                "degraded": bool(safe.get("degraded", False)),
+                "summary": (str(summary) if summary is not None else "")[:_STREAM_SUMMARY_CHARS],
+                "truncated": True,
+            }
+            size = len(json.dumps(safe, ensure_ascii=False))
+        out[str(node_id)] = safe
+        used += size
+    return out
+
+
 def build_stream_final_state(
     final_state: dict[str, Any] | None,
     node_outputs: dict[str, Any] | None,
@@ -172,6 +402,9 @@ def build_stream_final_state(
         "nodes": nodes,
         "evidenceIds": sorted(str(k) for k in evidence) if isinstance(evidence, dict) else [],
     }
+    totals = usage_totals(final_state.get("usage_by_node"))
+    if totals:
+        trimmed["usageTotals"] = totals  # P4-7
 
     def size(value: Any) -> int:
         return len(json.dumps(value, ensure_ascii=False, default=str))
@@ -197,6 +430,9 @@ def is_explicit_approval(value: Any) -> bool:
     """Only ``{"approved": True}`` approves; anything else (missing, None, truthy strings) rejects."""
     return is_valid_resume_value(value) and value.get("approved") is True
 
+CLEANUP_OUTCOMES_DEFAULT = frozenset({"completed", "cancelled", "failed"})
+
+
 @dataclass(frozen=True)
 class GraphGuardrails:
     """P2-12: bounds for one graph run (all configurable via Settings)."""
@@ -204,7 +440,9 @@ class GraphGuardrails:
     recursion_limit: int = 100
     timeout_seconds: float = 900.0
     thread_meta_max: int = 1000
-    cleanup_checkpoints: bool = False
+    # Decision D5: checkpoints of runs that reached a terminal state are deleted by default.
+    cleanup_checkpoints: bool = True
+    cleanup_outcomes: frozenset = CLEANUP_OUTCOMES_DEFAULT
 
     @classmethod
     def from_settings(cls, settings: Any) -> "GraphGuardrails":
@@ -212,8 +450,46 @@ class GraphGuardrails:
             recursion_limit=int(getattr(settings, "workflow_recursion_limit", 100)),
             timeout_seconds=float(getattr(settings, "workflow_timeout_seconds", 900.0)),
             thread_meta_max=int(getattr(settings, "workflow_thread_meta_max", 1000)),
-            cleanup_checkpoints=bool(getattr(settings, "workflow_cleanup_checkpoints", False)),
+            cleanup_checkpoints=bool(getattr(settings, "workflow_cleanup_checkpoints", True)),
+            cleanup_outcomes=parse_cleanup_outcomes(getattr(settings, "workflow_cleanup_outcomes", None)),
         )
+
+
+def parse_cleanup_outcomes(value: Any) -> frozenset:
+    """CSV of terminal outcome kinds whose checkpoints are deleted (subset of completed/cancelled/failed).
+
+    Unknown names (including ``paused`` / ``running``) are rejected: an interrupted run's checkpoint
+    is what an approval resumes, so it is never cleanable.
+    """
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return CLEANUP_OUTCOMES_DEFAULT
+    items = value.split(",") if isinstance(value, str) else list(value)
+    parsed = frozenset(str(item).strip().lower() for item in items if str(item).strip())
+    unknown = parsed - CLEANUP_OUTCOMES_DEFAULT
+    if unknown:
+        raise ValueError(f"workflow_cleanup_outcomes: unsupported {sorted(unknown)}; "
+                         f"allowed {sorted(CLEANUP_OUTCOMES_DEFAULT)}")
+    return parsed
+
+
+def cleanup_kind(outcome: str, *, resumed: bool) -> str | None:
+    """Map an engine outcome to a cleanup kind, or ``None`` when the checkpoint must be kept.
+
+    - ``paused`` (HUMAN_INTERRUPT) and ``aborted`` (client gone / shutdown, Java state unknown): keep.
+    - completed (approved or rejected resume, finished run) -> ``completed``.
+    - cancelled -> ``cancelled``; error / timeout -> ``failed``.
+    - A *resume* that fails or is cancelled keeps the checkpoint: Java puts a failed resume back to
+      HUMAN_INTERRUPT so the approval can be retried, which needs the checkpoint.
+    """
+    if outcome == "completed":
+        return "completed"
+    if resumed:
+        return None
+    if outcome == "cancelled":
+        return "cancelled"
+    if outcome in ("error", "timeout"):
+        return "failed"
+    return None
 
 
 class WorkflowTimeout(Exception):
@@ -278,6 +554,60 @@ def _interrupt_event() -> SSEEvent:
     )
 
 
+
+def _custom_sse(chunk: Any) -> SSEEvent | None:
+    """Map one custom-stream payload ``{"event": name, ...}`` to a v2 SSE event."""
+    if not isinstance(chunk, dict):
+        return None
+    name = chunk.get("event")
+    if name not in STREAM_V2_EVENTS:
+        return None
+    return SSEEvent(event=str(name), data={k: v for k, v in chunk.items() if k != "event"})
+
+
+def _usage_sse(node_id: str, trace_entry: dict[str, Any]) -> SSEEvent | None:
+    usage = trace_entry.get("tokenUsage") or trace_entry.get("turnUsage")
+    if not isinstance(usage, dict) or not usage:
+        return None
+    return SSEEvent(
+        event="usage",
+        data={
+            "nodeId": node_id,
+            "scope": "node" if trace_entry.get("tokenUsage") else "turn",
+            "usage": usage,
+        },
+    )
+
+
+def _aggregate_final_events(
+    node_name: str, node_outputs: dict[str, Any], token_node_id: str | None
+) -> list[SSEEvent]:
+    payload = node_outputs.get(node_name)
+    if not isinstance(payload, dict) or payload.get("handler") != AGGREGATE_HANDLER:
+        return []
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    passed = bool(payload.get("ok")) and aggregate_gate_passed(data) and not data.get("contentWithheld")
+    text = (payload.get("content") if passed else None) or payload.get("summary") or ""
+    if not text:
+        return []
+    events = [
+        SSEEvent(
+            event="message_delta",
+            data={
+                "nodeId": node_name,
+                "delta": text,
+                "final": True,
+                "gatePassed": passed,
+                **({} if passed else {"withheld": True}),
+            },
+        )
+    ]
+    if token_node_id and node_name == token_node_id:
+        # Deprecated alias for older clients of /stream-workflow-tokens: one chunk, same text.
+        events.append(SSEEvent(event="token", data={"nodeId": node_name, "content": text}))
+    return events
+
+
 class WorkflowEngine:
     """LangGraph-based workflow orchestration engine."""
 
@@ -291,8 +621,17 @@ class WorkflowEngine:
         checkpointer: Any | None = None,
         tool_registry: dict[str, Any] | None = None,
         guardrails: "GraphGuardrails | None" = None,
+        message_queues: MessageQueueRegistry | None = None,
+        tool_policy: ToolPolicy | None = None,
+        run_registry: RunRegistry | None = None,
     ):
         self._node_executor = node_executor
+        # P4-3: active runs, cancellable through POST /cancel-run.
+        self._runs = run_registry or RunRegistry()
+        # P4-1: validate / classify / truncate / fence every tool call.
+        self._tool_policy = tool_policy or ToolPolicy.from_settings(getattr(node_executor, "_config", None))
+        # Per-thread steering / follow-up queues (pi dual-loop semantics).
+        self._message_queues = message_queues or MessageQueueRegistry()
         self._guardrails = guardrails or GraphGuardrails()
         self._cache_token = uuid.uuid4().hex
         self._checkpointer = ensure_async_checkpointer(checkpointer)
@@ -300,7 +639,7 @@ class WorkflowEngine:
         self._tool_registry = tool_registry
         self._store = store
         # Shared ToolNode for backward-compatible single-tools-list mode.
-        self._tool_node = ToolNode(self._tools) if self._tools else None
+        self._tool_node = build_tool_node(self._tools, self._tool_policy) if self._tools else None
         # Persist layout/flags per thread so resume rebuilds the same graph. Bounded LRU (P2-12);
         # evicted threads fall back to the durable layout in the store.
         self._thread_meta: OrderedDict[str, dict[str, Any]] = OrderedDict()
@@ -313,8 +652,187 @@ class WorkflowEngine:
         self._checkpointer = ensure_async_checkpointer(checkpointer)
         self._cache_token = uuid.uuid4().hex
 
+    @property
+    def message_queues(self) -> MessageQueueRegistry:
+        return self._message_queues
+
+    @property
+    def runs(self) -> RunRegistry:
+        return self._runs
+
+    def cancel_run(self, thread_id: str, owner: Any, reason: str = "cancelled") -> dict[str, Any]:
+        """P4-3: stop the graph of an active run (owner-checked). Raises RunRegistryError."""
+        return self._runs.cancel(thread_id, owner, reason)
+
+    # ── message queue (steering / follow-up) ─────────────────────────────
+    def _open_message_queue(self, thread_id: str, owner: Any) -> ThreadMessageQueue | None:
+        return self._message_queues.open_run(thread_id, QueueOwner.from_any(owner))
+
+    @staticmethod
+    def _queue_summary_if_used(queue: ThreadMessageQueue | None) -> dict[str, Any] | None:
+        if queue is None:
+            return None
+        summary = queue.summary()
+        if summary["delivered"] or summary["undelivered"] or summary["skippedToolCalls"]:
+            return summary
+        return None
+
+    def _finish_message_queue(self, queue: ThreadMessageQueue | None, outcome: str) -> None:
+        """Documented lifecycle: paused keeps the queue, every other outcome closes it."""
+        if queue is None:
+            return
+        if outcome == "paused":
+            queue.pause()
+            return
+        undelivered = queue.close(outcome)
+        if undelivered:
+            logger.info(
+                "[QUEUE] run %s %s with %d undelivered queued message(s)",
+                queue.thread_id,
+                outcome,
+                len(undelivered),
+            )
+
+    def _attach_queue_summary(
+        self, result: WorkflowResult, queue: ThreadMessageQueue | None
+    ) -> WorkflowResult:
+        summary = self._queue_summary_if_used(queue)
+        if summary is not None and isinstance(result.final_state, dict):
+            result.final_state["messageQueue"] = summary
+        return result
+
+    def _close_queue_event(self, queue: ThreadMessageQueue | None, outcome: str) -> SSEEvent | None:
+        """Close the run queue and return the ``message_queue_closed`` SSE event."""
+        if queue is None:
+            return None
+        self._finish_message_queue(queue, outcome)
+        summary = queue.summary()
+        return SSEEvent(
+            event="message_queue_closed",
+            data={
+                "threadId": queue.thread_id,
+                "reason": outcome,
+                "delivered": summary["delivered"],
+                "undelivered": summary["undelivered"],
+            },
+        )
+
+    @staticmethod
+    def _queue_sse(event: dict[str, Any]) -> SSEEvent:
+        data = {k: v for k, v in event.items() if k != "type"}
+        return SSEEvent(event=str(event.get("type")), data=data)
+
+    def _agent_tools_fn(self, tool_node: Any, agent_ids: list[str]):
+        """Run ToolNode on each listed agent's own pending tool calls (P2-8 isolation).
+
+        Queue-aware (pi inner loop) when the run has a message queue in config:
+
+        * steering pending after a tool call finishes -> the remaining tool calls of the
+          same assistant message get an explicit skipped ToolMessage
+          (``skip_remaining_tools``; off = pi HEAD batch semantics);
+        * after the batch, pending steering is appended to *that agent's* channel as marked
+          HumanMessages so it reaches the agent's next LLM call.
+
+        Without a run queue this is exactly the phase-2 per-channel ToolNode call.
+        """
+        skip_remaining = self._message_queues.settings.skip_remaining_tools
+
+        async def _run_calls(msgs: list[Any], config: RunnableConfig, queue, agent_id: str) -> list[Any]:
+            last = msgs[-1]
+            if is_truncated_tool_call_message(last):
+                # P4-2: arguments cut by max_tokens are never executed.
+                return refuse_tool_calls(last)
+            calls = list(getattr(last, "tool_calls", None) or [])
+            if queue is None or not skip_remaining or len(calls) <= 1:
+                out = await tool_node.ainvoke({"messages": msgs}, config)
+                return out.get("messages", []) if isinstance(out, dict) else list(out or [])
+            results: list[Any] = []
+            for index, call in enumerate(calls):
+                single = last.model_copy(update={"tool_calls": [call]})
+                part = await tool_node.ainvoke({"messages": [*msgs[:-1], single]}, config)
+                part_msgs = _tool_messages_from(part)
+                if part_msgs is None:
+                    # Command-style tool output: keep ToolNode semantics, no skipping.
+                    out = await tool_node.ainvoke({"messages": msgs}, config)
+                    return out.get("messages", []) if isinstance(out, dict) else list(out or [])
+                results.extend(part_msgs)
+                if index < len(calls) - 1 and queue.has_steering(node_id=agent_id):
+                    for rest in calls[index + 1:]:
+                        results.append(
+                            ToolMessage(
+                                content=SKIPPED_TOOL_RESULT_TEXT,
+                                tool_call_id=str(rest.get("id") or ""),
+                                name=rest.get("name"),
+                                status="error",
+                            )
+                        )
+                        queue.record_skipped_tool(node_id=agent_id, tool_call=rest)
+                    logger.info(
+                        "[QUEUE] steering pending: skipped %d tool call(s) for agent=%s",
+                        len(calls) - index - 1,
+                        agent_id,
+                    )
+                    break
+            return results
+
+        async def tools_fn(state: WorkflowState, config: RunnableConfig) -> dict:
+            queue = queue_from_config(config)
+            updates: dict[str, list[Any]] = {}
+            for agent_id in agent_ids:
+                msgs = list((state.get("agent_messages") or {}).get(agent_id) or [])
+                if not msgs or not _has_pending_tool_calls(msgs[-1]):
+                    continue
+                produced = list(await _run_calls(msgs, config, queue, agent_id))
+                if queue is not None and queue.has_steering(node_id=agent_id):
+                    steering = queue.drain("steer", node_id=agent_id)
+                    if steering:
+                        produced.extend(to_human_messages(steering))
+                updates[agent_id] = produced
+            return {"agent_messages": updates} if updates else {}
+
+        return tools_fn
+
+    def _make_inbox_node(self, agent_id: str):
+        """Deliver queued messages when the agent's inner loop would end.
+
+        Steering first (pi polls steering before follow-ups), else follow-up
+        (pi outer loop). Messages go to this agent's own channel; the routing flag
+        ``final_state.message_queue_inbox[agent]`` tells the edge whether to loop back.
+        """
+
+        async def inbox(state: WorkflowState, config: RunnableConfig) -> dict:
+            queue = queue_from_config(config)
+            delivered: list[Any] = []
+            if queue is not None:
+                delivered = queue.drain("steer", node_id=agent_id) or queue.drain(
+                    "follow_up", node_id=agent_id
+                )
+            update: dict[str, Any] = {
+                "final_state": {"message_queue_inbox": {agent_id: bool(delivered)}}
+            }
+            if delivered:
+                update["agent_messages"] = {agent_id: to_human_messages(delivered)}
+            return update
+
+        return inbox
+
     def _has_tools_capability(self) -> bool:
         return bool(self._tools) or bool(self._tool_registry)
+
+    def _queue_receivers(self, nodes: list[Node]) -> list[str]:
+        """Agent nodes that own a tool loop (and so an ``inbox__`` delivery point) in build_graph."""
+        agents = [n for n in nodes if (n.data.handler or "") == "general.agent"]
+        if self._tool_registry:
+            return [n.id for n in agents if tools_for_roles(self._tool_registry, resolve_agent_roles(n))]
+        if self._tool_node:
+            return [n.id for n in agents]
+        return []
+
+    def _open_run_queue(self, thread_id: str, owner: Any, nodes: list[Node]) -> ThreadMessageQueue | None:
+        queue = self._open_message_queue(thread_id, owner)
+        if queue is not None:
+            queue.set_receivers(self._queue_receivers(nodes))
+        return queue
 
     def _tools_for_node(self, node: Node) -> list:
         """Role-filtered tools for a general.agent node (empty if none available)."""
@@ -398,19 +916,30 @@ class WorkflowEngine:
         while len(self._thread_meta) > max(1, self._guardrails.thread_meta_max):
             self._thread_meta.popitem(last=False)
 
-    def _run_config(self, thread_id: str) -> dict[str, Any]:
+    def _run_config(self, thread_id: str, queue: ThreadMessageQueue | None = None) -> dict[str, Any]:
+        configurable: dict[str, Any] = {"thread_id": thread_id}
+        if queue is not None:
+            # Non-primitive configurable values are not persisted into checkpoint metadata.
+            configurable[CONFIG_QUEUE_KEY] = queue
         return {
-            "configurable": {"thread_id": thread_id},
+            "configurable": configurable,
             "recursion_limit": self._guardrails.recursion_limit,
         }
 
-    async def _ainvoke_guarded(self, graph: Any, graph_input: Any, config: dict[str, Any]) -> Any:
-        """``ainvoke`` bounded by the configured whole-run timeout, with a run-scoped quote cache."""
+    async def _ainvoke_guarded(
+        self, graph: Any, graph_input: Any, config: dict[str, Any], run: RunHandle | None = None
+    ) -> Any:
+        """``ainvoke`` bounded by the configured whole-run timeout, with a run-scoped quote cache.
+
+        P4-3: a registry cancel raises :class:`RunCancelled` (not a timeout); cancellation of the
+        calling task (client gone) still propagates as ``CancelledError``.
+        """
         try:
             with run_scoped_market_cache():
-                return await asyncio.wait_for(
+                return await await_or_cancel(
                     graph.ainvoke(graph_input, config=config, **self._graph_run_kwargs()),
-                    timeout=self._guardrails.timeout_seconds,
+                    run,
+                    self._guardrails.timeout_seconds,
                 )
         except asyncio.TimeoutError:
             raise WorkflowTimeout(self._guardrails.timeout_seconds) from None
@@ -434,9 +963,17 @@ class WorkflowEngine:
             logger.warning("[THINKING] approved_conclusion write failed thread_id=%s error=%s",
                            thread_id, type(exc).__name__)
 
-    async def _cleanup_thread(self, thread_id: str) -> None:
-        """Drop checkpoint + layout of a thread that reached a terminal state (opt-in)."""
+    async def _cleanup_thread(self, thread_id: str, outcome: str = "completed", *, resumed: bool = False) -> None:
+        """Drop checkpoint + layout of a thread that reached a terminal state (decision D5).
+
+        Never for paused (HUMAN_INTERRUPT) / aborted runs, nor for a failed or cancelled resume
+        (see :func:`cleanup_kind`). Configurable: ``AEGIS_ALPHA_WORKFLOW_CLEANUP_CHECKPOINTS`` and
+        ``AEGIS_ALPHA_WORKFLOW_CLEANUP_OUTCOMES``.
+        """
         if not self._guardrails.cleanup_checkpoints:
+            return
+        kind = cleanup_kind(outcome, resumed=resumed)
+        if kind is None or kind not in self._guardrails.cleanup_outcomes:
             return
         self._thread_meta.pop(thread_id, None)
         delete = getattr(self._checkpointer, "adelete_thread", None)
@@ -557,7 +1094,47 @@ class WorkflowEngine:
         if not isinstance(traced, dict):
             traced = trace_entry
         traced["memoryHits"] = memory_hit_count(exec_state if isinstance(exec_state, dict) else {})
+        resolution = (result_data or {}).get("modelResolution") if isinstance(result_data, dict) else None
+        if isinstance(resolution, dict):
+            # P4-6: requested vs effective model (fallbacks are visible, never silent).
+            for key in ("requestedModel", "effectiveModel", "modelFallbackReason"):
+                if resolution.get(key) is not None:
+                    traced[key] = resolution[key]
+        prompt_version = (result_data or {}).get("promptVersion") if isinstance(result_data, dict) else None
+        if isinstance(prompt_version, str) and prompt_version:
+            traced["promptVersion"] = prompt_version  # P4-14
         return traced
+
+    def _agent_turn_usage(self, agent_result: Any) -> dict | None:
+        """Normalized usage of one agent LLM call, with a registry cost estimate when prices are configured."""
+        usage = getattr(agent_result, "turn_usage", None)
+        if not usage:
+            return None
+        resolution = getattr(agent_result, "model_resolution", None)
+        model = getattr(resolution, "effective", None) or getattr(
+            getattr(self._node_executor, "_config", None), "model", None
+        )
+        models_file = getattr(getattr(self._node_executor, "_config", None), "models_file", "") or None
+        return with_estimated_cost(usage, model, get_model_registry(models_file))
+
+    @staticmethod
+    def _prior_usage_turns(final_state: Any, node_id: str) -> list[dict[str, Any]]:
+        turns = ((final_state or {}).get("usage_turns") or {}).get(node_id) if isinstance(final_state, dict) else None
+        return [dict(t) for t in turns if isinstance(t, dict)] if isinstance(turns, list) else []
+
+    @staticmethod
+    def _usage_state(node_id: str, turns: list[dict[str, Any]]) -> dict[str, Any]:
+        """final_state keys for P4-7 usage (node-keyed, so deep_merge keeps parallel branches)."""
+        if not turns:
+            return {}
+        return {"usage_turns": {node_id: turns}, "usage_by_node": {node_id: sum_token_usage(turns)}}
+
+    @staticmethod
+    def _with_usage_totals(final_state: dict[str, Any]) -> dict[str, Any]:
+        totals = usage_totals(final_state.get("usage_by_node"))
+        if totals:
+            final_state["usageTotals"] = totals
+        return final_state
 
     @staticmethod
     def _node_result_from_cache(payload: Any) -> NodeResult | None:
@@ -579,7 +1156,7 @@ class WorkflowEngine:
         if not isinstance(graph_out, dict):
             graph_out = {}
         interrupted = bool(graph_out.get("__interrupt__"))
-        inner = dict(graph_out.get("final_state") or {})
+        inner = self._with_usage_totals(dict(graph_out.get("final_state") or {}))
         if interrupted:
             inner["interrupted"] = True
         trace: list[TraceEntry] = []
@@ -609,7 +1186,7 @@ class WorkflowEngine:
             snapshot = await graph.aget_state(config)
             values = getattr(snapshot, "values", None) or {}
             if isinstance(values, dict):
-                final_state = dict(values.get("final_state") or {})
+                final_state = self._with_usage_totals(dict(values.get("final_state") or {}))
                 final_state["interrupted"] = True
                 for entry in values.get("trace") or []:
                     if isinstance(entry, dict):
@@ -656,6 +1233,7 @@ class WorkflowEngine:
         cache_key = (
             f"{topo_hash}:{require_approval}:"
             f"{bool(self._tools)}:{bool(self._tool_registry)}:"
+            f"mq={self._message_queues.enabled}:{self._message_queues.settings.skip_remaining_tools}:"
             # Compiled graphs embed this engine's executor, checkpointer and store: never share
             # them across engine instances or across a checkpointer swap.
             f"{self._cache_token}"
@@ -673,6 +1251,7 @@ class WorkflowEngine:
         agent_tools_node_ids: dict[str, str] = {}
         agent_nodes: list[str] = []
         use_per_agent_tools = bool(self._tool_registry)
+        queue_enabled = self._message_queues.enabled
 
         for edge in edges:
             if edge.source in node_ids and edge.target in node_ids:
@@ -696,7 +1275,7 @@ class WorkflowEngine:
                 if not filtered:
                     continue
                 tools_node_id = f"tools__{node.id}"
-                graph.add_node(tools_node_id, self._agent_tools_fn(ToolNode(filtered), [node.id]))
+                graph.add_node(tools_node_id, self._agent_tools_fn(build_tool_node(filtered, self._tool_policy), [node.id]))
                 agent_tools_node_ids[node.id] = tools_node_id
                 agent_nodes.append(node.id)
         elif self._tool_node:
@@ -744,18 +1323,31 @@ class WorkflowEngine:
                 if not next_nodes:
                     next_nodes = [END]
 
-                def route_to_tools(
-                    state: WorkflowState,
-                    _agent_id: str = agent_id,
-                    _tools_target: str = tools_target,
-                    _next: tuple = tuple(next_nodes),
-                ) -> Any:
-                    if _has_pending_tool_calls(_last_agent_message(state, _agent_id)):
-                        return _tools_target
+                inbox_id = f"{INBOX_NODE_PREFIX}{agent_id}"
+
+                def _successors(_agent_id: str, _next: tuple) -> Any:
                     # Fan out to every successor (P2-8), not only the first one.
                     if len(_next) == 1:
                         return _agent_id + "__next"
                     return list(_next)
+
+                def route_to_tools(
+                    state: WorkflowState,
+                    config: RunnableConfig,
+                    _agent_id: str = agent_id,
+                    _tools_target: str = tools_target,
+                    _next: tuple = tuple(next_nodes),
+                    _inbox_id: str = inbox_id,
+                ) -> Any:
+                    if _has_pending_tool_calls(_last_agent_message(state, _agent_id)):
+                        return _tools_target
+                    # Inner loop would end: deliver pending steering / follow-up first (pi outer loop).
+                    queue = queue_from_config(config) if queue_enabled else None
+                    if queue is not None and queue.has_pending(node_id=_agent_id):
+                        return _inbox_id
+                    if queue is not None:
+                        queue.mark_agent_done(_agent_id)
+                    return _successors(_agent_id, _next)
 
                 # Always register __next so route_to_tools return value is valid
                 # whether there is one or many successors (next_nodes defaults to [END]).
@@ -763,7 +1355,34 @@ class WorkflowEngine:
                 for n in next_nodes:
                     routing_map[n] = n
                 routing_map[agent_id + "__next"] = next_nodes[0]
+                if queue_enabled:
+                    routing_map[inbox_id] = inbox_id
                 graph.add_conditional_edges(agent_id, route_to_tools, routing_map)
+
+                if queue_enabled:
+                    graph.add_node(inbox_id, self._make_inbox_node(agent_id))
+
+                    def route_after_inbox(
+                        state: WorkflowState,
+                        config: RunnableConfig,
+                        _agent_id: str = agent_id,
+                        _next: tuple = tuple(next_nodes),
+                    ) -> Any:
+                        flags = (state.get("final_state") or {}).get("message_queue_inbox") or {}
+                        if flags.get(_agent_id):
+                            return _agent_id
+                        queue = queue_from_config(config)
+                        if queue is not None:
+                            queue.mark_agent_done(_agent_id)
+                        # Same successors as route_to_tools: the approval-gate mapping and the
+                        # parallel fan-out list are preserved; deferred fan-in still waits.
+                        return _successors(_agent_id, _next)
+
+                    inbox_map: dict[str, Any] = {agent_id: agent_id}
+                    for n in next_nodes:
+                        inbox_map[n] = n
+                    inbox_map[agent_id + "__next"] = next_nodes[0]
+                    graph.add_conditional_edges(inbox_id, route_after_inbox, inbox_map)
 
             if use_per_agent_tools:
                 # Unique tools node per agent: tools__{agent_id} always returns to that agent.
@@ -772,7 +1391,12 @@ class WorkflowEngine:
             else:
                 # Shared tools node: route back to every agent whose channel now ends with tool results.
                 def route_after_tools(state: WorkflowState, _agents: list[str] = list(agent_nodes)) -> Any:
-                    ready = [aid for aid in _agents if _is_tool_message(_last_agent_message(state, aid))]
+                    # A channel may end with steering injected after its tool results.
+                    ready = [
+                        aid for aid in _agents
+                        if _is_tool_message(_last_agent_message(state, aid))
+                        or is_queued_human_message(_last_agent_message(state, aid))
+                    ]
                     if ready:
                         return ready if len(ready) > 1 else ready[0]
                     last = (state.get("final_state") or {}).get("last_agent_id")
@@ -839,23 +1463,6 @@ class WorkflowEngine:
         self._put_cached_graph(cache_key, compiled)
         return compiled
 
-    @staticmethod
-    def _agent_tools_fn(tool_node: Any, agent_ids: list[str]):
-        """Run ToolNode on each listed agent's own pending tool calls (P2-8 isolation)."""
-
-        async def tools_fn(state: WorkflowState, config: RunnableConfig) -> dict:
-            updates: dict[str, list[Any]] = {}
-            for agent_id in agent_ids:
-                msgs = list((state.get("agent_messages") or {}).get(agent_id) or [])
-                if not msgs or not _has_pending_tool_calls(msgs[-1]):
-                    continue
-                out = await tool_node.ainvoke({"messages": msgs}, config)
-                produced = out.get("messages", []) if isinstance(out, dict) else list(out or [])
-                updates[agent_id] = list(produced)
-            return {"agent_messages": updates} if updates else {}
-
-        return tools_fn
-
     def _make_node_fn(self, node: Node):
         """Create async function for a graph node."""
         handler = node.data.handler or node.data.function_name or "logic"
@@ -878,6 +1485,17 @@ class WorkflowEngine:
                 workflow_state=state,
                 store=store,
             )
+            if handler not in ("start", "end"):
+                rounds = (exec_state.get("tool_rounds") if isinstance(exec_state, dict) else None) or {}
+                emit_tool_event(
+                    "node_start",
+                    {
+                        "nodeId": node.id,
+                        "nodeName": node_label,
+                        "handler": handler,
+                        "turn": int((rounds.get(node.id, 0) if isinstance(rounds, dict) else 0) or 0) + 1,
+                    },
+                )
 
             # Portfolio-reading agents are user-specific: never served from / written to the ticker cache.
             cacheable = handler != "start" and handler != "end" and not self._node_reads_portfolio(node)
@@ -918,7 +1536,7 @@ class WorkflowEngine:
                 except Exception as cache_err:
                     logger.warning(f"[THINKING] Store read error for node {node.id}: {cache_err}")
 
-            logger.info(f"[THINKING] Workflow node starting: id={node.id} handler={handler} label={node_label} subject={subject}")
+            logger.info(f"[THINKING] Workflow node starting: id={node.id} handler={handler} label={node_label} subject_len={text_len(subject)}")
 
             # True tool-calling loop for general.agent when tools are bound.
             if agent_tools:
@@ -939,26 +1557,32 @@ class WorkflowEngine:
                 except GraphInterrupt:
                     raise
                 except Exception as e:
+                    # P4-2: no silent fallback to a tool-less execute() (which would re-run the node
+                    # without the data it asked for and look like a normal answer). The node is
+                    # reported as an explicit degraded failure and never cached.
                     logger.error(
-                        f"[THINKING] Agent tool-loop failed, falling back to execute: "
-                        f"id={node.id} error={e}"
+                        f"[THINKING] Agent tool-loop failed (no fallback): id={node.id} "
+                        f"error={type(e).__name__}: {e}"
                     )
-
-            try:
-                result = await self._node_executor.execute(
-                    node=node,
-                    state=exec_state,
-                    subject=subject,
-                )
-            except GraphInterrupt:
-                raise
-            except Exception as e:
-                logger.error(f"[THINKING] Workflow node exception: id={node.id} handler={handler} label={node_label} error={e}")
-                result = NodeResult(
-                    ok=False, status="error", handler="logic",
-                    node_id=node.id, node_name=node_label,
-                    subject=subject, summary=str(e), duration_ms=0,
-                )
+                    result = self._node_executor.agent_failure_result(
+                        node=node, subject=subject, started_at=started_at, error=e,
+                    )
+            else:
+                try:
+                    result = await self._node_executor.execute(
+                        node=node,
+                        state=exec_state,
+                        subject=subject,
+                    )
+                except GraphInterrupt:
+                    raise
+                except Exception as e:
+                    logger.error(f"[THINKING] Workflow node exception: id={node.id} handler={handler} label={node_label} error={e}")
+                    result = NodeResult(
+                        ok=False, status="error", handler="logic",
+                        node_id=node.id, node_name=node_label,
+                        subject=subject, summary=str(e), duration_ms=0,
+                    )
 
             trace_entry = self._annotate_trace(
                 {
@@ -981,7 +1605,7 @@ class WorkflowEngine:
                 try:
                     ticker = state.get("final_state", {}).get("ticker", "") or state.get("final_state", {}).get("symbol", "")
                     cache_key = self._node_result_cache_key(node, handler)
-                    if ticker and result.ok:
+                    if ticker and result.ok and result.status != "agent_failed":
                         await store.aput(
                             ticker_namespace(ticker), cache_key,
                             result.model_dump(),
@@ -995,6 +1619,10 @@ class WorkflowEngine:
             if result.handler:
                 state_update[result.handler] = result.model_dump()
             self._merge_evidence(state_update, result)
+            node_usage = normalize_token_usage((result.data or {}).get("tokenUsage")) if isinstance(result.data, dict) else None
+            if node_usage:
+                # P4-7: per-node totals (node-keyed so parallel branches merge) → final_state.usageTotals.
+                state_update["usage_by_node"] = {node.id: node_usage}
             if is_agent_with_tools:
                 # Attribution for tools → agent return path
                 state_update["last_agent_id"] = node.id
@@ -1028,8 +1656,29 @@ class WorkflowEngine:
         if not isinstance(tool_rounds, dict):
             tool_rounds = {}
         current_round = int(tool_rounds.get(node.id, 0) or 0)
-        force_final = current_round >= MAX_TOOL_ROUNDS
+        max_rounds = max_tool_rounds_for(node)
+        force_final = current_round >= max_rounds
 
+        delta_kwargs: dict[str, Any] = {}
+        if _streaming_active():
+            turn = current_round + 1
+
+            def _on_delta(text: str, attempt: int) -> None:
+                emit_tool_event(
+                    "message_delta",
+                    {"nodeId": node.id, "turn": turn, "attempt": attempt, "delta": text, "final": False},
+                )
+
+            delta_kwargs["on_delta"] = _on_delta
+        # P4-11 (pi runLoop L185): steering queued before the first LLM call is delivered to that
+        # first request instead of waiting for the first tool batch / inbox.
+        first_turn_steering: list[Any] = []
+        if not mid_tool_loop:
+            queue = _current_run_queue()
+            if queue is not None and queue.has_steering(node_id=node.id):
+                first_turn_steering = to_human_messages(queue.drain("steer", node_id=node.id))
+        if first_turn_steering:
+            delta_kwargs["leading_messages"] = first_turn_steering
         agent_result = await self._node_executor.invoke_agent_with_tools(
             node=node,
             state=final_state,
@@ -1037,7 +1686,10 @@ class WorkflowEngine:
             tools=agent_tools,
             prior_messages=prior_for_tools if mid_tool_loop else None,
             force_final=force_final,
+            **delta_kwargs,
         )
+        if first_turn_steering:
+            agent_result.leading_messages = first_turn_steering
 
         if agent_result.has_tool_calls and not force_final:
             next_round = current_round + 1
@@ -1049,11 +1701,18 @@ class WorkflowEngine:
                 else:
                     tool_names.append(str(getattr(tc, "name", "") or ""))
             logger.info(
-                f"[THINKING] Agent requesting tools: id={node.id} round={next_round}/{MAX_TOOL_ROUNDS} "
+                f"[THINKING] Agent requesting tools: id={node.id} round={next_round}/{max_rounds} "
                 f"tools={tool_names}"
             )
+            turn_usage = self._agent_turn_usage(agent_result)
+            prior_turns = self._prior_usage_turns(final_state, node.id)
+            turns = prior_turns + ([{"round": next_round, "kind": "tool_request", **turn_usage}] if turn_usage else [])
+            awaiting_extra: dict[str, Any] = {"turnUsage": turn_usage} if turn_usage else {}
+            if getattr(agent_result, "context_stats", None):
+                awaiting_extra["contextStats"] = agent_result.context_stats  # P4-8
             trace_entry = self._annotate_trace(
                 {
+                    **awaiting_extra,
                     "nodeId": node.id,
                     "nodeName": node_label,
                     "handler": handler,
@@ -1076,6 +1735,7 @@ class WorkflowEngine:
                 "final_state": {
                     "last_agent_id": node.id,
                     "tool_rounds": {node.id: next_round},
+                    **self._usage_state(node.id, turns),
                 },
                 "trace": [trace_entry],
             }
@@ -1086,6 +1746,7 @@ class WorkflowEngine:
             subject=subject,
             agent_result=agent_result,
             started_at=started_at,
+            tool_errors=count_tool_errors(prior_for_tools if mid_tool_loop else []),
         )
         if force_final and agent_result.has_tool_calls:
             # Model still tried to call tools past the cap; surface as degraded text.
@@ -1094,13 +1755,24 @@ class WorkflowEngine:
                     **result.model_dump(),
                     "degraded": True,
                     "summary": result.summary
-                    or f"Tool-call limit ({MAX_TOOL_ROUNDS}) reached for {node.id}",
+                    or f"Tool-call limit ({max_rounds}) reached for {node.id}",
                     "data": {
                         **(result.data or {}),
                         "tool_round_capped": True,
                         "tool_rounds": current_round,
                     },
                 }
+            )
+
+        # P4-7: the node's tokenUsage is the sum over every turn (tool-requesting turns included).
+        final_turn = normalize_token_usage((result.data or {}).get("tokenUsage"))
+        turns = self._prior_usage_turns(final_state, node.id) + (
+            [{"round": current_round + 1, "kind": "final", **final_turn}] if final_turn else []
+        )
+        node_total = sum_token_usage(turns)
+        if node_total:
+            result = NodeResult(
+                **{**result.model_dump(), "data": {**(result.data or {}), "tokenUsage": node_total, "usageTurns": turns}}
             )
 
         trace_entry = self._annotate_trace(
@@ -1114,6 +1786,10 @@ class WorkflowEngine:
                 "startedAt": started_at,
                 "completedAt": datetime.now(timezone.utc).isoformat(),
                 "durationMs": result.duration_ms,
+                **({"turns": turns} if turns else {}),
+                # P4-15: conversation audit by envelope kind (no message bodies).
+                **({"conversation": conversation_kinds(prior_for_tools)} if mid_tool_loop else {}),
+                **({"contextStats": agent_result.context_stats} if getattr(agent_result, "context_stats", None) else {}),
             },
             result.data,
             final_state,
@@ -1123,7 +1799,16 @@ class WorkflowEngine:
             f"ok={result.ok} rounds={current_round}"
         )
 
-        if store and handler != "start" and handler != "end" and not self._node_reads_portfolio(node):
+        # A turn shaped by queued user messages is user-specific: never write it to the
+        # shared per-ticker cache.
+        steered = bool(first_turn_steering) or any(
+            is_queued_human_message(m)
+            for m in ((state.get("agent_messages") or {}).get(node.id) or [])
+        )
+        if (
+            store and not steered
+            and handler != "start" and handler != "end" and not self._node_reads_portfolio(node)
+        ):
             try:
                 ticker = final_state.get("ticker", "") or final_state.get("symbol", "")
                 cache_key = self._node_result_cache_key(node, handler)
@@ -1140,6 +1825,7 @@ class WorkflowEngine:
         state_update: dict[str, Any] = {
             node.id: result.model_dump(),
             "last_agent_id": node.id,
+            **self._usage_state(node.id, turns),
         }
         if result.handler:
             state_update[result.handler] = result.model_dump()
@@ -1168,14 +1854,24 @@ class WorkflowEngine:
         }
 
     async def _start_thread(
-        self, nodes: list[Node], edges: list[Edge], require_approval: bool, thread_id: str | None
-    ) -> tuple[Any, str, dict[str, Any]]:
+        self,
+        nodes: list[Node],
+        edges: list[Edge],
+        require_approval: bool,
+        thread_id: str | None,
+        *,
+        owner: Any = None,
+        state: Any = None,
+    ) -> tuple[Any, str, dict[str, Any], ThreadMessageQueue | None]:
         graph = self.build_graph(nodes, edges, require_approval=require_approval)
         tid = thread_id or str(uuid.uuid4())
         await self._persist_thread_layout(
             tid, require_approval=require_approval, nodes=nodes, edges=edges
         )
-        return graph, tid, self._run_config(tid)
+        queue = self._open_run_queue(
+            tid, owner if owner is not None else _owner_from_state(state), nodes
+        )
+        return graph, tid, self._run_config(tid, queue), queue
 
     async def execute_workflow(
         self,
@@ -1185,17 +1881,25 @@ class WorkflowEngine:
         subject: str,
         require_approval: bool = False,
         thread_id: str | None = None,
+        owner: Any = None,
     ) -> WorkflowResult:
         """Execute workflow non-streaming."""
-        logger.info(f"[THINKING] Workflow execution starting: subject={subject} nodes={[n.id for n in nodes]} require_approval={require_approval}")
-        graph, tid, config = await self._start_thread(nodes, edges, require_approval, thread_id)
+        logger.info(f"[THINKING] Workflow execution starting: subject_len={text_len(subject)} nodes={[n.id for n in nodes]} require_approval={require_approval}")
+        logger.debug("Workflow subject: %s", subject)
+        graph, tid, config, queue = await self._start_thread(
+            nodes, edges, require_approval, thread_id, owner=owner, state=state
+        )
         initial_state = self._initial_state(state, subject, require_approval)
+        run = self._runs.open(tid, owner if owner is not None else _owner_from_state(state))
 
+        outcome = "aborted"
         try:
-            final_state = await self._ainvoke_guarded(graph, initial_state, config)
+            final_state = await self._ainvoke_guarded(graph, initial_state, config, run)
             node_ids = [n.id for n in nodes]
-            logger.info(f"[THINKING] Workflow execution completed: subject={subject} nodes={node_ids} ok=True")
-            result = self._result_from_graph_output(final_state)
+            logger.info(f"[THINKING] Workflow execution completed: subject_len={text_len(subject)} nodes={node_ids} ok=True")
+            outcome = "paused" if _graph_output_interrupted(final_state) else "completed"
+            self._finish_message_queue(queue, outcome)
+            result = self._attach_queue_summary(self._result_from_graph_output(final_state), queue)
             if not result.final_state.get("interrupted"):
                 await self._cleanup_thread(tid)
             return result
@@ -1205,13 +1909,33 @@ class WorkflowEngine:
                 subject,
                 tid,
             )
+            outcome = "paused"
+            self._finish_message_queue(queue, outcome)
             return await self._result_from_interrupt(graph, config, state)
         except WorkflowTimeout as e:
             logger.error("[THINKING] Workflow execution timed out: thread_id=%s", tid)
-            return WorkflowResult(ok=False, error=str(e), final_state=state)
+            outcome = "timeout"
+            self._finish_message_queue(queue, outcome)
+            await self._cleanup_thread(tid, outcome)
+            return self._attach_queue_summary(WorkflowResult(ok=False, error=str(e), final_state=state), queue)
+        except RunCancelled as e:
+            logger.info("[THINKING] Workflow execution cancelled: thread_id=%s", tid)
+            outcome = "cancelled"
+            self._finish_message_queue(queue, outcome)
+            await self._cleanup_thread(tid, outcome)
+            return self._attach_queue_summary(
+                WorkflowResult(ok=False, error=str(e), final_state={**(state or {}), "cancelled": True}), queue
+            )
         except Exception as e:
-            logger.error(f"[THINKING] Workflow execution failed: subject={subject} error={e}")
-            return WorkflowResult(ok=False, error=str(e), final_state=state)
+            logger.error(f"[THINKING] Workflow execution failed: subject_len={text_len(subject)} error={e}")
+            outcome = "error"
+            self._finish_message_queue(queue, outcome)
+            await self._cleanup_thread(tid, outcome)
+            return self._attach_queue_summary(WorkflowResult(ok=False, error=str(e), final_state=state), queue)
+        finally:
+            self._runs.close(run)
+            if outcome == "aborted":  # cancelled (client gone / server shutdown)
+                self._finish_message_queue(queue, outcome)
 
     async def _stream_events(
         self,
@@ -1224,13 +1948,27 @@ class WorkflowEngine:
         token_node_id: str | None,
         report_degraded: bool,
         label: str,
+        queue: ThreadMessageQueue | None = None,
+        owner: Any = None,
+        on_complete: Callable[[], Awaitable[None]] | None = None,
+        include_node_outputs: bool = False,
     ) -> AsyncIterator[SSEEvent]:
         """Shared ``astream`` → SSE translation for both streaming endpoints (P2-12).
 
-        ``token_node_id`` re-emits that node's content as ``token`` chunks; ``report_degraded``
+        ``include_node_outputs`` (D10b, resume stream) adds the bounded per-node results of the nodes
+        that ran in this stream to ``workflow_complete`` as ``node_outputs``.
+
+        ``on_complete`` (P4-10, resume stream) runs after a completed graph, before thread cleanup.
+
+        ``token_node_id`` also emits the gated aggregate answer as one deprecated ``token`` alias event; ``report_degraded``
         collects degraded reasons and emits a ``degraded`` event before completion. The whole run
         is bounded by the configured timeout; on expiry an ``error`` event with code
         ``WORKFLOW_TIMEOUT`` is emitted.
+
+        Message queue: queue events (``message_queued`` / ``message_dequeued`` / ``tool_skipped`` /
+        ``message_queue_cleared``) are interleaved with node updates; an interrupt pauses the queue,
+        every terminal outcome closes it and emits ``message_queue_closed`` before
+        ``workflow_complete`` / ``error``; a closed generator (client abort) closes it as ``aborted``.
         """
         degraded_reasons: list[str] = []
         saw_interrupt = False
@@ -1240,23 +1978,64 @@ class WorkflowEngine:
         deadline = loop.time() + self._guardrails.timeout_seconds
         market_scope = run_scoped_market_cache()
         market_scope.__enter__()
-        stream = graph.astream(
-            graph_input,
-            config=config,
-            stream_mode="updates",
-            **self._graph_run_kwargs(),
+        run = self._runs.open(tid, owner)
+        stream = _merge_queue_events(
+            graph.astream(
+                graph_input,
+                config=_with_stream_v2(config),
+                stream_mode=["updates", "custom"],
+                **self._graph_run_kwargs(),
+            ),
+            queue,
         ).__aiter__()
+        # P4-3: the graph stream is consumed by one pump task (stable contextvars for LangGraph);
+        # this generator waits on its output, the run deadline and the cancel signal together.
+        pumped: asyncio.Queue = asyncio.Queue()
+
+        async def _pump() -> None:
+            try:
+                async for item in stream:
+                    await pumped.put(("item", item))
+                await pumped.put(("done", None))
+            except asyncio.CancelledError:
+                raise
+            except BaseException as exc:  # noqa: BLE001 - re-raised by the consumer below
+                await pumped.put(("error", exc))
+
+        pump_task = asyncio.ensure_future(_pump())
+        cancel_waiter = asyncio.ensure_future(run.cancelled.wait())
+        outcome = "aborted"
         try:
             while True:
                 remaining = deadline - loop.time()
                 if remaining <= 0:
                     raise WorkflowTimeout(self._guardrails.timeout_seconds)
-                try:
-                    chunk = await asyncio.wait_for(stream.__anext__(), timeout=remaining)
-                except StopAsyncIteration:
+                getter = asyncio.ensure_future(pumped.get())
+                done, _ = await asyncio.wait(
+                    {getter, cancel_waiter}, timeout=remaining, return_when=asyncio.FIRST_COMPLETED
+                )
+                if getter not in done:
+                    getter.cancel()
+                    if run.is_cancelled:
+                        raise RunCancelled(tid, run.cancel_reason or "cancelled")
+                    raise WorkflowTimeout(self._guardrails.timeout_seconds)
+                tag, payload = getter.result()
+                if tag == "done":
                     break
-                except asyncio.TimeoutError:
-                    raise WorkflowTimeout(self._guardrails.timeout_seconds) from None
+                if tag == "error":
+                    raise payload
+                kind, chunk = payload
+                if kind == "queue":
+                    yield self._queue_sse(chunk)
+                    continue
+                mode = "updates"
+                if isinstance(chunk, tuple) and len(chunk) == 2 and chunk[0] in ("updates", "custom"):
+                    mode, chunk = chunk
+                if mode == "custom":
+                    event = _custom_sse(chunk)
+                    if event is not None:
+                        yield event
+                    continue
                 if not isinstance(chunk, dict):
                     continue
                 for node_name, update in chunk.items():
@@ -1270,33 +2049,20 @@ class WorkflowEngine:
                         streamed_state = deep_merge(streamed_state, update["final_state"])
                     if isinstance(update.get("node_outputs"), dict):
                         streamed_outputs.update(update["node_outputs"])
+                    if _is_inbox_node_name(str(node_name)):
+                        continue
                     trace_entry = (update.get("trace") or [{}])[0]
 
-                    if token_node_id and node_name == token_node_id:
-                        node_result = (update.get("node_outputs") or {}).get(token_node_id)
-                        if node_result and node_result.get("content"):
-                            content = node_result["content"]
-                            chunk_size = 50
-                            for i in range(0, len(content), chunk_size):
-                                yield SSEEvent(
-                                    event="token",
-                                    data={"nodeId": token_node_id, "content": content[i:i + chunk_size]},
-                                )
-                            continue
-
                     if _is_tools_node_name(str(node_name)):
-                        yield SSEEvent(
-                            event="tool_call",
-                            data={
-                                "nodeId": node_name,
-                                "nodeName": "Tool Execution",
-                                "handler": "tool",
-                                "status": "completed",
-                                "ok": True,
-                                "results": update.get("node_outputs", {}),
-                            },
-                        )
+                        # v2: per-call tool_execution_start/end arrive on the custom stream.
                         continue
+
+                    # P4-9: the aggregate answer is released once, after the policy/critique gate
+                    # ran (node finished); a failed gate releases only the gated summary.
+                    for final_event in _aggregate_final_events(
+                        str(node_name), update.get("node_outputs") or {}, token_node_id
+                    ):
+                        yield final_event
                     node_id = trace_entry.get("nodeId", node_name)
                     node_status = trace_entry.get("status", "")
                     node_ok = trace_entry.get("ok", False)
@@ -1324,12 +2090,19 @@ class WorkflowEngine:
                             "startedAt": trace_entry.get("startedAt", ""),
                             "completedAt": trace_entry.get("completedAt", ""),
                             "durationMs": node_duration,
+                            **({"tokenUsage": trace_entry["tokenUsage"]} if trace_entry.get("tokenUsage") else {}),
+                            **({"turnUsage": trace_entry["turnUsage"]} if trace_entry.get("turnUsage") else {}),
                         },
                     )
+                    usage_event = _usage_sse(node_id, trace_entry)
+                    if usage_event is not None:
+                        yield usage_event
                 if saw_interrupt:
                     break
 
             if saw_interrupt:
+                outcome = "paused"
+                self._finish_message_queue(queue, outcome)
                 return
             complete: dict[str, Any] = {"ok": True}
             if report_degraded:
@@ -1340,17 +2113,65 @@ class WorkflowEngine:
                     )
                 complete["degraded"] = bool(degraded_reasons)
             complete["final_state"] = build_stream_final_state(streamed_state, streamed_outputs)
+            if include_node_outputs:
+                complete["node_outputs"] = bounded_node_outputs(streamed_outputs)
+            if on_complete is not None:
+                try:
+                    await on_complete()
+                except Exception as exc:  # noqa: BLE001 - post-run hooks never fail a finished run
+                    logger.warning("[THINKING] %s on_complete hook failed: %s", label, type(exc).__name__)
             await self._cleanup_thread(tid)
+            outcome = "completed"
+            closed = self._close_queue_event(queue, outcome)
+            if closed is not None:
+                yield closed
+            queue_summary = self._queue_summary_if_used(queue)
+            if queue_summary is not None:
+                complete["messageQueue"] = queue_summary
             yield SSEEvent(event="workflow_complete", data=complete)
         except GraphInterrupt:
+            outcome = "paused"
+            self._finish_message_queue(queue, outcome)
             yield _interrupt_event()
         except WorkflowTimeout as e:
             logger.error("[THINKING] Workflow %s timed out: thread_id=%s", label, tid)
+            outcome = "timeout"
+            closed = self._close_queue_event(queue, outcome)
+            await self._cleanup_thread(tid, outcome, resumed=label == "resume")
+            if closed is not None:
+                yield closed
             yield SSEEvent(event="error", data={"ok": False, "error": str(e), "code": "WORKFLOW_TIMEOUT"})
+        except RunCancelled as e:
+            logger.info("[THINKING] Workflow %s cancelled: thread_id=%s", label, tid)
+            outcome = "cancelled"
+            closed = self._close_queue_event(queue, outcome)
+            await self._cleanup_thread(tid, outcome, resumed=label == "resume")
+            if closed is not None:
+                yield closed
+            yield SSEEvent(
+                event="cancelled",
+                data={"ok": False, "threadId": tid, "reason": e.reason, "code": "WORKFLOW_CANCELLED"},
+            )
         except Exception as e:
             logger.error(f"[THINKING] Workflow {label} failed: thread_id={tid} error={e}")
+            outcome = "error"
+            closed = self._close_queue_event(queue, outcome)
+            await self._cleanup_thread(tid, outcome, resumed=label == "resume")
+            if closed is not None:
+                yield closed
             yield SSEEvent(event="error", data={"ok": False, "error": str(e), "code": "WORKFLOW_ERROR"})
         finally:
+            self._runs.close(run)
+            cancel_waiter.cancel()
+            if not pump_task.done():
+                pump_task.cancel()
+            try:
+                await pump_task
+            except BaseException:  # noqa: BLE001 - graph run is being torn down
+                pass
+            if outcome == "aborted":
+                # Client disconnected / generator closed: discard undelivered messages.
+                self._finish_message_queue(queue, outcome)
             aclose = getattr(stream, "aclose", None)
             if aclose is not None:
                 try:
@@ -1367,21 +2188,32 @@ class WorkflowEngine:
         subject: str,
         require_approval: bool = False,
         thread_id: str | None = None,
+        owner: Any = None,
     ) -> AsyncIterator[SSEEvent]:
         """Execute workflow with SSE streaming."""
-        logger.info(f"[THINKING] Workflow streaming starting: subject={subject} nodes={[n.id for n in nodes]} require_approval={require_approval}")
-        graph, tid, config = await self._start_thread(nodes, edges, require_approval, thread_id)
-        async for event in self._stream_events(
-            graph,
-            self._initial_state(state, subject, require_approval),
-            config,
-            state,
-            tid=tid,
-            token_node_id=None,
-            report_degraded=True,
-            label="streaming",
-        ):
-            yield event
+        logger.info(f"[THINKING] Workflow streaming starting: subject_len={text_len(subject)} nodes={[n.id for n in nodes]} require_approval={require_approval}")
+        logger.debug("Workflow subject: %s", subject)
+        graph, tid, config, queue = await self._start_thread(
+            nodes, edges, require_approval, thread_id, owner=owner, state=state
+        )
+        # aclosing: a client abort (aclose on this generator) must close the inner stream now,
+        # not at GC time, so the graph run is cancelled and the queue closes as "aborted".
+        async with contextlib.aclosing(
+            self._stream_events(
+                graph,
+                self._initial_state(state, subject, require_approval),
+                config,
+                state,
+                tid=tid,
+                token_node_id=None,
+                report_degraded=True,
+                label="streaming",
+                queue=queue,
+                owner=owner if owner is not None else _owner_from_state(state),
+            )
+        ) as events:
+            async for event in events:
+                yield event
 
     async def stream_workflow_tokens(
         self,
@@ -1391,45 +2223,45 @@ class WorkflowEngine:
         subject: str,
         require_approval: bool = False,
         thread_id: str | None = None,
+        owner: Any = None,
     ) -> AsyncIterator[SSEEvent]:
-        graph, tid, config = await self._start_thread(nodes, edges, require_approval, thread_id)
+        graph, tid, config, queue = await self._start_thread(
+            nodes, edges, require_approval, thread_id, owner=owner, state=state
+        )
         aggregate_node = next(
             (n for n in nodes if n.data.handler == "finance.stock_recommendation_aggregate"),
             None,
         )
-        async for event in self._stream_events(
-            graph,
-            self._initial_state(state, subject, require_approval),
-            config,
-            state,
-            tid=tid,
-            token_node_id=aggregate_node.id if aggregate_node else None,
-            report_degraded=False,
-            label="token-stream",
-        ):
-            yield event
+        # aclosing: a client abort (aclose on this generator) must close the inner stream now,
+        # not at GC time, so the graph run is cancelled and the queue closes as "aborted".
+        async with contextlib.aclosing(
+            self._stream_events(
+                graph,
+                self._initial_state(state, subject, require_approval),
+                config,
+                state,
+                tid=tid,
+                token_node_id=aggregate_node.id if aggregate_node else None,
+                report_degraded=False,
+                label="token-stream",
+                queue=queue,
+                owner=owner if owner is not None else _owner_from_state(state),
+            )
+        ) as events:
+            async for event in events:
+                yield event
 
-    async def resume_workflow(
+    async def _resume_setup(
         self,
         thread_id: str,
-        resume_value: dict[str, Any] | None = None,
-        nodes: list[Node] | None = None,
-        edges: list[Edge] | None = None,
-        require_approval: bool | None = None,
-    ) -> WorkflowResult:
-        """Resume an interrupted workflow using Command(resume=...).
-
-        Rebuilds the graph with the same require_approval flag used at start.
-        Prefers explicit args, then per-thread metadata saved during execute/stream.
-        When unknown, defaults require_approval=True because resume is used for
-        approval-gate interrupts.
-        """
+        resume_value: dict[str, Any] | None,
+        nodes: list[Node] | None,
+        edges: list[Edge] | None,
+        require_approval: bool | None,
+    ) -> tuple[list[Node], list[Edge], bool] | str:
+        """Validate the decision and recover layout + require_approval; returns an error text on failure."""
         if not is_valid_resume_value(resume_value):
-            return WorkflowResult(
-                ok=False,
-                error="resume_value must be an object with a boolean 'approved' field",
-                final_state={},
-            )
+            return "resume_value must be an object with a boolean 'approved' field"
         meta = dict(self._thread_meta.get(thread_id) or {})
         had_layout = bool(meta.get("nodes")) and bool(meta.get("edges"))
         if nodes is None:
@@ -1448,10 +2280,7 @@ class WorkflowEngine:
                     edges=edges,
                 )
         if nodes is None or edges is None:
-            return WorkflowResult(
-                ok=False,
-                error="Cannot resume: original workflow layout not available. Provide nodes and edges.",
-            )
+            return "Cannot resume: original workflow layout not available. Provide nodes and edges."
 
         if require_approval is None:
             if had_layout and "require_approval" in meta:
@@ -1464,13 +2293,90 @@ class WorkflowEngine:
                 # Resume targets approval interrupts; keep approval_gate in the graph.
                 require_approval = True
 
-        graph = self.build_graph(nodes, edges, require_approval=require_approval)
-        config = self._run_config(thread_id)
+        return nodes, edges, bool(require_approval)
 
+    async def resume_workflow_stream(
+        self,
+        thread_id: str,
+        resume_value: dict[str, Any] | None = None,
+        owner: Any = None,
+    ) -> AsyncIterator[SSEEvent]:
+        """P4-10 (R11): streaming resume with the same v2 events as ``stream_workflow``.
+
+        The aggregate after the approval gate is still released only through the gated final
+        ``message_delta``; an explicit approval writes the approved conclusion like the sync path.
+        """
+        setup = await self._resume_setup(thread_id, resume_value, None, None, None)
+        if isinstance(setup, str):
+            yield SSEEvent(event="error", data={"ok": False, "error": setup, "code": "RESUME_INVALID"})
+            return
+        nodes, edges, require_approval = setup
+        graph = self.build_graph(nodes, edges, require_approval=require_approval)
+        queue = self._open_run_queue(thread_id, owner, nodes)
+        config = self._run_config(thread_id, queue)
+
+        async def _after_complete() -> None:
+            if not is_explicit_approval(resume_value):
+                return
+            snapshot = await graph.aget_state({"configurable": {"thread_id": thread_id}})
+            result = self._result_from_graph_output(dict(getattr(snapshot, "values", None) or {}))
+            if not result.final_state.get("interrupted"):
+                await self._store_approved_conclusion(result, nodes, thread_id)
+
+        async with contextlib.aclosing(
+            self._stream_events(
+                graph,
+                Command(resume=resume_value),
+                config,
+                {},
+                tid=thread_id,
+                token_node_id=None,
+                report_degraded=True,
+                label="resume",
+                queue=queue,
+                owner=owner,
+                on_complete=_after_complete,
+                include_node_outputs=True,
+            )
+        ) as events:
+            async for event in events:
+                yield event
+
+    async def resume_workflow(
+        self,
+        thread_id: str,
+        resume_value: dict[str, Any] | None = None,
+        nodes: list[Node] | None = None,
+        edges: list[Edge] | None = None,
+        require_approval: bool | None = None,
+        owner: Any = None,
+    ) -> WorkflowResult:
+        """Resume an interrupted workflow using Command(resume=...).
+
+        Rebuilds the graph with the same require_approval flag used at start.
+        Prefers explicit args, then per-thread metadata saved during execute/stream.
+        When unknown, defaults require_approval=True because resume is used for
+        approval-gate interrupts.
+        """
+        setup = await self._resume_setup(thread_id, resume_value, nodes, edges, require_approval)
+        if isinstance(setup, str):
+            return WorkflowResult(ok=False, error=setup, final_state={})
+        nodes, edges, require_approval = setup
+
+        graph = self.build_graph(nodes, edges, require_approval=require_approval)
+        # Queued messages kept while paused are delivered after the explicit resume
+        # (never used as the approval decision itself).
+        queue = self._open_run_queue(thread_id, owner, nodes)
+        config = self._run_config(thread_id, queue)
+        run = self._runs.open(thread_id, owner)
+
+        outcome = "aborted"
         try:
             from langgraph.types import Command as LgCommand
-            final_state = await self._ainvoke_guarded(graph, LgCommand(resume=resume_value), config)
-            result = self._result_from_graph_output(final_state)
+            final_state = await self._ainvoke_guarded(graph, LgCommand(resume=resume_value), config, run)
+            outcome = "paused" if _graph_output_interrupted(final_state) else "completed"
+            self._finish_message_queue(queue, outcome)
+            result = self._attach_queue_summary(self._result_from_graph_output(final_state), queue)
             if not result.final_state.get("interrupted"):
                 if is_explicit_approval(resume_value):
                     await self._store_approved_conclusion(result, nodes, thread_id)
@@ -1478,17 +2384,39 @@ class WorkflowEngine:
             return result
         except GraphInterrupt:
             logger.info("[THINKING] Workflow resume paused again: thread_id=%s", thread_id)
+            outcome = "paused"
+            self._finish_message_queue(queue, outcome)
             return await self._result_from_interrupt(graph, config, {})
         except WorkflowTimeout as e:
             logger.error("[THINKING] Workflow resume timed out: thread_id=%s", thread_id)
+            outcome = "timeout"
+            self._finish_message_queue(queue, outcome)
+            await self._cleanup_thread(thread_id, outcome, resumed=True)
             return WorkflowResult(ok=False, error=str(e), final_state={})
+        except RunCancelled as e:
+            logger.info("[THINKING] Workflow resume cancelled: thread_id=%s", thread_id)
+            outcome = "cancelled"
+            self._finish_message_queue(queue, outcome)
+            await self._cleanup_thread(thread_id, outcome, resumed=True)
+            return WorkflowResult(ok=False, error=str(e), final_state={"cancelled": True})
         except Exception as e:
             logger.error(f"[THINKING] Workflow resume failed: thread_id={thread_id} error={e}")
+            outcome = "error"
+            self._finish_message_queue(queue, outcome)
+            await self._cleanup_thread(thread_id, outcome, resumed=True)
             return WorkflowResult(ok=False, error=str(e), final_state={})
+        finally:
+            self._runs.close(run)
+            if outcome == "aborted":
+                self._finish_message_queue(queue, outcome)
 
     @staticmethod
     def topological_sort(nodes: list[Node], edges: list[Edge]) -> list[Node]:
-        """Sort nodes in topological order using Kahn's algorithm."""
+        """Sort nodes in topological order using Kahn's algorithm.
+
+        P3-9: not on the execution path (LangGraph compiles the graph); kept as a validation helper
+        and raises on cycles instead of silently dropping the nodes on the cycle.
+        """
         node_map = {n.id: n for n in nodes}
         in_degree: dict[str, int] = {n.id: 0 for n in nodes}
         adjacency: dict[str, list[str]] = defaultdict(list)
@@ -1509,4 +2437,7 @@ class WorkflowEngine:
                 if in_degree[neighbor] == 0:
                     queue.append(neighbor)
 
+        if len(result) != len(nodes):
+            remaining = sorted(nid for nid, deg in in_degree.items() if deg > 0)
+            raise ValueError(f"Workflow graph contains a cycle: {remaining}")
         return result

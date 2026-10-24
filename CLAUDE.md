@@ -7,8 +7,8 @@
 **核心功能**：投资组合管理、市场数据采集（Yahoo/Stooq/SEC/GDELT）、LangGraph Agent 执行、回测、推荐治理（审批/驳回）。
 
 **技术栈**：
-- **Backend**: Spring Boot 2.7.18 / Java 17 / MyBatis / MySQL 8.0 / Redis 7
-- **Orchestrator**: Python 3.11 / FastAPI / LangGraph 0.2.x / langchain-openai 0.2.x
+- **Backend**: Spring Boot 2.7.18 / Java 8 语言级别（`pom.xml` `java.version=1.8`，CI 用 JDK 17 构建，JDK 21 亦验证可用）/ MyBatis / MySQL 8.0 / Redis 7
+- **Orchestrator**: Python 3.11+ / FastAPI / LangGraph 1.2.x / langchain-openai 1.7.x（已测版本见 `aegis-alpha-orchestrator/constraints.txt`，安装：`pip install -c constraints.txt -r requirements-dev.txt`）
 - **Frontend**: Next.js 15 App Router / React 19 / Tailwind CSS / @xyflow/react / JSX（非 TypeScript）
 - **Infra**: Docker Compose / GitHub Actions CI
 
